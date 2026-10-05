@@ -96,7 +96,22 @@ pub fn build_patches(f_master: &[i32], k0: i32, k_x: i32, m: i32, fs_sbr: u32) -
     // goalSb = NINT(2.048e6 / Fs).
     let goal_sb = ((2.0 * 2.048e6 / f64::from(fs_sbr) + 1.0) / 2.0).floor() as i32;
     // k: the first master index at/after goalSb (NMaster if goalSb is
-    // past the SBR stop border).
+    // past the SBR stop border). FFmpeg's `for (k = 0; f_master[k] <
+    // goal_sb; k++)` can stop *one past* `NMaster` when every master
+    // subband is below goalSb — its `f_master[49]` array is
+    // zero-initialised, so the following patch walk reads a stale 0
+    // and emits a zero-width patch (observed on the FATE
+    // `CT_DecoderCheck/sbr_i-ps_i.*` streams, where goalSb = 46 >
+    // every f_master entry). Model that entry as 0: reading index
+    // `NMaster + 1` yields 0; anything further is malformed and
+    // errors.
+    let master_at = |idx: usize| -> Result<i32> {
+        match idx {
+            i if i < f_master.len() => Ok(f_master[i]),
+            i if i == f_master.len() => Ok(0),
+            _ => Err(Error::SbrFreqBandInvalid),
+        }
+    };
     let mut k = if goal_sb < k_x + m {
         let mut kk = 0usize;
         for (i, &f) in f_master.iter().enumerate() {
@@ -122,10 +137,7 @@ pub fn build_patches(f_master: &[i32], k0: i32, k_x: i32, m: i32, fs_sbr: u32) -
         // first master subband: sb <= k0 - 1 + msb - odd.
         let mut j = k;
         let odd = loop {
-            if j >= f_master.len() {
-                return Err(Error::SbrFreqBandInvalid);
-            }
-            sb = f_master[j];
+            sb = master_at(j)?;
             let odd = (sb - 2 + k0).rem_euclid(2);
             if sb <= k0 - 1 + msb - odd {
                 break odd;
@@ -150,7 +162,7 @@ pub fn build_patches(f_master: &[i32], k0: i32, k_x: i32, m: i32, fs_sbr: u32) -
             msb = k_x;
         }
 
-        if f_master[k] - sb < 3 {
+        if master_at(k)? - sb < 3 {
             k = n_master;
         }
         if sb == k_x + m {

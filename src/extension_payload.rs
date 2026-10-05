@@ -210,6 +210,11 @@ pub enum ExtensionPayload {
     },
     /// `EXT_DYNAMIC_RANGE` — DRC metadata per Table 4.52.
     DynamicRange(DynamicRangeInfo),
+    /// A *reserved* `extension_type` (Table 4.59 / ISO/IEC 13818-7
+    /// Table 40). The body carries no layout this crate parses; the
+    /// payload was skipped whole. `u8` is the raw 4-bit
+    /// `extension_type`, `u32` the FIL `cnt` that was skipped.
+    Reserved(u8, u32),
 }
 
 /// The result of [`ExtensionPayload::parse_with_sbr`]: either a standard
@@ -347,7 +352,38 @@ impl ExtensionPayload {
     /// [`Error::ExtensionPayloadInvalid`] — Table 4.51's
     /// `extension_type` field itself is 4 bits, so a zero-byte FIL
     /// has no room for it.
+    ///
+    /// `extension_type` values outside
+    /// `{EXT_FILL, EXT_FILL_DATA, EXT_DYNAMIC_RANGE, EXT_SBR_DATA,
+    /// EXT_SBR_DATA_CRC}` are *reserved* per Table 4.59 / ISO/IEC
+    /// 13818-7 Table 40; real streams carry them (FFmpeg's aac.mak
+    /// `al04_44` et al. use `0x5`, which some muxers emit for
+    /// extension data). Mirroring FFmpeg's
+    /// `decode_extension_payload` default branch
+    /// (libavcodec/aac/aacdec.c), the body is skipped whole
+    /// (`8 * cnt - 4` bits) and decoding continues; the raw
+    /// extension type is surfaced for diagnostics.
     pub fn parse(reader: &mut BitReader<'_>, cnt: u32) -> Result<Self> {
+        match Self::parse_result(reader, cnt) {
+            Ok(p) => Ok(p),
+            Err(Error::UnsupportedExtensionType(raw)) => {
+                // Reserved type: skip `8 * cnt - 4` bits (FFmpeg's
+                // `skip_bits_long(gb, 8 * cnt - 4)`), recovering the
+                // FIL `cnt` so the walk continues.
+                let bits = 8u32
+                    .checked_mul(cnt)
+                    .and_then(|b| b.checked_sub(4))
+                    .ok_or(Error::ExtensionPayloadInvalid)?;
+                reader.skip(bits).map_err(|_| Error::UnexpectedEnd)?;
+                Ok(ExtensionPayload::Reserved(raw, cnt))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The strict Table 4.51 dispatch (errors on reserved types)
+    /// that [`Self::parse`] relaxes.
+    fn parse_result(reader: &mut BitReader<'_>, cnt: u32) -> Result<Self> {
         if cnt == 0 {
             return Err(Error::ExtensionPayloadInvalid);
         }
@@ -472,6 +508,9 @@ impl ExtensionPayload {
             ExtensionPayload::Fill { cnt, other_bits } => write_fill(writer, *cnt, other_bits),
             ExtensionPayload::FillData { cnt } => write_fill_data(writer, *cnt),
             ExtensionPayload::DynamicRange(drc) => write_dynamic_range(writer, drc),
+            // A reserved extension type has no writable layout; the
+            // parser only produces it for skipped input.
+            ExtensionPayload::Reserved(_, _) => Err(Error::ExtensionPayloadInvalid),
         }
     }
 
@@ -482,6 +521,7 @@ impl ExtensionPayload {
             ExtensionPayload::Fill { cnt, .. } => *cnt,
             ExtensionPayload::FillData { cnt } => *cnt,
             ExtensionPayload::DynamicRange(drc) => drc.byte_length(),
+            ExtensionPayload::Reserved(_, cnt) => *cnt,
         }
     }
 }
