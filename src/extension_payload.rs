@@ -434,7 +434,24 @@ impl ExtensionPayload {
         }
         let nibble_start = reader.bit_position();
         let raw = read_u8(reader, EXTENSION_TYPE_BITS)?;
-        let ty = ExtensionType::from_bits_allow_sbr(raw)?;
+        let ty = match ExtensionType::from_bits_allow_sbr(raw) {
+            Ok(ty) => ty,
+            Err(Error::UnsupportedExtensionType(_)) => {
+                // Reserved extension type (Table 4.59): skip the body
+                // whole (`8 * cnt - 4` bits), mirroring FFmpeg's
+                // `decode_extension_payload` default branch, and
+                // report it as a non-SBR payload.
+                let bits = 8u32
+                    .checked_mul(cnt)
+                    .and_then(|b| b.checked_sub(4))
+                    .ok_or(Error::ExtensionPayloadInvalid)?;
+                reader.skip(bits).map_err(|_| Error::UnexpectedEnd)?;
+                return Ok(ExtensionPayloadOrSbr::Payload(ExtensionPayload::Reserved(
+                    raw, cnt,
+                )));
+            }
+            Err(e) => return Err(e),
+        };
         match ty {
             ExtensionType::Fill => Ok(ExtensionPayloadOrSbr::Payload(parse_fill(reader, cnt)?)),
             ExtensionType::FillData => Ok(ExtensionPayloadOrSbr::Payload(parse_fill_data(
