@@ -650,7 +650,6 @@ impl StreamDecoder {
                 }
                 Some((id_aac, slot)) => {
                     let prev = self.sbr_prev_header.get(&slot).copied();
-                    let sbr_start_bit = reader.bit_position();
                     match ExtensionPayload::parse_with_sbr(reader, remaining, id_aac, fs_sbr, prev)?
                     {
                         ExtensionPayloadOrSbr::Payload(p) => {
@@ -661,19 +660,6 @@ impl StreamDecoder {
                             ext.verify_crc(payload)?;
                             self.sbr_prev_header.insert(slot, ext.header);
                             result = Some(ext);
-                            // finish() advanced the reader through
-                            // sbr_data() + the intra-byte align padding
-                            // only. Jump to the FIL payload end so the
-                            // element walk continues at the next
-                            // element (FFmpeg's host cursor advances by
-                            // the full cnt through the fill region).
-                            let before = sbr_start_bit;
-                            let target = before + u64::from(remaining) * 8;
-                            let pos = reader.bit_position();
-                            if target > pos {
-                                let bits = usize::try_from(target - pos).unwrap_or(0);
-                                reader.skip(bits as u32).map_err(|_| Error::UnexpectedEnd)?;
-                            }
                             remaining = 0;
                         }
                         ExtensionPayloadOrSbr::SbrPreHeader { crc, crc_region } => {
