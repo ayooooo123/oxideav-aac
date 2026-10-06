@@ -671,6 +671,14 @@ impl SbrDecoder {
             } else {
                 None
             };
+            if ps_payload.is_some() {
+                // Annex 8.A in-band signalling: an EXTENSION_ID_PS
+                // payload on a single-channel element marks the stream
+                // as parametric stereo even without the ASC
+                // `psPresentFlag` — stereo output (duplicated mono
+                // until the first decodable ps_data) starts here.
+                self.ps_signaled = true;
+            }
             if ps_payload.is_some() && self.low_power {
                 // §4.6.18.8: the real-valued tool cannot host the
                 // complex-domain PS processing.
