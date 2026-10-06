@@ -510,7 +510,7 @@ impl AacDecoder {
             if !asc.ps_present
                 && !asc.ps_absent
                 && asc.trailing_sbr_probe.is_some()
-                && asc.channel_configuration == 1
+                && asc.channel_count() == 1
             {
                 self.stream.set_ps_signaled(true);
                 self.loas.set_ps_signaled(true);
