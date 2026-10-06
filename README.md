@@ -21,12 +21,14 @@ M/S and complex stereo prediction, and TNS. AudioPreRoll primes a fresh,
 reset or reconfigured decoder with its pre-roll AUs (output discarded) and
 applies embedded configuration changes; continuous decoding with an
 unchanged configuration skips it (ISO/IEC 23003-3 7.18.3.3).
-applyCrossfade is not applied. FFmpeg 2da55bf parses AudioPreRoll as fill,
-so a stream that starts with non-silent pre-roll (FATE xhe_target_level)
-intentionally differs from FFmpeg. The optional `target_level` codec option
+applyCrossfade is not applied. FFmpeg 2da55bf parses AudioPreRoll as fill
+and never primes, so FATE xhe_target_level (non-silent pre-roll, noise
+filling) no longer matches the FFmpeg reference (19.69 dB SNR); this is an
+unresolved regression. The optional `target_level` codec option
 (-70..=0 dBFS, FFmpeg's range; 0 disables it) applies program/anchor
 loudness for the unprocessed layout. See "Not yet supported" for the
 rejected and unverified USAC tools.
+
 USAC and two ELD MP4 fixtures still need container-provided sample trimming;
 the decoder deliberately retains its complete raw PCM. The workspace's
 `check-aac` tests assert those exact presentation gaps separately from

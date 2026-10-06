@@ -14,8 +14,9 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   USAC's four-bit long-window TNS orders. AudioPreRoll primes fresh, reset
   or reconfigured decoders and applies embedded configuration changes; it
   is skipped during continuous decoding (ISO/IEC 23003-3 7.18.3.3). FFmpeg
-  2da55bf parses it as fill, so non-silent pre-roll intentionally differs
-  from FFmpeg. Optional `target_level` (-70..=0 dBFS, FFmpeg's range)
+  2da55bf parses it as fill and never primes, so FATE xhe_target_level no
+  longer matches FFmpeg (19.69 dB SNR; unresolved regression). Optional
+  `target_level` (-70..=0 dBFS, FFmpeg's range)
   applies program/anchor loudness for the unprocessed layout; extension
   payloads are length-bounded. This is an LGPL-2.1-or-later port of FFmpeg
   `aacdec_usac.c` / `aacdec_ac.c` and their tables at 2da55bf.
