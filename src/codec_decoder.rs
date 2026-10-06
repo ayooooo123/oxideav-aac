@@ -142,12 +142,14 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         .options
         .get("sbr_downsampled")
         .is_some_and(|v| matches!(v, "true" | "1"));
+    let mut ps_signaled = false;
     if let Some(Ok(asc)) = &asc {
         let (rate, ch) = asc_output_geometry(asc, sbr_downsampled_opt);
         sample_rate = rate;
         if ch > 0 {
             channels = ch;
         }
+        ps_signaled = asc.ps_present;
     }
 
     let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
@@ -170,6 +172,8 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     if let Some(v) = params.options.get("sbr_low_power") {
         dec.set_sbr_low_power(matches!(v, "true" | "1"));
     }
+    dec.stream.set_ps_signaled(ps_signaled);
+    dec.loas.set_ps_signaled(ps_signaled);
     Ok(Box::new(dec))
 }
 
