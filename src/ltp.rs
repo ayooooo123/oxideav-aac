@@ -341,19 +341,15 @@ impl LtpState {
         // windowing_and_mdct_ltp). The fork previously applied the
         // full long-only window on every sequence.
         let left_shape = prev_shape.unwrap_or(ics_info.window_shape);
-        let window = if self.family.is_ld() {
-            long_only_window_family(self.family, left_shape, ics_info.window_shape)
-        } else {
-            long_sequence_window_n(
-                self.family.long_transform_len(),
-                128,
+        let window = match self.family.short_transform_len() {
+            Some(n_s) if !self.family.is_ld() => long_sequence_window_n(
+                n_transform,
+                n_s,
                 ics_info.window_sequence,
                 left_shape,
                 ics_info.window_shape,
-            )
-            .unwrap_or_else(|_| {
-                long_only_window_family(self.family, left_shape, ics_info.window_shape)
-            })
+            )?,
+            _ => long_only_window_family(self.family, left_shape, ics_info.window_shape),
         };
         let z: Vec<f64> = x_est
             .iter()
