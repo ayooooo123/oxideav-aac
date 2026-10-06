@@ -455,6 +455,8 @@ pub mod extension_payload;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod filterbank;
+// internal — FFT-based MDCT / IMDCT plans (LGPL port of av_tx's MDCT)
+mod mdct;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod gain_control;

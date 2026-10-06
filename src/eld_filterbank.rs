@@ -11,7 +11,6 @@
 //! decoder does.
 
 use crate::eld_window::{ELD_WINDOW_480, ELD_WINDOW_512};
-use crate::filterbank::imdct;
 use crate::{Error, Result};
 
 /// One channel's ELD synthesis state: the three previous half-length
@@ -23,6 +22,10 @@ pub struct EldFilterbank {
     /// FFmpeg's `saved[0..3N]`: the previous frame's IMDCT output at
     /// `0..N`, the one before at `N..2N`, the oldest at `2N..3N`.
     saved: Vec<f64>,
+    /// The reordered spectral lines of the frame being synthesized.
+    input: Vec<f64>,
+    /// The half-length IMDCT output of the frame being synthesized.
+    buf: Vec<f64>,
 }
 
 impl EldFilterbank {
@@ -34,6 +37,8 @@ impl EldFilterbank {
         Ok(EldFilterbank {
             n,
             saved: vec![0.0; 3 * n],
+            input: vec![0.0; n],
+            buf: vec![0.0; n],
         })
     }
 
@@ -54,7 +59,8 @@ impl EldFilterbank {
 
         // Reorder and negate the lines so a standard IMDCT computes the
         // ELD inverse transform.
-        let mut input = spec.to_vec();
+        let input = &mut self.input;
+        input.copy_from_slice(spec);
         for i in (0..n2).step_by(2) {
             let t = input[i];
             input[i] = -input[n - 1 - i];
@@ -65,8 +71,9 @@ impl EldFilterbank {
         }
         // The half-length IMDCT: the middle `N` samples of the 2N-point
         // inverse transform, with every even sample negated.
-        let full = imdct(&input, 2 * n);
-        let mut buf = full[n2..n2 + n].to_vec();
+        let plan = crate::mdct::imdct_plan(2 * n).ok_or(Error::FilterbankInvalid)?;
+        let buf = &mut self.buf;
+        plan.half(input, buf);
         for v in buf.iter_mut().step_by(2) {
             *v = -*v;
         }
@@ -91,7 +98,7 @@ impl EldFilterbank {
         }
 
         self.saved.copy_within(0..2 * n, n);
-        self.saved[..n].copy_from_slice(&buf);
+        self.saved[..n].copy_from_slice(buf);
         Ok(out)
     }
 }

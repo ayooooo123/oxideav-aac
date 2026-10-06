@@ -31,13 +31,16 @@
 //!   `out[n] = z[i][n] + z[i-1][n + N/2]` for `0 ≤ n < N/2`,
 //!   `N = 2048`, valid for all four sequences.
 //!
-//! The frame-length-960 (`N = 1920 / 240`) variant of the spec is
-//! out of scope: the rest of the crate's `swb_offset` tables and
-//! transmission-order machinery are wired to the 1024-coefficient
-//! layout, so this module mirrors that and only implements the 2048
-//! transform family.
+//! The same geometry also covers frame-length-960 (`N = 1920 / 240`),
+//! ER AAC LD (`N = 1024 / 960`, long-only) and SSR's per-band windows.
+//! Transforms run through the FFT-based `mdct` module; sine, KBD and
+//! low-overlap halves are cached once per transform size and kind.
+
+use std::borrow::Cow;
+use std::sync::OnceLock;
 
 use crate::ics_info::{IcsInfo, WindowSequence, WindowShape};
+use crate::mdct::CACHED_LENGTHS;
 use crate::swb_offset::{FrameFamily, LONG_WINDOW_LEN, SHORT_WINDOW_LEN};
 use crate::Error;
 
@@ -69,20 +72,18 @@ type Result<T> = core::result::Result<T, Error>;
 /// scale and the half-coefficient phase are the only normalization
 /// the spec attaches to the inverse transform; the energy-correcting
 /// window then follows in the per-sequence windowing step.
+///
+/// Computed through the FFT-based [`crate::mdct::Imdct`]; `N` is a
+/// multiple of 8 whose `N/4` factors into 2, 3 and 5 (every transform
+/// length the codec runs).
 pub(crate) fn imdct(spec: &[f64], n_transform: usize) -> Vec<f64> {
-    let half = n_transform / 2;
-    debug_assert_eq!(spec.len(), half);
-    let n0 = (half + 1) as f64 / 2.0;
-    let scale = 2.0 / n_transform as f64;
-    let phase_step = 2.0 * core::f64::consts::PI / n_transform as f64;
+    debug_assert_eq!(spec.len(), n_transform / 2);
     let mut out = vec![0.0f64; n_transform];
-    for (n, slot) in out.iter_mut().enumerate() {
-        let np = n as f64 + n0;
-        let mut acc = 0.0f64;
-        for (k, &c) in spec.iter().enumerate() {
-            acc += c * (phase_step * np * (k as f64 + 0.5)).cos();
-        }
-        *slot = scale * acc;
+    match crate::mdct::imdct_plan(n_transform) {
+        Some(plan) => plan.full(spec, &mut out),
+        None => crate::mdct::Imdct::new(n_transform / 2)
+            .expect("IMDCT length is a multiple of 8 with N/4 = 2^a·3^b·5^c")
+            .full(spec, &mut out),
     }
     out
 }
@@ -99,21 +100,19 @@ pub(crate) fn imdct(spec: &[f64], n_transform: usize) -> Vec<f64> {
 /// `2/N` scale, the analysis here carries the matching factor `2`, so
 /// the windowed-and-overlap-added round trip is unity for a
 /// power-complementary §4.6.11.3.2 window. The same transform is the
-/// `MDCT(x_est)` of the §4.6.7.3 Long-Term-Prediction loop.
+/// `MDCT(x_est)` of the §4.6.7.3 Long-Term-Prediction loop. Computed
+/// through the FFT-based [`crate::mdct::Mdct`] under the same length
+/// rule as [`imdct`].
 pub(crate) fn forward_mdct(time: &[f64], n_transform: usize) -> Vec<f64> {
-    let half = n_transform / 2;
     debug_assert_eq!(time.len(), n_transform);
-    let n0 = (half + 1) as f64 / 2.0;
-    let step = 2.0 * core::f64::consts::PI / n_transform as f64;
-    (0..half)
-        .map(|k| {
-            2.0 * time
-                .iter()
-                .enumerate()
-                .map(|(n, &t)| t * (step * (n as f64 + n0) * (k as f64 + 0.5)).cos())
-                .sum::<f64>()
-        })
-        .collect()
+    let mut out = vec![0.0f64; n_transform / 2];
+    match crate::mdct::mdct_plan(n_transform) {
+        Some(plan) => plan.forward(time, &mut out),
+        None => crate::mdct::Mdct::new(n_transform / 2)
+            .expect("MDCT length is a multiple of 8 with N/4 = 2^a·3^b·5^c")
+            .forward(time, &mut out),
+    }
+    out
 }
 
 /// §4.6.11.3.2 — build the `ONLY_LONG_SEQUENCE` analysis window
@@ -139,16 +138,16 @@ pub(crate) fn long_only_window_family(
     let half_l = n_l / 2;
     let mut w = vec![0.0f64; n_l];
     w[..half_l].copy_from_slice(&halves.left);
-    for (m, &rv) in halves.right.iter().enumerate() {
-        w[half_l + m] = rv;
+    for (slot, rv) in w[half_l..].iter_mut().zip(halves.right()) {
+        *slot = rv;
     }
     w
 }
 
 /// §4.6.11.3.2 — assemble the length-2048 window for any of the
 /// three long-transform sequences. The window is shared between the
-/// decoder's synthesis ([`Filterbank::long_window`] delegates here)
-/// and the encoder's analysis (the §4.6.11 filterbank is its own
+/// decoder's synthesis and the encoder's analysis (the §4.6.11
+/// filterbank is its own
 /// transpose up to the TDAC fold, so the same window applies on both
 /// sides). Returns [`Error::FilterbankInvalid`] for
 /// `EIGHT_SHORT_SEQUENCE` — use [`short_window_j`] per short window
@@ -206,8 +205,8 @@ pub(crate) fn short_window_n(
     let halves = window_halves(n_s, this_left, right_shape);
     let mut w = vec![0.0f64; n_s];
     w[..n_s / 2].copy_from_slice(&halves.left);
-    for (m, &rv) in halves.right.iter().enumerate() {
-        w[n_s / 2 + m] = rv;
+    for (slot, rv) in w[n_s / 2..].iter_mut().zip(halves.right()) {
+        *slot = rv;
     }
     w
 }
@@ -289,14 +288,21 @@ fn sine_left(half: usize) -> Vec<f64> {
 
 /// One transform's analysis/synthesis window halves, each `half = N/2`
 /// long. The right half of a sine/KBD window is the mirror of its
-/// left half (`W_RIGHT(n) = W_LEFT(N − 1 − n)`), so we store left
-/// halves and index the right half by mirror at apply time.
+/// left half (`W_RIGHT(n) = W_LEFT(N − 1 − n)`), so we keep left
+/// halves and read the right half by mirror.
 struct WindowHalves {
     /// Left half, indices `0..half`.
-    left: Vec<f64>,
-    /// Right half, indices `0..half`; element `m` is the window value
-    /// at transform position `half + m`.
-    right: Vec<f64>,
+    left: Cow<'static, [f64]>,
+    /// The *left* (rising) half of the right shape: the window value at
+    /// transform position `half + m` is `rising_right[half − 1 − m]`.
+    rising_right: Cow<'static, [f64]>,
+}
+
+impl WindowHalves {
+    /// The right half in transform order (positions `half..N`).
+    fn right(&self) -> impl Iterator<Item = f64> + '_ {
+        self.rising_right.iter().rev().copied()
+    }
 }
 
 /// §4.6.17.2.3 Table 4.171 — the ER AAC LD *low-overlap* window's
@@ -370,7 +376,7 @@ impl WindowStyle {
 /// print precision — pinned by the `ssr_kbd_*` tests below). Under
 /// [`WindowStyle::LowDelay`] the `window_shape == 1` bit selects the
 /// §4.6.17.2.3 low-overlap window instead of KBD.
-fn half_window_style(n_transform: usize, shape: WindowShape, style: WindowStyle) -> Vec<f64> {
+fn compute_half_window(n_transform: usize, shape: WindowShape, style: WindowStyle) -> Vec<f64> {
     let half = n_transform / 2;
     match (shape, style) {
         (WindowShape::Sine, _) => sine_left(half),
@@ -389,11 +395,34 @@ fn half_window_style(n_transform: usize, shape: WindowShape, style: WindowStyle)
     }
 }
 
+/// [`compute_half_window`] for every (transform length, window kind)
+/// the codec runs, built once per process: three kinds (sine, KBD,
+/// low-overlap) per cached transform length.
+static HALF_WINDOWS: [OnceLock<Vec<f64>>; 3 * CACHED_LENGTHS.len()] =
+    [const { OnceLock::new() }; 3 * CACHED_LENGTHS.len()];
+
+/// The left half-window for `shape` at `n_transform` under `style`
+/// ([`compute_half_window`]), from the process-wide cache for the
+/// codec's transform lengths.
+fn half_window_style(n_transform: usize, shape: WindowShape, style: WindowStyle) -> Cow<'static, [f64]> {
+    let kind = match (shape, style) {
+        (WindowShape::Sine, _) => 0,
+        (WindowShape::Kbd, WindowStyle::Standard) => 1,
+        (WindowShape::Kbd, WindowStyle::LowDelay) => 2,
+    };
+    match CACHED_LENGTHS.iter().position(|&l| l == n_transform) {
+        Some(slot) => Cow::Borrowed(
+            HALF_WINDOWS[3 * slot + kind]
+                .get_or_init(|| compute_half_window(n_transform, shape, style)),
+        ),
+        None => Cow::Owned(compute_half_window(n_transform, shape, style)),
+    }
+}
+
 /// §4.6.11.3.2 — assemble a transform's window from a `left` shape
 /// (inherited from the previous block) and a `right` shape (this
 /// block's `window_shape`). For a sine/KBD window the right half is
-/// the spatial mirror of that shape's *left* half, so we build the
-/// `right`-shape left half and reverse it.
+/// the spatial mirror of that shape's *left* half.
 fn window_halves(
     n_transform: usize,
     left_shape: WindowShape,
@@ -409,10 +438,10 @@ fn window_halves_style(
     right_shape: WindowShape,
     style: WindowStyle,
 ) -> WindowHalves {
-    let left = half_window_style(n_transform, left_shape, style);
-    let mut right = half_window_style(n_transform, right_shape, style);
-    right.reverse();
-    WindowHalves { left, right }
+    WindowHalves {
+        left: half_window_style(n_transform, left_shape, style),
+        rising_right: half_window_style(n_transform, right_shape, style),
+    }
 }
 
 /// The stateful per-channel §4.6.11 filterbank. One instance per
@@ -436,6 +465,9 @@ pub struct Filterbank {
     /// the block before the first one is taken to be sine-windowed, as
     /// FFmpeg's zero-initialised `use_kb_window` history does.
     prev_shape: Option<WindowShape>,
+    /// This frame's windowed time signal `z[i][0 .. N]`
+    /// (`family.long_transform_len()` long), reused across frames.
+    z: Vec<f64>,
 }
 
 impl Default for Filterbank {
@@ -460,6 +492,7 @@ impl Filterbank {
             family,
             overlap: vec![0.0f64; family.frame_len()],
             prev_shape: Some(WindowShape::Sine),
+            z: vec![0.0f64; family.long_transform_len()],
         }
     }
 
@@ -517,20 +550,19 @@ impl Filterbank {
         if ics_info.family != self.family {
             return Err(Error::FilterbankInvalid);
         }
-        let z = self.windowed_signal(spec, ics_info)?;
-        debug_assert_eq!(z.len(), self.family.long_transform_len());
+        let left_shape = self.prev_shape.unwrap_or(ics_info.window_shape);
+        windowed_signal(self.family, spec, ics_info, left_shape, &mut self.z)?;
 
         // §4.6.11.3.3 overlap-add: out[n] = z[i][n] + z[i-1][n + N/2].
         let half = self.family.frame_len();
-        let out: Vec<f64> = z[..half]
+        let out: Vec<f64> = self.z[..half]
             .iter()
             .zip(self.overlap.iter())
             .map(|(&zn, &on)| zn + on)
             .collect();
 
         // Retain z[i][N/2 .. N] as next frame's z[i-1][n + N/2].
-        self.overlap.clear();
-        self.overlap.extend_from_slice(&z[half..]);
+        self.overlap.copy_from_slice(&self.z[half..]);
 
         // §4.6.11.3.2: the left-half shape of the *next* block is this
         // block's window_shape.
@@ -538,60 +570,19 @@ impl Filterbank {
         Ok(out)
     }
 
-    /// §4.6.11.3.1 + §4.6.11.3.2 — produce the full-length (`N_l =
-    /// 2048`) windowed time signal `z[i][n]` for this frame, before
-    /// the inter-block overlap-add. Dispatches on `window_sequence`.
+    /// [`windowed_signal`] for this filterbank's state, as a fresh
+    /// vector.
+    #[cfg(test)]
     fn windowed_signal(&self, spec: &[f64], ics_info: &IcsInfo) -> Result<Vec<f64>> {
+        let mut z = vec![0.0f64; self.family.long_transform_len()];
         let left_shape = self.prev_shape.unwrap_or(ics_info.window_shape);
-        let right_shape = ics_info.window_shape;
-        match ics_info.window_sequence {
-            WindowSequence::OnlyLong => {
-                self.long_windowed(spec, left_shape, right_shape, LongKind::OnlyLong)
-            }
-            WindowSequence::LongStart => {
-                self.long_windowed(spec, left_shape, right_shape, LongKind::Start)
-            }
-            WindowSequence::LongStop => {
-                self.long_windowed(spec, left_shape, right_shape, LongKind::Stop)
-            }
-            WindowSequence::EightShort => self.short_windowed(spec, left_shape, right_shape),
-        }
-    }
-
-    /// §4.6.11.3.2 a)/b)/d) — the three long-transform sequences. Each
-    /// runs a single length-2048 IMDCT and applies a composite window
-    /// whose left half (`ONLY_LONG`, `LONG_START`) or right half
-    /// (`LONG_STOP`) is the full long half-window, and whose other
-    /// half is shaped by the start/stop transition (a short half-window
-    /// flanked by a flat `1.0` plateau and a zero region).
-    fn long_windowed(
-        &self,
-        spec: &[f64],
-        left_shape: WindowShape,
-        right_shape: WindowShape,
-        kind: LongKind,
-    ) -> Result<Vec<f64>> {
-        if spec.len() != self.family.frame_len() {
-            return Err(Error::FilterbankInvalid);
-        }
-        let x = imdct(spec, self.family.long_transform_len());
-        let w = self.long_window(left_shape, right_shape, kind)?;
-        let z: Vec<f64> = x.iter().zip(w.iter()).map(|(&xv, &wv)| xv * wv).collect();
+        windowed_signal(self.family, spec, ics_info, left_shape, &mut z)?;
         Ok(z)
     }
 
-    /// §4.6.11.3.2 — assemble the length-2048 window vector for a
-    /// long-transform sequence.
-    ///
-    /// * `OnlyLong` (a): `[W_LEFT_l | W_RIGHT_l]`.
-    /// * `Start` (b): left half is `W_LEFT_l`; the right half is a
-    ///   flat `1.0` plateau over `[N_l/2, (3N_l − N_s)/4)`, the short
-    ///   right half-window over `[(3N_l − N_s)/4, (3N_l + N_s)/4)`, and
-    ///   `0.0` over `[(3N_l + N_s)/4, N_l)`.
-    /// * `Stop` (d): the left half is `0.0` over `[0, (N_l − N_s)/4)`,
-    ///   the short left half-window over `[(N_l − N_s)/4, (N_l +
-    ///   N_s)/4)`, and a flat `1.0` plateau over `[(N_l + N_s)/4,
-    ///   N_l/2)`; the right half is `W_RIGHT_l`.
+    /// §4.6.11.3.2 — the length-`N_l` composite window of a
+    /// long-transform sequence (see [`apply_long_window`]).
+    #[cfg(test)]
     fn long_window(
         &self,
         left_shape: WindowShape,
@@ -599,36 +590,193 @@ impl Filterbank {
         kind: LongKind,
     ) -> Result<Vec<f64>> {
         let n_l = self.family.long_transform_len();
-        match self.family.short_transform_len() {
-            Some(n_s) => Ok(build_long_window_style(
-                n_l,
-                n_s,
-                left_shape,
-                right_shape,
-                kind,
-                WindowStyle::for_family(self.family),
-            )),
-            // LD: long-only — Start / Stop transitions do not exist
-            // (§4.6.17.2.2), so only the OnlyLong composite is legal.
-            None => match kind {
-                LongKind::OnlyLong => {
-                    let halves =
-                        window_halves_style(n_l, left_shape, right_shape, WindowStyle::LowDelay);
-                    let half_l = n_l / 2;
-                    let mut w = vec![0.0f64; n_l];
-                    w[..half_l].copy_from_slice(&halves.left);
-                    for (m, &rv) in halves.right.iter().enumerate() {
-                        w[half_l + m] = rv;
-                    }
-                    Ok(w)
-                }
-                _ => Err(Error::LdShortWindow),
-            },
+        let n_s = match (self.family.short_transform_len(), kind) {
+            (Some(n_s), _) => n_s,
+            (None, LongKind::OnlyLong) => 0,
+            (None, _) => return Err(Error::LdShortWindow),
+        };
+        let style = WindowStyle::for_family(self.family);
+        Ok(build_long_window_style(
+            n_l,
+            n_s,
+            left_shape,
+            right_shape,
+            kind,
+            style,
+        ))
+    }
+}
+
+/// §4.6.11.3.1 + §4.6.11.3.2 — the full-length (`N_l`) windowed time
+/// signal `z[i][n]` of one frame, before the inter-block overlap-add,
+/// into `z[..N_l]`. Dispatches on `window_sequence`; `left_shape` is
+/// the previous block's `window_shape`.
+fn windowed_signal(
+    family: FrameFamily,
+    spec: &[f64],
+    ics_info: &IcsInfo,
+    left_shape: WindowShape,
+    z: &mut [f64],
+) -> Result<()> {
+    let right_shape = ics_info.window_shape;
+    let kind = match ics_info.window_sequence {
+        WindowSequence::OnlyLong => LongKind::OnlyLong,
+        WindowSequence::LongStart => LongKind::Start,
+        WindowSequence::LongStop => LongKind::Stop,
+        WindowSequence::EightShort => {
+            return short_windowed(family, spec, left_shape, right_shape, z)
+        }
+    };
+    long_windowed(family, spec, left_shape, right_shape, kind, z)
+}
+
+/// §4.6.11.3.2 a)/b)/d) — the three long-transform sequences. Each
+/// runs a single length-`N_l` IMDCT and applies a composite window
+/// whose left half (`ONLY_LONG`, `LONG_START`) or right half
+/// (`LONG_STOP`) is the full long half-window, and whose other half is
+/// shaped by the start/stop transition (a short half-window flanked by
+/// a flat `1.0` plateau and a zero region). The LD families are
+/// long-only (§4.6.17.2.2): their Start / Stop transitions do not
+/// exist.
+fn long_windowed(
+    family: FrameFamily,
+    spec: &[f64],
+    left_shape: WindowShape,
+    right_shape: WindowShape,
+    kind: LongKind,
+    z: &mut [f64],
+) -> Result<()> {
+    if spec.len() != family.frame_len() {
+        return Err(Error::FilterbankInvalid);
+    }
+    let n_s = match (family.short_transform_len(), kind) {
+        (Some(n_s), _) => n_s,
+        (None, LongKind::OnlyLong) => 0,
+        (None, _) => return Err(Error::LdShortWindow),
+    };
+    let n_l = family.long_transform_len();
+    let plan = crate::mdct::imdct_plan(n_l).ok_or(Error::FilterbankInvalid)?;
+    let z = z.get_mut(..n_l).ok_or(Error::FilterbankInvalid)?;
+    plan.full(spec, z);
+    apply_long_window(
+        z,
+        n_s,
+        left_shape,
+        right_shape,
+        kind,
+        WindowStyle::for_family(family),
+    );
+    Ok(())
+}
+
+/// §4.6.11.3.2 c) — the `EIGHT_SHORT` sequence: eight length-`N_s`
+/// IMDCTs, each windowed with a short window, then overlapped and
+/// added into the `N_l`-sample frame with leading/trailing zeros.
+///
+/// Window-shape inheritance (§4.6.11.3.2): the *first* short window's
+/// left half uses the previous block's shape; every later short
+/// window's left half — and every short window's right half — uses
+/// this block's `window_shape`.
+///
+/// Short window `j` starts at offset `(N_l − N_s)/4 + j·N_s/2` (each
+/// successive short window is hopped by `N_s/2` = 128 (120) samples) —
+/// the spec's piecewise `z_{i,n}` is exactly this 50%-overlap-add with
+/// the first window placed at `(N_l − N_s)/4` = 448 (420).
+fn short_windowed(
+    family: FrameFamily,
+    spec: &[f64],
+    left_shape: WindowShape,
+    right_shape: WindowShape,
+    z: &mut [f64],
+) -> Result<()> {
+    let n_s = family.short_transform_len().ok_or(Error::LdShortWindow)?;
+    let n_l = family.long_transform_len();
+    let hop = n_s / 2; // 128 (120)
+    if spec.len() != NUM_SHORT_WINDOWS * hop {
+        return Err(Error::FilterbankInvalid);
+    }
+    let plan = crate::mdct::imdct_plan(n_s).ok_or(Error::FilterbankInvalid)?;
+    let mut x = [0.0f64; N_S];
+    let x = x.get_mut(..n_s).ok_or(Error::FilterbankInvalid)?;
+    let z = z.get_mut(..n_l).ok_or(Error::FilterbankInvalid)?;
+    z.fill(0.0);
+    let first_left = half_window_style(n_s, left_shape, WindowStyle::Standard);
+    let this_shape = half_window_style(n_s, right_shape, WindowStyle::Standard);
+    let start = (n_l - n_s) / 4; // 448 (420)
+    for (j, coeffs) in spec.chunks_exact(hop).enumerate() {
+        plan.full(coeffs, x);
+        let left: &[f64] = if j == 0 { &first_left } else { &this_shape };
+        let base = start + j * hop;
+        let (rise, fall) = z[base..base + n_s].split_at_mut(hop);
+        for ((acc, &xv), &wv) in rise.iter_mut().zip(&x[..hop]).zip(left) {
+            *acc += xv * wv;
+        }
+        for ((acc, &xv), &wv) in fall.iter_mut().zip(&x[hop..]).zip(this_shape.iter().rev()) {
+            *acc += xv * wv;
+        }
+    }
+    Ok(())
+}
+
+/// §4.6.11.3.2 — multiply `z[..N_l]` in place by the composite window
+/// of a long-transform sequence (`N_s` is the family's short transform
+/// length; only `Start` / `Stop` read it).
+///
+/// * `OnlyLong` (a): `[W_LEFT_l | W_RIGHT_l]`.
+/// * `Start` (b): left half is `W_LEFT_l`; the right half is a flat
+///   `1.0` plateau over `[N_l/2, (3N_l − N_s)/4)`, the short right
+///   half-window over `[(3N_l − N_s)/4, (3N_l + N_s)/4)`, and `0.0`
+///   over `[(3N_l + N_s)/4, N_l)`.
+/// * `Stop` (d): the left half is `0.0` over `[0, (N_l − N_s)/4)`, the
+///   short left half-window over `[(N_l − N_s)/4, (N_l + N_s)/4)`, and
+///   a flat `1.0` plateau over `[(N_l + N_s)/4, N_l/2)`; the right half
+///   is `W_RIGHT_l`.
+fn apply_long_window(
+    z: &mut [f64],
+    n_s: usize,
+    left_shape: WindowShape,
+    right_shape: WindowShape,
+    kind: LongKind,
+    style: WindowStyle,
+) {
+    let n_l = z.len();
+    let half_l = n_l / 2;
+    let (head, tail) = z.split_at_mut(half_l);
+    match kind {
+        LongKind::OnlyLong | LongKind::Start => {
+            let left = half_window_style(n_l, left_shape, style);
+            for (v, &w) in head.iter_mut().zip(left.iter()) {
+                *v *= w;
+            }
+        }
+        LongKind::Stop => {
+            let a = (n_l - n_s) / 4;
+            let short_left = half_window_style(n_s, left_shape, style);
+            head[..a].fill(0.0);
+            for (v, &w) in head[a..a + n_s / 2].iter_mut().zip(short_left.iter()) {
+                *v *= w;
+            }
+        }
+    }
+    match kind {
+        LongKind::OnlyLong | LongKind::Stop => {
+            let right = half_window_style(n_l, right_shape, style);
+            for (v, &w) in tail.iter_mut().zip(right.iter().rev()) {
+                *v *= w;
+            }
+        }
+        LongKind::Start => {
+            let b = (3 * n_l - n_s) / 4 - half_l;
+            let short_right = half_window_style(n_s, right_shape, style);
+            for (v, &w) in tail[b..b + n_s / 2].iter_mut().zip(short_right.iter().rev()) {
+                *v *= w;
+            }
+            tail[b + n_s / 2..].fill(0.0);
         }
     }
 }
 
-/// §4.6.11.3.2 — [`build_long_window`] generalized to an arbitrary
+/// §4.6.11.3.2 — the composite long-sequence window generalized to an arbitrary
 /// `(n_l, n_s)` transform family; every breakpoint is the spec's
 /// `N_l`/`N_s` expression evaluated at the caller's lengths (the
 /// standard family passes `(2048, 256)`, the SSR §4.6.12.1 per-band
@@ -654,7 +802,8 @@ fn build_long_window_n(
 /// families map `window_shape == 1` to the §4.6.17.2.3 low-overlap
 /// window; the LD long-only path never reaches the Start / Stop
 /// composites, but the parameterization keeps the construction
-/// uniform).
+/// uniform). The window is [`apply_long_window`] applied to ones, so
+/// the analysis paths window with exactly the synthesis geometry.
 fn build_long_window_style(
     n_l: usize,
     n_s: usize,
@@ -663,123 +812,13 @@ fn build_long_window_style(
     kind: LongKind,
     style: WindowStyle,
 ) -> Vec<f64> {
-    let long = window_halves_style(n_l, left_shape, right_shape, style);
-    let short = window_halves_style(n_s, left_shape, right_shape, style);
-    let half_l = n_l / 2;
-    let mut w = vec![0.0f64; n_l];
-
-    // Left half is always the plain long left half for OnlyLong /
-    // Start; Stop replaces it with the start-transition mirror.
-    match kind {
-        LongKind::OnlyLong | LongKind::Start => {
-            w[..half_l].copy_from_slice(&long.left);
-        }
-        LongKind::Stop => {
-            // 0.0 over [0, (N_l − N_s)/4); short left half over
-            // [(N_l − N_s)/4, (N_l + N_s)/4); 1.0 over
-            // [(N_l + N_s)/4, N_l/2).
-            let a = (n_l - n_s) / 4;
-            for (m, &sv) in short.left.iter().enumerate() {
-                w[a + m] = sv;
-            }
-            for slot in w.iter_mut().take(half_l).skip(a + n_s / 2) {
-                *slot = 1.0;
-            }
-        }
-    }
-
-    match kind {
-        LongKind::OnlyLong => {
-            for (m, &rv) in long.right.iter().enumerate() {
-                w[half_l + m] = rv;
-            }
-        }
-        LongKind::Start => {
-            // 1.0 over [N_l/2, (3N_l − N_s)/4); short right half
-            // over [(3N_l − N_s)/4, (3N_l + N_s)/4); 0.0 after.
-            let b = (3 * n_l - n_s) / 4;
-            for slot in w.iter_mut().take(b).skip(half_l) {
-                *slot = 1.0;
-            }
-            for (m, &rv) in short.right.iter().enumerate() {
-                w[b + m] = rv;
-            }
-            // [(3N_l + N_s)/4, N_l) stays 0.0 from the vec init.
-        }
-        LongKind::Stop => {
-            for (m, &rv) in long.right.iter().enumerate() {
-                w[half_l + m] = rv;
-            }
-        }
-    }
+    let mut w = vec![1.0f64; n_l];
+    apply_long_window(&mut w, n_s, left_shape, right_shape, kind, style);
     w
 }
 
-impl Filterbank {
-    /// §4.6.11.3.2 c) — the `EIGHT_SHORT` sequence: eight length-256
-    /// IMDCTs, each windowed with a short window, then overlapped and
-    /// added into the 2048-sample frame with leading/trailing zeros.
-    ///
-    /// Window-shape inheritance (§4.6.11.3.2): the *first* short
-    /// window's left half uses the previous block's shape; every
-    /// later short window's left half — and every short window's right
-    /// half — uses this block's `window_shape`.
-    fn short_windowed(
-        &self,
-        spec: &[f64],
-        left_shape: WindowShape,
-        right_shape: WindowShape,
-    ) -> Result<Vec<f64>> {
-        let n_s = self
-            .family
-            .short_transform_len()
-            .ok_or(Error::LdShortWindow)?;
-        let n_l = self.family.long_transform_len();
-        let short_len = n_s / 2; // 128 (120)
-        if spec.len() != NUM_SHORT_WINDOWS * short_len {
-            return Err(Error::FilterbankInvalid);
-        }
-
-        // Per-window windowed length-N_s time signals.
-        let mut windowed: Vec<Vec<f64>> = Vec::with_capacity(NUM_SHORT_WINDOWS);
-        for j in 0..NUM_SHORT_WINDOWS {
-            let coeffs = &spec[j * short_len..(j + 1) * short_len];
-            let x = imdct(coeffs, n_s);
-            // W_0 left half inherits the previous block's shape; all
-            // other windows' left halves use this block's shape.
-            let this_left = if j == 0 { left_shape } else { right_shape };
-            let halves = window_halves(n_s, this_left, right_shape);
-            let mut z = vec![0.0f64; n_s];
-            for n in 0..n_s / 2 {
-                z[n] = x[n] * halves.left[n];
-            }
-            for n in n_s / 2..n_s {
-                z[n] = x[n] * halves.right[n - n_s / 2];
-            }
-            windowed.push(z);
-        }
-
-        // §4.6.11.3.2 c) overlap-add of the eight short windows into a
-        // N_l-sample frame. Short window `j` starts at offset
-        // `(N_l − N_s)/4 + j·N_s/2` (each successive short window is
-        // hopped by N_s/2 = 128 (120) samples) — the spec's piecewise
-        // z_{i,n} is exactly this 50%-overlap-add with the first
-        // window placed at (N_l − N_s)/4 = 448 (420).
-        let mut z = vec![0.0f64; n_l];
-        let start = (n_l - n_s) / 4; // 448 (420)
-        let hop = n_s / 2; // 128 (120)
-        for (j, win) in windowed.iter().enumerate() {
-            let base = start + j * hop;
-            for (n, &v) in win.iter().enumerate() {
-                z[base + n] += v;
-            }
-        }
-        Ok(z)
-    }
-}
-
 /// Discriminates the three long-transform `window_sequence` shapes
-/// inside [`Filterbank::long_window`].
+/// inside [`apply_long_window`].
 #[derive(Clone, Copy)]
 enum LongKind {
     OnlyLong,

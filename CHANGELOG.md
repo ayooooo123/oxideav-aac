@@ -26,6 +26,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Replace the quadratic, per-sample-cosine IMDCT and LTP/encoder MDCT
+  with cached, mixed-radix FFT transforms for all AAC frame sizes.
+  The self-contained `mdct` module ports the pre/post rotations from
+  FFmpeg `libavutil/tx_template.c` (LGPL-2.1-or-later, commit 2da55bf).
+  Synthesis windows are computed once per size/shape; LC/Main/LD reuse
+  transform scratch and ELD computes only the half-IMDCT it consumes.
 - AAC LTP: the LTP analysis of a `LONG_START` / `LONG_STOP` frame used a
   128-point short transition (the short window's half length) instead of
   the 256-point short transform, so the predicted spectrum differed from
