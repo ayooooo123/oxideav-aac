@@ -8,6 +8,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- USAC (AOT 42) mono/stereo 1024-line FD decoding behind the AAC
+  registry: bounded `UsacConfig`, context-adaptive arithmetic spectra,
+  noise filling, grouped short windows, MS/complex stereo prediction and
+  USAC's four-bit long-window TNS orders. Optional `target_level` applies
+  program/anchor loudness for the unprocessed layout; extension payloads
+  are length-bounded. This is an LGPL-2.1-or-later port of FFmpeg
+  `aacdec_usac.c` / `aacdec_ac.c` and their tables at 2da55bf.
+  LPD/ACELP, FAC transitions, eSBR/MPS212 and time-warped MDCT remain
+  explicit unsupported errors. MP4 presentation trimming still requires
+  packet side data from the container, not a codec latency adjustment.
 - ER AAC ELD (AOT 39) decoding: `ELDSpecificConfig` parsing (low-delay
   SBR and the resilience tools are rejected, as FFmpeg does), the ELD
   element syntax (no instance tags, no window sequence / shape, pulse or

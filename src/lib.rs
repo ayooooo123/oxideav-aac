@@ -406,6 +406,10 @@ pub mod adts;
 pub mod adts_container;
 pub mod adts_crc;
 pub mod asc;
+pub mod usac_config;
+mod usac;
+mod usac_arith;
+mod usac_tables;
 pub mod asc_writer;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]

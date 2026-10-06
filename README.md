@@ -1,15 +1,31 @@
 # oxideav-aac
 
-[![CI](https://github.com/OxideAV/oxideav-aac/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-aac/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-aac.svg)](https://crates.io/crates/oxideav-aac) [![docs.rs](https://docs.rs/oxideav-aac/badge.svg)](https://docs.rs/oxideav-aac) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/OxideAV/oxideav-aac/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-aac/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-aac.svg)](https://crates.io/crates/oxideav-aac) [![docs.rs](https://docs.rs/oxideav-aac/badge.svg)](https://docs.rs/oxideav-aac) [Licensing](#license)
 
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-Every numeric constant, bit layout, and clause reference is sourced from
-the staged ISO/IEC 13818-7 and ISO/IEC 14496-3 specifications under
-`docs/audio/aac/`.
+The original primitives reference the staged ISO/IEC 13818-7 and
+ISO/IEC 14496-3 specifications under `docs/audio/aac/`. This fork also
+contains LGPL-licensed FFmpeg ports, identified in their source headers.
 
 ## Status
+
+The PearTube runtime decoder emits interleaved F32. Its MDCT/IMDCT uses
+cached mixed-radix FFT plans for all supported frame families, including
+ELD and LTP analysis; synthesis windows and transform scratch are reused.
+
+USAC (AOT 42) accepts raw access units with `UsacConfig` in extradata:
+mono/stereo 1024-line FD, arithmetic spectra, noise filling, MS/complex
+stereo and TNS. The optional `target_level` codec option (-63..=0 dBFS;
+0 disables it) applies program/anchor loudness for the unprocessed layout.
+LPD/ACELP, FAC transitions, eSBR/MPS212 and time-warped MDCT are rejected.
+USAC and two ELD MP4 fixtures still need container-provided sample trimming;
+the decoder deliberately retains its complete raw PCM. The workspace's
+`check-aac` tests assert those exact presentation gaps separately from
+codec fidelity, including every presented sample and the USAC S16 FATE
+references. Phone performance and end-to-end presentation trimming are
+not established by these codec tests.
 
 The crate implements the full AAC-LC decode chain end to end — from
 ADTS bitstream parse through the per-tool reconstruction to interleaved
@@ -260,7 +276,7 @@ ISO-copyright bitstreams are never committed). Measured state:
 - **Filterbank** (`filterbank`) — §4.6.11 stateful per-channel IMDCT
   with sine / KBD windows, all four `window_sequence` shapes, eight-short
   internal overlap-add, and inter-frame overlap-add. Pinned by streaming
-  TDAC perfect-reconstruction tests. Covers **all four §4.5.1.1
+  TDAC perfect-reconstruction tests. Cached FFT transforms and windows cover **all four §4.5.1.1
   frame-length families**: the 1024/128- and 960/120-line
   block-switching families (`N = 2048/256` and `1920/240`) and the
   long-only ER AAC LD 512/480-line families (`N = 1024/960`), where
@@ -960,7 +976,7 @@ the EP section below).
   (`aac-lc-mono-8000-16kbps-adts`, `aac-lc-intensity-stereo`) are
   **99.9% byte-exact** to the reference s16 output with a **max error of
   1 LSB** — the residual is purely the difference between this crate's
-  `f64` direct-sum IMDCT and a `float32` fast transform. The PNS-bearing
+  `f64` FFT-based IMDCT and a `float32` fast transform. The PNS-bearing
   fixtures are compared in the PCM RMS domain (per the fixtures-doc §8),
   where the error-to-signal RMS ratio stays below 0.1%; full
   byte-exactness on those is precluded by the §4.6.13.3 spec-undefined
@@ -1517,4 +1533,6 @@ component still open (see below):
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+Original code: MIT — see [LICENSE](./LICENSE). FFmpeg-derived files are
+LGPL-2.1-or-later — see [LICENSE-LGPL](./LICENSE-LGPL) and each source
+header. The combined fork is declared `MIT AND LGPL-2.1-or-later`.

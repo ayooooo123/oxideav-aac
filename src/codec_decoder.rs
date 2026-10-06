@@ -110,8 +110,11 @@ pub const WAVE_FORMAT_MPEG_ADTS_AAC: u16 = 0x1601;
 ///   the Matroska `A_AAC` `CodecPrivate`, the WAVEFORMATEX `0x00FF`
 ///   trailer, …) and every packet is one bare access unit
 ///   (ISO/IEC 14496-14 §3.1.2 / §5.6: a sample is one AU, no ADTS
-///   header). A packet that is nevertheless a complete ADTS frame is
-///   still decoded as ADTS.
+///   header). USAC (AOT 42) uses [`crate::usac_config::UsacConfig`]
+///   and the 1024-line mono/stereo FD core. Its optional `target_level`
+///   codec option selects loudness normalization (-63..=0 dBFS, with
+///   0 disabling normalization). Other AAC profiles also accept a packet
+///   that is nevertheless a complete ADTS frame as ADTS.
 /// * **In-band configuration** — ADTS frames or a LOAS
 ///   `AudioSyncStream`, auto-detected from the first packet's syncword.
 ///   When neither syncword is present and no extradata was supplied,
@@ -123,6 +126,10 @@ pub const WAVE_FORMAT_MPEG_ADTS_AAC: u16 = 0x1601;
 /// advertised output description; the real per-frame sample rate and
 /// channel count come from the configuration actually decoded.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    // USAC has a different configuration and core syntax, not a GA body.
+    if crate::usac_config::is_usac(&params.extradata) {
+        return Ok(Box::new(crate::usac::UsacDecoder::new(params)?));
+    }
     let mut sample_rate = params.sample_rate.unwrap_or(44_100);
     let mut channels = params.channels.unwrap_or(2);
 
