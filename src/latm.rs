@@ -693,46 +693,72 @@ impl<'a> AudioSyncStream<'a> {
     /// On a successful decode the frame's [`StreamMuxConfig`] is
     /// retained so a subsequent frame carrying `useSameStreamMux` can
     /// inherit it.
+    ///
+    /// Real transports hand this decoder whole PES payloads whose
+    /// framing can be imperfect: a truncated final sync frame, or a
+    /// first frame that inherits a `StreamMuxConfig` transmitted
+    /// before the capture began. Both are skipped — the walk resyncs
+    /// to the next syncword (or, for an inherited-config frame,
+    /// jumps past the frame) and decode continues with the next
+    /// frame, matching FFmpeg's `latm_decode_frame`, which returns
+    /// `AVERROR_INVALIDDATA` for an overrun (the packet is dropped,
+    /// the stream carries on) and skips a `useSameStreamMux == 1`
+    /// frame that arrives before any config.
     pub fn next_frame(&mut self) -> Result<Option<LoasFrame>> {
-        let Some(sync_off) = self.find_syncword(AUDIO_SYNC_STREAM_SYNCWORD, 11) else {
-            self.pos = self.data.len();
-            return Ok(None);
-        };
+        loop {
+            let Some(sync_off) = self.find_syncword(AUDIO_SYNC_STREAM_SYNCWORD, 11) else {
+                self.pos = self.data.len();
+                return Ok(None);
+            };
 
-        // Read audioMuxLengthBytes (13 bits) starting after the 11-bit
-        // syncword.
-        let mut reader = BitReader::new(&self.data[sync_off..]);
-        reader.skip(11).map_err(|_| Error::LoasSyncInvalid)?;
-        let audio_mux_length_bytes =
-            reader.read_u32(13).map_err(|_| Error::LoasSyncInvalid)? as u16;
+            // Read audioMuxLengthBytes (13 bits) starting after the 11-bit
+            // syncword.
+            let mut reader = BitReader::new(&self.data[sync_off..]);
+            reader.skip(11).map_err(|_| Error::LoasSyncInvalid)?;
+            let audio_mux_length_bytes =
+                reader.read_u32(13).map_err(|_| Error::LoasSyncInvalid)? as u16;
 
-        // The AudioMuxElement(1) follows; it is byte-aligned because
-        // 11 + 13 = 24 bits = 3 whole bytes.
-        debug_assert_eq!(reader.bit_position(), 24);
-        let element_byte_start = sync_off + 3;
-        let element_byte_end = element_byte_start + usize::from(audio_mux_length_bytes);
-        if element_byte_end > self.data.len() {
-            return Err(Error::LoasSyncInvalid);
+            // The AudioMuxElement(1) follows; it is byte-aligned because
+            // 11 + 13 = 24 bits = 3 whole bytes.
+            debug_assert_eq!(reader.bit_position(), 24);
+            let element_byte_start = sync_off + 3;
+            let element_byte_end = element_byte_start + usize::from(audio_mux_length_bytes);
+            if element_byte_end > self.data.len() {
+                // Truncated / overrun sync frame: resync past this
+                // syncword and keep looking.
+                self.pos = sync_off + 1;
+                continue;
+            }
+            let element_bytes = &self.data[element_byte_start..element_byte_end];
+            let mut elem_reader = BitReader::new(element_bytes);
+            let element = match AudioMuxElement::parse(
+                &mut elem_reader,
+                element_bytes,
+                true,
+                self.prev_config.as_ref(),
+            ) {
+                Ok(element) => element,
+                Err(Error::LatmNoPreviousMuxConfig) => {
+                    // A `useSameStreamMux == 1` frame before any
+                    // StreamMuxConfig: skip the frame and continue
+                    // with the next one (FFmpeg drops the packet).
+                    self.pos = element_byte_end;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            self.prev_config = Some(element.config.clone());
+            self.pos = element_byte_end;
+
+            return Ok(Some(LoasFrame {
+                audio_mux_length_bytes,
+                element,
+                frame_counter: None,
+                offset: sync_off,
+                next_offset: element_byte_end,
+            }));
         }
-        let element_bytes = &self.data[element_byte_start..element_byte_end];
-        let mut elem_reader = BitReader::new(element_bytes);
-        let element = AudioMuxElement::parse(
-            &mut elem_reader,
-            element_bytes,
-            true,
-            self.prev_config.as_ref(),
-        )?;
-
-        self.prev_config = Some(element.config.clone());
-        self.pos = element_byte_end;
-
-        Ok(Some(LoasFrame {
-            audio_mux_length_bytes,
-            element,
-            frame_counter: None,
-            offset: sync_off,
-            next_offset: element_byte_end,
-        }))
     }
 
     /// Search for an `n`-bit syncword on byte boundaries from the
@@ -1884,7 +1910,12 @@ mod tests {
     }
 
     #[test]
-    fn audio_sync_stream_truncated_body_rejected() {
+    fn audio_sync_stream_truncated_body_resyncs() {
+        // A sync frame whose audioMuxLengthBytes overruns the buffer is
+        // skipped; the walk resyncs to the next syncword (or reports
+        // end-of-stream when none follows) instead of failing the
+        // whole packet — FFmpeg drops the packet and the stream
+        // carries on.
         let payload: [u8; 4] = [0x01, 0x02, 0x03, 0x04];
         let body = build_min_audio_mux_element(&payload);
         let mut w = BitWriter::new();
@@ -1895,7 +1926,7 @@ mod tests {
         let stream = w.finish();
 
         let mut walker = AudioSyncStream::new(&stream);
-        assert!(matches!(walker.next_frame(), Err(Error::LoasSyncInvalid)));
+        assert!(matches!(walker.next_frame(), Ok(None)));
     }
 
     #[test]
