@@ -13,9 +13,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   noise filling, grouped short windows, MS/complex stereo prediction and
   USAC's four-bit long-window TNS orders. AudioPreRoll primes fresh, reset
   or reconfigured decoders and applies embedded configuration changes; it
-  is skipped during continuous decoding (ISO/IEC 23003-3 7.18.3.3). FFmpeg
-  2da55bf parses it as fill and never primes, so FATE xhe_target_level no
-  longer matches FFmpeg (19.69 dB SNR; unresolved regression). Optional
+  is skipped during continuous decoding (ISO/IEC 23003-3 7.18.3.3). Noise
+  filling seeds the first channel 0x3039 as libxaac does (FFmpeg 2da55bf
+  leaves it 0). FATE xhe_target_level matches libxaac 2fbadd5 at 112 dB but
+  FFmpeg 2da55bf, which never primes, only near 20 dB (unresolved). Optional
   `target_level` (-70..=0 dBFS, FFmpeg's range)
   applies program/anchor loudness for the unprocessed layout; extension
   payloads are length-bounded. This is an LGPL-2.1-or-later port of FFmpeg

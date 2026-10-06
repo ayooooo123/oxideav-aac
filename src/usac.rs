@@ -375,8 +375,9 @@ impl Channel {
             arith: usac_arith::State::default(),
             spectrum: [0.0; N],
             scalefactors: [0; MAX_BANDS],
-            // Preserve the reference decoder's FD reset seeds.
-            noise_seed: if channel == 1 { 0x10932 } else { 0 },
+            // libxaac ixheaacd_create.c seeds a CPE's channels 0x3039 and
+            // 0x10932 and an SCE 0x3039; FFmpeg's `if (!ch)` leaves ch0 at 0.
+            noise_seed: if channel == 1 { 0x10932 } else { 0x3039 },
             tns: Tns::default(),
             filterbank: Filterbank::new(),
             transform: [0.0; N],

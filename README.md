@@ -21,10 +21,11 @@ M/S and complex stereo prediction, and TNS. AudioPreRoll primes a fresh,
 reset or reconfigured decoder with its pre-roll AUs (output discarded) and
 applies embedded configuration changes; continuous decoding with an
 unchanged configuration skips it (ISO/IEC 23003-3 7.18.3.3).
-applyCrossfade is not applied. FFmpeg 2da55bf parses AudioPreRoll as fill
-and never primes, so FATE xhe_target_level (non-silent pre-roll, noise
-filling) no longer matches the FFmpeg reference (19.69 dB SNR); this is an
-unresolved regression. The optional `target_level` codec option
+applyCrossfade is not applied. Noise filling seeds the first channel 0x3039
+as libxaac does; FFmpeg 2da55bf leaves it 0 and parses AudioPreRoll as fill,
+so it never primes. On FATE xhe_target_level the fork matches libxaac
+2fbadd5 at 112 dB over the presented samples but FFmpeg's reference only near
+20 dB; which oracle governs that file is unresolved. The optional `target_level` codec option
 (-70..=0 dBFS, FFmpeg's range; 0 disables it) applies program/anchor
 loudness for the unprocessed layout. See "Not yet supported" for the
 rejected and unverified USAC tools.
