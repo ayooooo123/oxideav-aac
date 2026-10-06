@@ -449,7 +449,7 @@ pub struct CceDecoder {
     /// synthesize to the time domain with their own window state).
     fb: Filterbank,
     /// §4.6.13.3 generator state for noise bands in the embedded SCE.
-    pns_state: u32,
+    pns_state: SharedPnsState,
 }
 
 impl Default for CceDecoder {
@@ -462,16 +462,29 @@ impl CceDecoder {
     /// A fresh CCE decoder with zeroed filterbank overlap.
     #[must_use]
     pub fn new() -> Self {
-        Self::new_family(crate::swb_offset::FrameFamily::Lc1024)
+        // Standalone constructor (tests): its own FFmpeg-seeded RNG.
+        Self::new_family_shared(
+            crate::swb_offset::FrameFamily::Lc1024,
+            SharedPnsState::new(std::sync::Mutex::new(0x1f2e_3d4c)),
+        )
     }
 
     /// A fresh CCE decoder for an arbitrary §4.5.1.1 frame-length
-    /// family.
+    /// family, sharing the stream's PNS RNG.
     #[must_use]
-    pub fn new_family(family: crate::swb_offset::FrameFamily) -> Self {
+    pub fn new_family(family: crate::swb_offset::FrameFamily, pns: SharedPnsState) -> Self {
         CceDecoder {
             fb: Filterbank::new_family(family),
-            pns_state: 0x0001_2345,
+            pns_state: pns,
+        }
+    }
+
+    /// A fresh CCE decoder with its own FFmpeg-seeded RNG (tests).
+    #[must_use]
+    pub fn new_family_shared(family: crate::swb_offset::FrameFamily, pns: SharedPnsState) -> Self {
+        CceDecoder {
+            fb: Filterbank::new_family(family),
+            pns_state: pns,
         }
     }
 
@@ -495,7 +508,7 @@ impl CceDecoder {
         // §4.6.13 PNS on the embedded single channel.
         let max_sfb = usize::from(cce.ics_info.max_sfb);
         let noise_nrg = noise_nrg_table(&abs, &cce.body.section_data.sfb_cb, max_sfb)?;
-        let state = &mut self.pns_state;
+        let state = &mut self.pns_state.lock().unwrap_or_else(|e| e.into_inner());
         let mut pns_chan = PnsChannel {
             spec: &mut spec,
             sfb_cb: &cce.body.section_data.sfb_cb,
@@ -561,6 +574,13 @@ impl Default for CpeJointStereo {
 /// Construct one [`ElementDecoder`] per channel element of the stream
 /// (one for an SCE / LFE, one for a CPE) and call [`Self::decode_sce`]
 /// / [`Self::decode_cpe`] once per frame.
+/// Decoder-global PNS RNG state. FFmpeg seeds one LCG per decoder
+/// (`0x1f2e3d4c`, `aacdec.c`) and advances it across every PNS band of
+/// every element in decode order; the fork previously reseeded each
+/// element's own generator, which mismatches FFmpeg sample-for-sample
+/// on PNS-heavy streams (FATE `al18_44`).
+pub type SharedPnsState = std::sync::Arc<std::sync::Mutex<u32>>;
+
 #[derive(Debug, Clone)]
 pub struct ElementDecoder {
     /// Per-channel filterbanks. `[0]` for the SCE / LFE or the CPE's
@@ -584,7 +604,7 @@ pub struct ElementDecoder {
     ssr_decoders: [Option<Box<SsrChannelDecoder>>; 2],
     /// §4.6.13.3 default generator state, advanced across every noise
     /// band of every frame so the noise is reproducible per decode run.
-    pns_state: u32,
+    pns_state: SharedPnsState,
 }
 
 impl Default for ElementDecoder {
@@ -597,12 +617,18 @@ impl ElementDecoder {
     /// A fresh element decoder with zeroed filterbank overlap and a
     /// fixed PNS generator seed.
     pub fn new() -> Self {
-        Self::new_family(crate::swb_offset::FrameFamily::Lc1024)
+        // Standalone constructor (tests): its own FFmpeg-seeded RNG.
+        Self::new_family(
+            crate::swb_offset::FrameFamily::Lc1024,
+            SharedPnsState::new(std::sync::Mutex::new(0x1f2e_3d4c)),
+        )
     }
 
     /// A fresh element decoder whose per-channel filterbank and LTP
-    /// state run an arbitrary §4.5.1.1 frame-length family.
-    pub fn new_family(family: crate::swb_offset::FrameFamily) -> Self {
+    /// state run an arbitrary §4.5.1.1 frame-length family. `pns` is
+    /// the decoder-global PNS RNG (FFmpeg's single `0x1f2e3d4c`-seeded
+    /// LCG) shared across every element of the stream.
+    pub fn new_family(family: crate::swb_offset::FrameFamily, pns: SharedPnsState) -> Self {
         ElementDecoder {
             filterbanks: [
                 Filterbank::new_family(family),
@@ -611,11 +637,7 @@ impl ElementDecoder {
             ltp_states: [LtpState::new_family(family), LtpState::new_family(family)],
             predictor_banks: [None, None],
             ssr_decoders: [None, None],
-            // Any non-zero seed yields a non-degenerate sequence; the
-            // §4.6.13.3 normalisation makes the per-band energy
-            // independent of the seed, so this choice only fixes the
-            // (spec-undefined) per-coefficient phase.
-            pns_state: 0x0001_2345,
+            pns_state: pns,
         }
     }
 
@@ -628,7 +650,7 @@ impl ElementDecoder {
             ltp_states: [LtpState::new(), LtpState::new()],
             predictor_banks: [None, None],
             ssr_decoders: [None, None],
-            pns_state: seed,
+            pns_state: SharedPnsState::new(std::sync::Mutex::new(seed)),
         }
     }
 
@@ -662,7 +684,7 @@ impl ElementDecoder {
 
         // §4.6.13 PNS on the single channel (no pair correlation).
         let noise_nrg = noise_nrg_table(&abs, &ch.body.section_data.sfb_cb, max_sfb)?;
-        let state = &mut self.pns_state;
+        let state = &mut self.pns_state.lock().unwrap_or_else(|e| e.into_inner());
         let mut pns_chan = PnsChannel {
             spec: &mut spec,
             sfb_cb: &ch.body.section_data.sfb_cb,
@@ -809,7 +831,7 @@ impl ElementDecoder {
                 sfb_cb: &right.body.section_data.sfb_cb,
                 noise_nrg: &right_nrg,
             };
-            let state = &mut self.pns_state;
+            let state = &mut self.pns_state.lock().unwrap_or_else(|e| e.into_inner());
             apply_pns_pair(
                 &mut left_chan,
                 &mut right_chan,

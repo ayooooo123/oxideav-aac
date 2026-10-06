@@ -254,7 +254,7 @@ impl AdtsDemuxer {
         let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
         params.sample_rate = Some(out_rate);
         params.channels = Some(if out_channels > 0 { out_channels } else { 2 });
-        params.sample_format = Some(SampleFormat::S16);
+        params.sample_format = Some(SampleFormat::F32);
         params.extradata = extradata;
         let stream_bytes: u64 = frames.iter().map(|f| u64::from(f.len)).sum();
         if pts > 0 {

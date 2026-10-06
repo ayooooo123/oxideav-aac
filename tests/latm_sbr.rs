@@ -124,7 +124,7 @@ fn build_loas(payloads: &[Vec<u8>], write_asc: impl Fn(&mut BitWriter)) -> Vec<u
 
 /// Decode LOAS bytes to one interleaved PCM vector, checking every
 /// frame is SBR-active dual-rate stereo output.
-fn decode_loas_pcm(loas: &[u8]) -> Vec<i16> {
+fn decode_loas_pcm(loas: &[u8]) -> Vec<f32> {
     let mut dec = LoasDecoder::new();
     let frames = dec.decode_all(loas).expect("LOAS decode");
     let mut pcm = Vec::new();
@@ -138,7 +138,7 @@ fn decode_loas_pcm(loas: &[u8]) -> Vec<i16> {
 }
 
 /// Reference: the same access units through the bare ADTS path.
-fn decode_adts_pcm(adts: &[u8]) -> Vec<i16> {
+fn decode_adts_pcm(adts: &[u8]) -> Vec<f32> {
     let mut dec = StreamDecoder::new();
     let frames = dec.decode_all(adts).expect("ADTS decode");
     let mut pcm = Vec::new();

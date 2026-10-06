@@ -165,7 +165,7 @@ fn he_aac_v2_ps_pcm_matches_reference() {
     // Fixture ASC: AOT 2 core at 16 kHz (index 8), mono config; the
     // SBR + PS extension upgrades each frame to 2048×2 @ 32 kHz.
     let mut dec = StreamDecoder::new();
-    let mut ours: Vec<i16> = Vec::new();
+    let mut ours: Vec<f32> = Vec::new();
     let mut ps_frames = 0usize;
     for &(off, len) in &samples {
         let au = &m4a[off..off + len];
@@ -275,7 +275,7 @@ fn he_aac_v2_ps_downsampled_matches_decimated_reference() {
 
     let mut dec = StreamDecoder::new();
     dec.set_sbr_downsampled(true);
-    let mut ours: Vec<i16> = Vec::new();
+    let mut ours: Vec<f32> = Vec::new();
     for &(off, len) in &samples {
         let au = &m4a[off..off + len];
         let f = dec
@@ -336,7 +336,8 @@ fn he_aac_v2_ps_downsampled_matches_decimated_reference() {
     let ref_lp: Vec<Vec<f64>> = (0..2)
         .map(|ch| lowpass(&channel(&expected, ch), 0.245, 481))
         .collect();
-    let our_down: Vec<Vec<f64>> = (0..2).map(|ch| channel(&ours, ch)).collect();
+    let ours_i16: Vec<i16> = ours.iter().map(|&s| (s * 32768.0) as i16).collect();
+    let our_down: Vec<Vec<f64>> = (0..2).map(|ch| channel(&ours_i16, ch)).collect();
     let score = |d: isize, step: usize| -> f64 {
         let mut err = 0.0;
         let mut sig = 0.0;

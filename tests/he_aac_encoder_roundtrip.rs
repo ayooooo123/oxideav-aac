@@ -141,7 +141,7 @@ fn round_trip(pcm: &[i16], cfg: HeAacConfig) -> Metrics {
     let mut out: Vec<i16> = Vec::new();
     for f in &frames {
         assert_eq!(f.channels, ch);
-        out.extend_from_slice(&f.pcm);
+        out.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     let input = channel(pcm, ch, 0);
     let output = channel(&out, ch, 0);
@@ -309,12 +309,12 @@ fn loas_wrapped_he_aac_decodes_at_full_rate() {
     assert!(!frames.is_empty());
     assert!(frames.iter().all(|f| f.sample_rate == 44_100));
     assert!(frames.iter().all(|f| f.channels == 2));
-    let latm_pcm: Vec<i16> = frames.iter().flat_map(|f| f.pcm.iter().copied()).collect();
+    let latm_pcm: Vec<f32> = frames.iter().flat_map(|f| f.pcm.iter().copied()).collect();
 
     // Identical to the ADTS decode path.
     let mut adts_dec = StreamDecoder::new();
     let adts_frames = adts_dec.decode_all(&adts).unwrap();
-    let adts_pcm: Vec<i16> = adts_frames
+    let adts_pcm: Vec<f32> = adts_frames
         .iter()
         .flat_map(|f| f.pcm.iter().copied())
         .collect();

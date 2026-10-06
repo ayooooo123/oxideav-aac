@@ -116,7 +116,7 @@ pub struct DecodedFrame {
 /// Construct one [`StreamDecoder`] per stream and feed it ADTS frames in
 /// order via [`Self::decode_frame`], or hand it the whole byte buffer
 /// via [`Self::decode_all`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StreamDecoder {
     decoders: HashMap<(u8, u8), ElementDecoder>,
     /// One §4.6.8.3.3 CCE decoder per coupling-element instance tag
@@ -133,6 +133,13 @@ pub struct StreamDecoder {
     /// duplicates its mono synthesis into both channels until the
     /// first decodable `ps_data()`.
     ps_signaled: bool,
+    /// Decoder-global PNS RNG (FFmpeg's single `0x1f2e3d4c`-seeded
+    /// LCG, advanced across every PNS band of every element in decode
+    /// order). Shared into each `ElementDecoder`.
+    pns_state: crate::element_decode::SharedPnsState,
+    /// The stream's `AudioSpecificConfig` rules PS out: in-band PS
+    /// payloads are skipped and the output stays mono.
+    ps_absent: bool,
     /// Latched once any frame carries SBR data: from then on every
     /// frame is emitted at the SBR output rate (doubled, or the core
     /// rate in downsampled mode) — SBR-less frames go through the
@@ -206,6 +213,14 @@ impl StreamDecoder {
     /// the first frame.
     pub fn set_ps_signaled(&mut self, ps_signaled: bool) {
         self.ps_signaled = ps_signaled;
+    }
+
+    /// Mark the stream's `AudioSpecificConfig` as ruling PS out
+    /// (explicit `psPresentFlag == 0` or the hierarchical wrapper):
+    /// in-band PS payloads are then skipped, not decoded, and the
+    /// output stays mono (FFmpeg's `ps = 0` state).
+    pub fn set_ps_absent(&mut self, ps_absent: bool) {
+        self.ps_absent = ps_absent;
     }
 
     /// Install the §4.5.1.1 frame-length family (from
@@ -427,7 +442,7 @@ impl StreamDecoder {
             let dec = self
                 .cce_decoders
                 .entry(cce.element_instance_tag)
-                .or_insert_with(|| CceDecoder::new_family(family));
+                .or_insert_with(|| CceDecoder::new_family(family, self.pns_state.clone()));
             decoded_cces.push(dec.decode(cce, aot, fs)?);
         }
 
@@ -452,7 +467,7 @@ impl StreamDecoder {
                     let dec = self
                         .decoders
                         .entry(pe.key)
-                        .or_insert_with(|| ElementDecoder::new_family(family));
+                        .or_insert_with(|| ElementDecoder::new_family(family, self.pns_state.clone()));
                     vec![dec.decode_sce_coupled(&ch, aot, fs, &coupling)?]
                 }
                 ParsedChannel::Pair(cpe) => {
@@ -464,7 +479,7 @@ impl StreamDecoder {
                     let dec = self
                         .decoders
                         .entry(pe.key)
-                        .or_insert_with(|| ElementDecoder::new_family(family));
+                        .or_insert_with(|| ElementDecoder::new_family(family, self.pns_state.clone()));
                     let (l, r) = dec.decode_cpe_coupled(
                         &left,
                         &right,
@@ -523,6 +538,7 @@ impl StreamDecoder {
                             d.set_downsampled(self.sbr_downsampled)?;
                             d.set_low_power(self.sbr_low_power)?;
                             d.set_ps_signaled(self.ps_signaled);
+                            d.set_ps_absent(self.ps_absent);
                             v.insert(d)
                         }
                     };
@@ -882,7 +898,7 @@ impl StreamDecoder {
                     let dec = self
                         .decoders
                         .entry(key)
-                        .or_insert_with(|| ElementDecoder::new_family(family));
+                        .or_insert_with(|| ElementDecoder::new_family(family, self.pns_state.clone()));
                     channels.push(dec.decode_sce(&ch, aot, fs)?);
                 }
                 IdSynEle::Cpe => {
@@ -943,7 +959,7 @@ impl StreamDecoder {
                         let dec = self
                             .decoders
                             .entry(key)
-                            .or_insert_with(|| ElementDecoder::new_family(family));
+                            .or_insert_with(|| ElementDecoder::new_family(family, self.pns_state.clone()));
                         dec.decode_cpe(&left, &right, &joint, aot, fs)?
                     } else {
                         let left_body = IcsBody::parse_er_family(
@@ -999,7 +1015,7 @@ impl StreamDecoder {
                         let dec = self
                             .decoders
                             .entry(key)
-                            .or_insert_with(|| ElementDecoder::new_family(family));
+                            .or_insert_with(|| ElementDecoder::new_family(family, self.pns_state.clone()));
                         dec.decode_cpe(&left, &right, &CpeJointStereo::default(), aot, fs)?
                     };
                     channels.push(dec_out.0);
@@ -1321,5 +1337,27 @@ mod tests {
     fn kind_id_separates_sce_and_cpe() {
         assert_ne!(kind_id(IdSynEle::Sce), kind_id(IdSynEle::Cpe));
         assert_ne!(kind_id(IdSynEle::Lfe), kind_id(IdSynEle::Cpe));
+    }
+}
+
+
+impl Default for StreamDecoder {
+    fn default() -> Self {
+        StreamDecoder {
+            decoders: Default::default(),
+            cce_decoders: Default::default(),
+            sbr: Default::default(),
+            sbr_prev_header: Default::default(),
+            ps_signaled: false,
+            ps_absent: false,
+            pns_state: crate::element_decode::SharedPnsState::new(std::sync::Mutex::new(
+                0x1f2e_3d4c,
+            )),
+            sbr_active: false,
+            sbr_downsampled: false,
+            sbr_low_power: false,
+            family: crate::swb_offset::FrameFamily::Lc1024,
+            program_config: None,
+        }
     }
 }

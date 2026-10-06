@@ -27,7 +27,8 @@ fn roundtrip(pcm: &[i16], config: EncoderConfig) -> Vec<i16> {
         .expect("self-produced stream decodes");
     let mut out = Vec::new();
     for f in &frames {
-        out.extend_from_slice(&f.pcm);
+        // Decoded f32 → the encoder's i16 domain.
+        out.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     out
 }
@@ -167,7 +168,7 @@ fn low_rate_mono_stays_within_budget_and_decodes() {
     // RMS bound.
     let mut out = Vec::new();
     for f in &decoded {
-        out.extend_from_slice(&f.pcm);
+        out.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     let ratio = err_to_signal_rms(&pcm, &out[FRAME_LEN..]);
     eprintln!("8 kHz / 16 kbps err/sig RMS = {ratio:.5}");
@@ -301,7 +302,8 @@ fn identical_channels_engage_ms_and_shrink_the_stream() {
     let frames = dec.decode_all(&stereo_stream).unwrap();
     let mut out = Vec::new();
     for f in &frames {
-        out.extend_from_slice(&f.pcm);
+        // Decoded f32 → the encoder's i16 domain.
+        out.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     let ratio = err_to_signal_rms(&stereo, &out[FRAME_LEN * 2..]);
     eprintln!("identical-channel stereo err/sig RMS = {ratio:.5}");
@@ -440,7 +442,8 @@ fn transient_input_switches_to_short_windows() {
     let frames = dec.decode_all(&stream).expect("decodes");
     let mut out = Vec::new();
     for f in &frames {
-        out.extend_from_slice(&f.pcm);
+        // Decoded f32 → the encoder's i16 domain.
+        out.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     let ratio = err_to_signal_rms(&pcm, &out[FRAME_LEN..]);
     eprintln!("transient round-trip err/sig RMS = {ratio:.5}");
@@ -529,7 +532,7 @@ fn fixture_transcode_preserves_the_signal() {
         };
         let mut pcm = Vec::new();
         for f in &frames {
-            pcm.extend_from_slice(&f.pcm);
+            pcm.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
         }
         assert_eq!(frames[0].sample_rate, rate, "{name}");
 
@@ -547,7 +550,7 @@ fn fixture_transcode_preserves_the_signal() {
         let frames2 = dec2.decode_all(&stream).expect("re-encoded stream decodes");
         let mut pcm2 = Vec::new();
         for f in &frames2 {
-            pcm2.extend_from_slice(&f.pcm);
+            pcm2.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
         }
         let ch = channels as usize;
         assert_eq!(pcm2.len(), pcm.len() + FRAME_LEN * ch);
@@ -664,7 +667,8 @@ fn correlated_high_bands_engage_intensity_stereo() {
     let frames = dec.decode_all(&stream).expect("IS stream decodes");
     let mut out = Vec::new();
     for f in &frames {
-        out.extend_from_slice(&f.pcm);
+        // Decoded f32 → the encoder's i16 domain.
+        out.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     let ratio = err_to_signal_rms(&pcm, &out[FRAME_LEN * 2..]);
     eprintln!("intensity-stereo round-trip err/sig RMS = {ratio:.5}");
@@ -715,7 +719,8 @@ fn anti_correlated_pair_uses_out_of_phase_book() {
     let frames = dec.decode_all(&stream).expect("decodes");
     let mut out = Vec::new();
     for f in &frames {
-        out.extend_from_slice(&f.pcm);
+        // Decoded f32 → the encoder's i16 domain.
+        out.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     let steady = &out[FRAME_LEN * 2..];
     let (mut dot, mut el, mut er) = (0.0f64, 0.0f64, 0.0f64);
@@ -844,7 +849,8 @@ fn burst_decay_noise_engages_tns_and_roundtrips() {
     let frames = dec.decode_all(&stream).expect("TNS stream decodes");
     let mut out = Vec::new();
     for f in &frames {
-        out.extend_from_slice(&f.pcm);
+        // Decoded f32 → the encoder's i16 domain.
+        out.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     let ratio = err_to_signal_rms(&pcm, &out[FRAME_LEN..]);
     eprintln!("burst-decay TNS round-trip err/sig RMS = {ratio:.5}");
@@ -861,7 +867,7 @@ fn burst_decay_noise_engages_tns_and_roundtrips() {
     let frames_off = dec_off.decode_all(&stream_off).expect("TNS-off decodes");
     let mut out_off = Vec::new();
     for f in &frames_off {
-        out_off.extend_from_slice(&f.pcm);
+        out_off.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     let ratio_off = err_to_signal_rms(&pcm, &out_off[FRAME_LEN..]);
     eprintln!("burst-decay TNS-off err/sig RMS = {ratio_off:.5}");
@@ -1021,7 +1027,8 @@ fn identical_noise_channels_emit_correlated_pns() {
     let frames = dec.decode_all(&stream).expect("decodes");
     let mut out = Vec::new();
     for f in &frames {
-        out.extend_from_slice(&f.pcm);
+        // Decoded f32 → the encoder's i16 domain.
+        out.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     // Shared vectors + equal energies ⇒ near-identical channels.
     let steady = &out[FRAME_LEN * 2..];
@@ -1086,7 +1093,8 @@ fn independent_noise_channels_stay_uncorrelated() {
     let frames = dec.decode_all(&stream).expect("decodes");
     let mut out = Vec::new();
     for f in &frames {
-        out.extend_from_slice(&f.pcm);
+        // Decoded f32 → the encoder's i16 domain.
+        out.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     let steady = &out[FRAME_LEN * 2..];
     let (mut dot, mut el, mut er) = (0.0f64, 0.0f64, 0.0f64);
@@ -1132,7 +1140,8 @@ fn noise_input_engages_pns_and_preserves_energy() {
     let frames = dec.decode_all(&stream).expect("decodes");
     let mut out = Vec::new();
     for f in &frames {
-        out.extend_from_slice(&f.pcm);
+        // Decoded f32 → the encoder's i16 domain.
+        out.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     let rms = |s: &[i16]| -> f64 {
         (s.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / s.len() as f64).sqrt()

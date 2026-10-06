@@ -529,11 +529,15 @@ fn cce_fixture_recipe_decodes_and_couples() {
     for (i, (f, b)) in frames.iter().zip(base.iter()).enumerate() {
         assert_eq!(f.channels, 3, "frame {i}");
         assert_eq!(f.pcm.len(), 3 * 1024);
-        assert!(f.pcm.iter().any(|&s| s != 0), "frame {i} silent");
+        assert!(f.pcm.iter().any(|&s| s != 0.0), "frame {i} silent");
         // Every frame carries an active CCE: the coupled output must
         // differ from the CCE-less decode of the same targets.
-        assert_ne!(f.pcm, b.pcm, "frame {i}: coupling had no effect");
-        pcm.extend_from_slice(&f.pcm);
+        // Decoded f32 → the fixture WAV's i16 domain.
+        assert_ne!(
+            f.pcm, b.pcm,
+            "frame {i}: coupling had no effect (compared in f32)"
+        );
+        pcm.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     stage_or_pin(
         "aac-cce-writer-assembled",
@@ -709,8 +713,8 @@ fn hcr_fixture_recipe_matches_plain_decode() {
             .unwrap();
         assert_eq!(frame.channels, 1, "frame {i}");
         assert_eq!(frame.pcm, base.pcm, "frame {i}: ER decode diverged");
-        assert!(frame.pcm.iter().any(|&s| s != 0), "frame {i} silent");
-        pcm.extend_from_slice(&frame.pcm);
+        assert!(frame.pcm.iter().any(|&s| s != 0.0), "frame {i} silent");
+        pcm.extend(frame.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     stage_or_pin("aac-er-hcr-loas", "input.latm", &loas, &pcm, 1, SAMPLE_RATE);
 }
@@ -830,12 +834,9 @@ fn ssr_fixture_recipe_decodes_with_gain_control() {
         // samples through the SSR gain-control pipeline.
         assert_eq!(frame.pcm.len(), ssr_frame_len(seq), "frame {i} ({seq:?})");
         any_diff |= frame.pcm != base[i].pcm;
-        pcm.extend_from_slice(&frame.pcm);
+        pcm.extend(frame.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
-    assert!(
-        pcm.iter().any(|&s| s != 0),
-        "SSR decode produced only silence"
-    );
+    assert!(pcm.iter().any(|&s| s != 0), "SSR decode produced only silence");
     // The non-unity ladders must actually modulate the output.
     assert!(any_diff, "gain ladders had no effect");
     stage_or_pin(

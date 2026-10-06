@@ -241,14 +241,15 @@ fn loas_two_layer_scalable_program() {
         assert_eq!(got.channels, 2, "frame {f}");
         assert_eq!(got.sample_rate, SAMPLE_RATE, "frame {f}");
         assert_eq!(got.pcm, want.pcm, "frame {f}");
-        assert!(got.pcm.iter().any(|&s| s != 0), "frame {f} silent");
+        assert!(got.pcm.iter().any(|&s| s != 0.0), "frame {f} silent");
     }
 
     // Docs-corpus fixture: the deterministic two-layer scalable LOAS
     // stream plus this crate's own decode.
     let mut pcm = Vec::new();
     for f in &frames {
-        pcm.extend_from_slice(&f.pcm);
+        // Decoded f32 → the fixture WAV's i16 domain.
+        pcm.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     stage_or_pin(
         "aac-scalable-2layer-writer-loas",

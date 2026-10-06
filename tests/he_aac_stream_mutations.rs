@@ -133,11 +133,11 @@ fn joining_at_a_header_frame_converges_to_the_full_decode() {
     let skip = 2;
     let full_pcm: Vec<i16> = full[join + skip..]
         .iter()
-        .flat_map(|f| f.pcm.iter().copied())
+        .flat_map(|f| f.pcm.iter().map(|&s| (s * 32768.0) as i16))
         .collect();
     let tail_pcm: Vec<i16> = tail[skip..]
         .iter()
-        .flat_map(|f| f.pcm.iter().copied())
+        .flat_map(|f| f.pcm.iter().map(|&s| (s * 32768.0) as i16))
         .collect();
     assert_eq!(full_pcm.len(), tail_pcm.len());
     let ef = band_energies(&full_pcm);

@@ -149,13 +149,21 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         if ch > 0 {
             channels = ch;
         }
-        // FFmpeg's `m4ac.ps == -1` implicit-PS state: a mono stream
-        // whose ASC signals SBR without a psPresentFlag may carry
-        // in-band PS; its output is stereo (duplicated mono until the
-        // first decodable ps_data) from the first SBR frame
-        // (aacdec.c decode_extension_payload EXT_SBR_DATA: `m4ac.ps ==
-        // -1 && nb_channels == 1` → reconfigure stereo).
-        ps_signaled = asc.ps_present || (asc.sbr_present && channels == 1);
+        // FFmpeg's `ff_mpeg4audio_get_config` defaults `ps = -1`
+        // ("unspecified") whenever the §1.6.5 trailing `0x2b7` probe
+        // signals implicit SBR on an LC stream without a
+        // `psPresentFlag`, and the decoder promotes a mono output to
+        // stereo at the first SBR frame in that state
+        // (aacdec.c `decode_extension_payload` EXT_SBR_DATA:
+        // `m4ac.ps == -1 && nb_channels == 1`). This is the MP4 /
+        // LOAS-LATM out-of-band-ASC carriage — the same
+        // extradata-ASC path this decoder serves. Plain ADTS has no
+        // ASC, so an in-band ASC parsed from ADTS must not take the
+        // implicit-PS default (FFmpeg's ADTS path keeps `ps = 0` and
+        // stays mono). A trailing probe without a `psPresentFlag`
+        // with the flag unset is the "implicit SBR" marker; the
+        // explicit outer-AOT-5/29 wrapper sets `ps_present` itself.
+        ps_signaled = asc.ps_present;
     }
 
     let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
@@ -163,6 +171,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     out_params.channels = Some(channels);
     out_params.sample_format = Some(SampleFormat::F32);
 
+    let asc_move = asc.clone();
     let mut dec = AacDecoder::new(CodecId::new(CODEC_ID_STR), out_params);
     dec.asc = asc;
     dec.param_hint = (params.sample_rate, params.channels);
@@ -180,6 +189,17 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     }
     dec.stream.set_ps_signaled(ps_signaled);
     dec.loas.set_ps_signaled(ps_signaled);
+    // `asc` was moved into the decoder above; recompute the absence
+    // flag from the same extradata.
+    if let Some(asc) = asc_move {
+        match asc {
+            Ok(a) => {
+                dec.stream.set_ps_absent(a.ps_absent);
+                dec.loas.set_ps_absent(a.ps_absent);
+            }
+            Err(_) => {}
+        }
+    }
     Ok(Box::new(dec))
 }
 
@@ -221,6 +241,10 @@ pub struct AacDecoder {
     output: CodecParameters,
     stream: StreamDecoder,
     loas: LoasDecoder,
+    /// Latched when the first `AudioFrame` is queued: `output` then
+    /// reflects the bitstream-resolved layout, so
+    /// [`Decoder::output_audio_format`] can report it.
+    emitted_audio: bool,
     /// The transport syntax detected from the first non-empty packet:
     /// raw ADTS (`0xFFF` syncword) or LOAS `AudioSyncStream` (`0x2B7`
     /// syncword). `None` until the first packet picks one; once set, every
@@ -282,6 +306,7 @@ impl AacDecoder {
             output,
             stream: StreamDecoder::new(),
             loas: LoasDecoder::new(),
+            emitted_audio: false,
             transport: None,
             pending: VecDeque::new(),
             eof: false,
@@ -351,6 +376,7 @@ impl AacDecoder {
             self.output.sample_rate = Some(decoded.sample_rate);
             self.output.channels = Some(decoded.channels as u16);
             self.pending.push_back(Self::decoded_to_audio(decoded, pts));
+            self.emitted_audio = true;
             true
         } else {
             false
@@ -476,6 +502,26 @@ impl AacDecoder {
             if !asc.sbr_present && self.param_hint.0 == Some(asc.sample_rate) {
                 self.stream.set_sbr_downsampled(true);
             }
+            // FFmpeg's `ps = -1` implicit-PS promotion (mono SBR stream
+            // reconfigured to stereo at the first SBR frame) is keyed
+            // on the OUT-OF-BAND config path: an MP4 `esds` /
+            // LOAS-LATM `AudioSpecificConfig` whose §1.6.5 trailing
+            // `0x2b7` probe signals SBR without a `psPresentFlag`
+            // (`ff_mpeg4audio_get_config` defaults `ps = -1`). Plain
+            // ADTS has no such config (FFmpeg's ADTS path keeps
+            // `ps = 0` and decodes mono), so this runs only on the
+            // raw-carrier selection, where the extradata ASC is
+            // authoritative.
+            if !asc.ps_present
+                && !asc.ps_absent
+                && asc.trailing_sbr_probe.is_some()
+                && asc.channel_configuration == 1
+            {
+                self.stream.set_ps_signaled(true);
+                self.loas.set_ps_signaled(true);
+                self.stream.set_ps_absent(false);
+                self.loas.set_ps_absent(false);
+            }
         }
         Ok(Transport::Raw)
     }
@@ -504,6 +550,23 @@ impl AacDecoder {
 impl Decoder for AacDecoder {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
+    }
+
+    /// The layout of the `AudioFrame` planes this decoder actually
+    /// emits: interleaved little-endian F32, at the queued output rate
+    /// and channel count (which SBR and parametric stereo change from
+    /// the container's declaration). `None` until the first frame —
+    /// the bitstream resolves HE-AAC / PS late, so the container's
+    /// declared layout is the only honest answer before that.
+    fn output_audio_format(&self) -> Option<oxideav_core::AudioFormat> {
+        if !self.emitted_audio {
+            return None;
+        }
+        Some(oxideav_core::AudioFormat {
+            sample_format: SampleFormat::F32,
+            sample_rate: self.output.sample_rate?,
+            channels: self.output.channels?,
+        })
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {

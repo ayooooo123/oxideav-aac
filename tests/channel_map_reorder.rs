@@ -129,8 +129,8 @@ fn assemble(elements: &[(IdSynEle, u8, u8)]) -> Vec<u8> {
     w.into_bytes()
 }
 
-/// De-interleave a [`DecodedFrame`] into per-channel s16 buffers.
-fn deinterleave(frame: &DecodedFrame) -> Vec<Vec<i16>> {
+/// De-interleave a [`DecodedFrame`] into per-channel f32 buffers.
+fn deinterleave(frame: &DecodedFrame) -> Vec<Vec<f32>> {
     let ch = frame.channels;
     assert_eq!(frame.pcm.len(), FRAME_LEN * ch, "frame length geometry");
     (0..ch)
@@ -139,7 +139,7 @@ fn deinterleave(frame: &DecodedFrame) -> Vec<Vec<i16>> {
 }
 
 /// Re-interleave per-channel buffers (the inverse of [`deinterleave`]).
-fn interleave(channels: &[Vec<i16>]) -> Vec<i16> {
+fn interleave(channels: &[Vec<f32>]) -> Vec<f32> {
     if channels.is_empty() {
         return Vec::new();
     }

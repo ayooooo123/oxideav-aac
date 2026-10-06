@@ -508,7 +508,7 @@ fn decode_loas(stream: &[u8], expect_frames: usize, samples_per_frame: usize) ->
             samples_per_frame,
             "frame {i}: family frame length"
         );
-        pcm.extend_from_slice(&f.pcm);
+        pcm.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     assert!(pcm.iter().any(|&s| s != 0), "stream decoded to silence");
     pcm
@@ -533,7 +533,7 @@ fn lc960_fixture_recipe_decodes() {
         let f = dec
             .decode_raw_data_block(AOT_LC, FS_INDEX, SAMPLE_RATE, 1, 1, p)
             .unwrap();
-        direct.extend_from_slice(&f.pcm);
+        direct.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     assert_eq!(pcm, direct, "LOAS vs direct raw_data_block decode");
 
@@ -832,7 +832,7 @@ fn sbr_on_960_family_decodes_at_fifteen_slots() {
         assert_eq!(f.pcm.len(), 1920, "frame {i}: 15 slots × 2 × 64");
         assert_eq!(f.sample_rate, fs_sbr, "frame {i}");
         assert_eq!(f.channels, 1);
-        pcm.extend_from_slice(&f.pcm);
+        pcm.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     assert!(pcm.iter().any(|&s| s != 0));
     // High band populated: energy above the core Nyquist over the
@@ -1013,7 +1013,7 @@ fn he_aac_960_round_trips_and_core_band_matches_the_reference_binary() {
     for (i, f) in frames.iter().enumerate() {
         assert_eq!(f.pcm.len(), 1920, "frame {i}");
         assert_eq!(f.sample_rate, fs_sbr, "frame {i}");
-        ours.extend_from_slice(&f.pcm);
+        ours.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     let band_energies = |pcm: &[i16], channels: usize| -> [f64; 64] {
         let mono: Vec<f64> = pcm

@@ -72,7 +72,7 @@ fn ssr_profile_stream_decodes_through_gain_control_pipeline() {
         assert_eq!(ssr.sample_rate, 44100);
         // ONLY_LONG frames keep the 1024-samples-per-frame layout.
         assert_eq!(ssr.pcm.len(), lc.pcm.len());
-        any_nonzero |= ssr.pcm.iter().any(|&s| s != 0);
+        any_nonzero |= ssr.pcm.iter().any(|&s| s != 0.0);
         any_diff |= ssr.pcm != lc.pcm;
     }
     assert!(any_nonzero, "SSR decode produced only silence");
@@ -96,7 +96,7 @@ fn ssr_profile_stereo_stream_decodes() {
     for f in &frames {
         assert_eq!(f.channels, 2);
         assert_eq!(f.pcm.len() % 2, 0);
-        assert!(f.pcm.iter().any(|&s| s != 0) || f.pcm.iter().all(|&s| s == 0));
+        assert!(f.pcm.iter().any(|&s| s != 0.0) || f.pcm.iter().all(|&s| s == 0.0));
     }
-    assert!(frames.iter().any(|f| f.pcm.iter().any(|&s| s != 0)));
+    assert!(frames.iter().any(|f| f.pcm.iter().any(|&s| s != 0.0)));
 }

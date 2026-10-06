@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use oxideav_aac::latm::LoasDecoder;
 
 /// Read the `data` chunk of a 16-bit WAV as interleaved `i16` samples.
-fn read_wav_s16(path: &PathBuf) -> Option<Vec<i16>> {
+fn read_wav_s16(path: &PathBuf) -> Option<Vec<f32>> {
     let d = fs::read(path).ok()?;
     let mut i = 12; // skip "RIFF" + size + "WAVE"
     while i + 8 <= d.len() {
@@ -39,8 +39,8 @@ fn read_wav_s16(path: &PathBuf) -> Option<Vec<i16>> {
             let end = (body_start + sz).min(d.len());
             return Some(
                 d[body_start..end]
-                    .chunks_exact(2)
-                    .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
                     .collect(),
             );
         }
@@ -54,7 +54,7 @@ fn fixture_dir() -> PathBuf {
 }
 
 /// Decode the LATM fixture to one interleaved-PCM vector.
-fn decode_latm() -> Option<(Vec<i16>, usize, u32)> {
+fn decode_latm() -> Option<(Vec<f32>, usize, u32)> {
     let bytes = fs::read(fixture_dir().join("input.latm")).ok()?;
     let mut dec = LoasDecoder::new();
     let frames = dec.decode_all(&bytes).expect("LATM/LOAS decode");

@@ -55,7 +55,8 @@ fn roundtrip_ratios(channels: usize, lfe: Option<usize>, expected_config: u8) ->
     let mut decoded = Vec::new();
     for f in &frames {
         assert_eq!(f.channels, channels);
-        decoded.extend_from_slice(&f.pcm);
+        // Decoded f32 → the encoder's i16 domain.
+        decoded.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     assert_eq!(decoded.len(), (n + FRAME_LEN) * channels);
     let aligned = &decoded[FRAME_LEN * channels..];

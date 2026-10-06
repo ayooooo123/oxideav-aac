@@ -109,7 +109,9 @@ fn pulse_bearing_stream_roundtrips_and_parses() {
     let frames = dec.decode_all(&stream).expect("pulse stream decodes");
     let mut out = Vec::new();
     for f in &frames {
-        out.extend_from_slice(&f.pcm);
+        // Decode output is f32 on [-1,1); back to the encoder's i16
+        // domain for the RMS comparison.
+        out.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     let ratio = err_to_signal_rms(&pcm, &out[FRAME_LEN..]);
     eprintln!("pulse round-trip err/sig RMS = {ratio:.5}");

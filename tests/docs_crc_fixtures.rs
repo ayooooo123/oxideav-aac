@@ -263,7 +263,7 @@ fn stage_or_pin(name: &str, derived: &[u8], source: &[u8]) {
         assert_eq!(a.channels, b.channels);
         assert_eq!(a.sample_rate, b.sample_rate);
     }
-    assert!(base.iter().any(|f| f.pcm.iter().any(|&s| s != 0)));
+    assert!(base.iter().any(|f| f.pcm.iter().any(|&s| s != 0.0)));
 }
 
 #[test]

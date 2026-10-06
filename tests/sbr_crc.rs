@@ -244,7 +244,7 @@ fn sbr_crc_payload_decodes_and_matches_crcless_path() {
     let a = decode(&with_crc).unwrap();
     assert_eq!(a.sample_rate, FS_SBR, "SBR output is dual-rate");
     assert_eq!(a.pcm.len(), 2048);
-    assert!(a.pcm.iter().any(|&s| s != 0));
+    assert!(a.pcm.iter().any(|&s| s != 0.0));
 
     // The CRC field only protects — the reconstruction must be
     // byte-identical to the type-13 (CRC-less) carriage of the same

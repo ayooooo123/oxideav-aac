@@ -232,7 +232,7 @@ fn er_triplet_matches_plain_scalable() {
             .unwrap();
         assert_eq!(a.channels, 2);
         assert_eq!(a.pcm, b.pcm, "frame {f}");
-        assert!(a.pcm.iter().any(|&s| s != 0), "frame {f} silent");
+        assert!(a.pcm.iter().any(|&s| s != 0.0), "frame {f} silent");
     }
 }
 

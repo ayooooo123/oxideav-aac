@@ -36,7 +36,7 @@ fn fixture_dir(name: &str) -> PathBuf {
 }
 
 /// Read the `data` chunk of a 16-bit WAV as interleaved `i16`.
-fn read_wav_s16(path: &PathBuf) -> Option<Vec<i16>> {
+fn read_wav_s16(path: &PathBuf) -> Option<Vec<f32>> {
     let d = fs::read(path).ok()?;
     let mut i = 12;
     while i + 8 <= d.len() {
@@ -47,8 +47,8 @@ fn read_wav_s16(path: &PathBuf) -> Option<Vec<i16>> {
             let end = (body + sz).min(d.len());
             return Some(
                 d[body..end]
-                    .chunks_exact(2)
-                    .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
                     .collect(),
             );
         }
@@ -243,7 +243,7 @@ fn validate_mc_fixture(
         let pce = asc.ga_body.pce.clone().expect("ASC-inline PCE");
         dec.set_program_config(pce);
     }
-    let mut ours: Vec<i16> = Vec::new();
+    let mut ours: Vec<f32> = Vec::new();
     for &(off, len) in &samples {
         let au = &m4a[off..off + len];
         let f = dec

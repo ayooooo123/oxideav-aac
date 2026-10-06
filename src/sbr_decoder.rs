@@ -268,6 +268,10 @@ pub struct SbrDecoder {
     /// synthesis into both channels — FFmpeg's SBR renders stereo from
     /// the first frame in this configuration, not mono.
     ps_signaled: bool,
+    /// The ASC ruled PS out (explicit `psPresentFlag == 0` or the
+    /// hierarchical wrapper): in-band PS payloads are skipped, not
+    /// decoded, and the output stays mono.
+    ps_absent: bool,
 }
 
 /// PS decoder + right-channel synthesis bank (Annex 8.A).
@@ -312,6 +316,7 @@ impl SbrDecoder {
                 .collect(),
             ps: None,
             ps_signaled: false,
+            ps_absent: false,
         })
     }
 
@@ -371,6 +376,13 @@ impl SbrDecoder {
     /// before-the-first-frame rule.
     pub fn set_ps_signaled(&mut self, ps_signaled: bool) {
         self.ps_signaled = ps_signaled;
+    }
+
+    /// Mark the ASC as ruling PS out: in-band PS payloads are skipped
+    /// (FFmpeg `read_sbr_extension`: "signaled to be not-present"),
+    /// the output stays mono.
+    pub fn set_ps_absent(&mut self, ps_absent: bool) {
+        self.ps_absent = ps_absent;
     }
 
     pub fn set_low_power(&mut self, low_power: bool) -> Result<()> {
@@ -671,12 +683,15 @@ impl SbrDecoder {
             } else {
                 None
             };
-            if ps_payload.is_some() {
+            if ps_payload.is_some() && !self.ps_absent {
                 // Annex 8.A in-band signalling: an EXTENSION_ID_PS
                 // payload on a single-channel element marks the stream
                 // as parametric stereo even without the ASC
                 // `psPresentFlag` — stereo output (duplicated mono
                 // until the first decodable ps_data) starts here.
+                // An ASC that rules PS out keeps the mono output (the
+                // payload is skipped, FFmpeg's "signaled to be
+                // not-present").
                 self.ps_signaled = true;
             }
             if ps_payload.is_some() && self.low_power {

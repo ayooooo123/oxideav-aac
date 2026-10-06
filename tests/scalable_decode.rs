@@ -250,7 +250,7 @@ fn single_layer_mono_matches_sce() {
         assert_eq!(got.channels, 1);
         assert_eq!(got.sample_rate, SAMPLE_RATE);
         assert_eq!(got.pcm, want.pcm, "frame {f}");
-        assert!(got.pcm.iter().any(|&s| s != 0), "frame {f} silent");
+        assert!(got.pcm.iter().any(|&s| s != 0.0), "frame {f} silent");
     }
 }
 
@@ -295,7 +295,7 @@ fn single_layer_stereo_matches_cpe() {
             .unwrap();
         assert_eq!(got.channels, 2);
         assert_eq!(got.pcm, want.pcm, "frame {f}");
-        assert!(got.pcm.iter().any(|&s| s != 0), "frame {f} silent");
+        assert!(got.pcm.iter().any(|&s| s != 0.0), "frame {f} silent");
     }
 }
 
@@ -390,7 +390,7 @@ fn two_mono_layers_sum_spectra() {
     let mut dec = ScalableDecoder::new(mono_cfg(2)).unwrap();
     for f in 0..3 {
         let want_f64 = fb.synthesize(&summed, &ics).unwrap();
-        let want = oxideav_aac::pcm::channel_to_s16(&want_f64);
+        let want = oxideav_aac::pcm::interleave_f32(&[want_f64]).unwrap_or_default();
         let got = dec
             .decode_frame(&payloads.iter().map(Vec::as_slice).collect::<Vec<_>>())
             .unwrap();
@@ -603,14 +603,14 @@ fn mono_stereo_fss_merge() {
     let mut fb_r = oxideav_aac::filterbank::Filterbank::new();
     let mut dec = ScalableDecoder::new(cfg).unwrap();
     for f in 0..3 {
-        let want_l = oxideav_aac::pcm::channel_to_s16(&fb_l.synthesize(&l_spec, &ics).unwrap());
-        let want_r = oxideav_aac::pcm::channel_to_s16(&fb_r.synthesize(&r_spec, &ics).unwrap());
+        let want_l = oxideav_aac::pcm::interleave_f32(&[fb_l.synthesize(&l_spec, &ics).unwrap()]).unwrap_or_default();
+        let want_r = oxideav_aac::pcm::interleave_f32(&[fb_r.synthesize(&r_spec, &ics).unwrap()]).unwrap_or_default();
         let got = dec
             .decode_frame(&payloads.iter().map(Vec::as_slice).collect::<Vec<_>>())
             .unwrap();
         assert_eq!(got.channels, 2);
-        let got_l: Vec<i16> = got.pcm.iter().step_by(2).copied().collect();
-        let got_r: Vec<i16> = got.pcm.iter().skip(1).step_by(2).copied().collect();
+        let got_l: Vec<f32> = got.pcm.iter().step_by(2).copied().collect();
+        let got_r: Vec<f32> = got.pcm.iter().skip(1).step_by(2).copied().collect();
         assert_eq!(got_l, want_l, "frame {f} left");
         assert_eq!(got_r, want_r, "frame {f} right");
     }

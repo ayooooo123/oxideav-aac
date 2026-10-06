@@ -209,7 +209,7 @@ fn er_spectral_resilience_matches_plain_decode() {
         assert_eq!(er.channels, 1);
         assert_eq!(er.pcm.len(), 1024);
         assert_eq!(er.pcm, base.pcm, "frame {frame}");
-        assert!(er.pcm.iter().any(|&s| s != 0), "frame {frame} silent");
+        assert!(er.pcm.iter().any(|&s| s != 0.0), "frame {frame} silent");
     }
 }
 
@@ -393,5 +393,5 @@ fn loas_er_stream_decodes() {
         .unwrap();
     assert_eq!(frames[0].pcm, expect.pcm);
     assert_eq!(frames[0].sample_rate, SAMPLE_RATE);
-    assert!(frames[0].pcm.iter().any(|&s| s != 0));
+    assert!(frames[0].pcm.iter().any(|&s| s != 0.0));
 }

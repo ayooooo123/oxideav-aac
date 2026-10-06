@@ -74,9 +74,10 @@ fn decode_fixture_pcm(name: &str) -> Option<Vec<i16>> {
     let frames = dec
         .decode_all(&data)
         .unwrap_or_else(|e| panic!("{name}: decode_all: {e}"));
-    let mut pcm = Vec::new();
+    let mut pcm: Vec<i16> = Vec::new();
     for f in &frames {
-        pcm.extend_from_slice(&f.pcm);
+        // Decoded f32 → the fixture WAV's i16 domain.
+        pcm.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     Some(pcm)
 }

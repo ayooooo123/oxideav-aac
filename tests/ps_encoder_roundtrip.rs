@@ -195,7 +195,9 @@ fn round_trip(pcm: &[i16], cfg: HeAacConfig) -> (HeAacEncoder, RoundTrip) {
     for f in &frames {
         assert_eq!(f.channels, 2, "PS renders stereo");
         assert_eq!(f.sample_rate, cfg.sample_rate);
-        out.extend_from_slice(&f.pcm);
+        // The decoder emits f32 on [-1,1); bring it back to the
+        // encoder's i16 domain for the round-trip comparison.
+        out.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     let sum_in: Vec<f64> = pcm
         .chunks_exact(2)
@@ -374,7 +376,7 @@ fn loas_wrapped_he_aac_v2_decodes_as_stereo() {
         .decode_all(&adts)
         .unwrap()
         .iter()
-        .flat_map(|f| f.pcm.iter().copied())
+        .flat_map(|f| f.pcm.iter().map(|&s| (s * 32768.0) as i16))
         .collect();
     for hierarchical in [false, true] {
         let asc = enc.audio_specific_config(hierarchical);
@@ -387,7 +389,7 @@ fn loas_wrapped_he_aac_v2_decodes_as_stereo() {
         assert!(frames
             .iter()
             .all(|f| f.sample_rate == 44_100 && f.channels == 2));
-        let latm_pcm: Vec<i16> = frames.iter().flat_map(|f| f.pcm.iter().copied()).collect();
+        let latm_pcm: Vec<i16> = frames.iter().flat_map(|f| f.pcm.iter().map(|&s| (s * 32768.0) as i16)).collect();
         assert_eq!(latm_pcm, adts_pcm, "hierarchical={hierarchical}");
     }
 }

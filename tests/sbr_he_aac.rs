@@ -53,7 +53,7 @@ fn he_aac_v1_sbr_pcm_byte_exact() {
     let mut dec = StreamDecoder::new();
     let frames = dec.decode_all(&data).expect("decode_all");
     assert!(!frames.is_empty());
-    let mut ours: Vec<i16> = Vec::new();
+    let mut ours: Vec<f32> = Vec::new();
     for f in &frames {
         // Every frame of this stream is SBR-active: stereo, 2048
         // samples per channel, at the doubled (44.1 kHz) rate.
@@ -70,6 +70,7 @@ fn he_aac_v1_sbr_pcm_byte_exact() {
     let mut max_err = 0i32;
     let mut err_sse = 0.0f64;
     let mut sig_sse = 0.0f64;
+    let ours: Vec<i16> = ours.iter().map(|&s| (s * 32768.0) as i16).collect();
     for (a, b) in ours.iter().zip(expected.iter()) {
         let e = i32::from(*a) - i32::from(*b);
         if e == 0 {
@@ -154,7 +155,7 @@ fn he_aac_v1_sbr_downsampled_matches_decimated_reference() {
     dec.set_sbr_downsampled(true);
     let frames = dec.decode_all(&data).expect("decode_all");
     assert!(!frames.is_empty());
-    let mut ours: Vec<i16> = Vec::new();
+    let mut ours: Vec<f32> = Vec::new();
     for f in &frames {
         assert_eq!(f.channels, 2);
         assert_eq!(f.sample_rate, 22_050, "downsampled mode = core rate");
@@ -162,6 +163,8 @@ fn he_aac_v1_sbr_downsampled_matches_decimated_reference() {
         ours.extend_from_slice(&f.pcm);
     }
     assert_eq!(ours.len() * 2, expected.len(), "half the dual-rate count");
+    // Decode output is f32; reference WAV is i16.
+    let ours: Vec<i16> = ours.iter().map(|&s| (s * 32768.0) as i16).collect();
 
     // Reference: low-pass the dual-rate expected.wav just below the
     // new Nyquist (0.245 cycles/sample at 44.1 kHz) and decimate 2:1.
@@ -241,7 +244,7 @@ fn he_aac_v1_sbr_low_power_decode() {
         assert_eq!(f.channels, 2);
         assert_eq!(f.sample_rate, 44_100);
         assert_eq!(f.pcm.len(), 2048 * 2);
-        ours.extend_from_slice(&f.pcm);
+        ours.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     assert_eq!(ours.len(), expected.len());
 
@@ -315,7 +318,7 @@ fn he_aac_v1_sbr_low_power_downsampled_decode() {
     for f in &frames {
         assert_eq!(f.sample_rate, 22_050);
         assert_eq!(f.pcm.len(), 1024 * 2);
-        ours.extend_from_slice(&f.pcm);
+        ours.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     for ch in 0..2 {
         let ref_dual = channel_f64(&expected, ch, 2);

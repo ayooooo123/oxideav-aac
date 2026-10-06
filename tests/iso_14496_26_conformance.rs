@@ -246,8 +246,8 @@ fn read_wav(path: &PathBuf) -> Option<(Vec<f64>, usize)> {
             let raw = &d[body..end];
             out = Some(match bits {
                 16 => raw
-                    .chunks_exact(2)
-                    .map(|c| f64::from(i16::from_le_bytes([c[0], c[1]])))
+                    .chunks_exact(4)
+                    .map(|c| f64::from(f32::from_le_bytes(c.try_into().unwrap())))
                     .collect(),
                 24 => raw
                     .chunks_exact(3)

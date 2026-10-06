@@ -290,5 +290,15 @@ fn raw_data_block_with_cce_decodes_sce_and_skips_cce() {
         .expect("SCE+CCE block decodes");
     assert_eq!(frame.channels, 1, "the CCE contributes no output channel");
     assert_eq!(frame.pcm.len(), 1024);
-    assert_eq!(frame.pcm, frame2.pcm, "CCE skip must not perturb the SCE");
+    // CCE skip must not perturb the SCE. Both blocks decode the same
+    // tone at sub-LSB amplitudes, so compare in the f32 domain with a
+    // small tolerance (an exact S16 compare passed only because both
+    // sides rounded to zero).
+    let max_diff = frame
+        .pcm
+        .iter()
+        .zip(frame2.pcm.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_diff < 1e-6, "CCE perturbed the SCE: {max_diff}");
 }

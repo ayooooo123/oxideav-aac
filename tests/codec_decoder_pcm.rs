@@ -35,7 +35,7 @@ fn fixture_dir(name: &str) -> PathBuf {
 }
 
 /// Read the `data` chunk of a 16-bit WAV as interleaved `i16` samples.
-fn read_wav_s16(path: &PathBuf) -> Option<Vec<i16>> {
+fn read_wav_s16(path: &PathBuf) -> Option<Vec<f32>> {
     let d = fs::read(path).ok()?;
     let mut i = 12; // skip "RIFF" + size + "WAVE"
     while i + 8 <= d.len() {
@@ -46,8 +46,8 @@ fn read_wav_s16(path: &PathBuf) -> Option<Vec<i16>> {
             let end = (body_start + sz).min(d.len());
             return Some(
                 d[body_start..end]
-                    .chunks_exact(2)
-                    .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
                     .collect(),
             );
         }
@@ -95,14 +95,14 @@ fn split_into_packets(bytes: &[u8]) -> Vec<Packet> {
 
 /// Drive the trait decoder over a fixture's `input.aac` and reassemble
 /// the interleaved s16 PCM exactly as a pipeline consumer would.
-fn decode_via_trait(name: &str) -> Option<Vec<i16>> {
+fn decode_via_trait(name: &str) -> Option<Vec<f32>> {
     let data = fs::read(fixture_dir(name).join("input.aac")).ok()?;
     let packets = split_into_packets(&data);
     let mut params = CodecParameters::audio(CodecId::new("aac"));
     params.sample_format = Some(SampleFormat::S16);
     let mut dec = make_decoder(&params).expect("make_decoder");
 
-    let mut pcm: Vec<i16> = Vec::new();
+    let mut pcm: Vec<f32> = Vec::new();
     for pkt in &packets {
         dec.send_packet(pkt)
             .unwrap_or_else(|e| panic!("{name}: send_packet: {e}"));
@@ -110,8 +110,8 @@ fn decode_via_trait(name: &str) -> Option<Vec<i16>> {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
                     assert_eq!(a.data.len(), 1, "{name}: interleaved single plane");
-                    for c in a.data[0].chunks_exact(2) {
-                        pcm.push(i16::from_le_bytes([c[0], c[1]]));
+                    for c in a.data[0].chunks_exact(4) {
+                        pcm.push(f32::from_le_bytes(c.try_into().unwrap()));
                     }
                 }
                 Ok(other) => panic!("{name}: expected Audio, got {other:?}"),
@@ -154,7 +154,7 @@ impl Compare {
     }
 }
 
-fn compare(ours: &[i16], expected: &[i16]) -> Compare {
+fn compare(ours: &[f32], expected: &[f32]) -> Compare {
     let n = ours.len().min(expected.len());
     let mut c = Compare {
         n,
@@ -274,7 +274,7 @@ fn he_aac_sbr_decodes_through_trait() {
         "{name}: PCM length {} not a whole number of stereo SBR frames",
         pcm.len()
     );
-    assert!(pcm.iter().any(|&s| s != 0), "{name}: all-silent SBR decode");
+    assert!(pcm.iter().any(|&s| s != 0.0), "{name}: all-silent SBR decode");
     // The trait path must match the raw StreamDecoder byte-for-byte.
     let bytes = std::fs::read(
         PathBuf::from("../../docs/audio/aac/fixtures")
@@ -284,6 +284,6 @@ fn he_aac_sbr_decodes_through_trait() {
     .expect("fixture bytes");
     let mut dec = oxideav_aac::decode::StreamDecoder::new();
     let frames = dec.decode_all(&bytes).expect("decode_all");
-    let direct: Vec<i16> = frames.iter().flat_map(|f| f.pcm.iter().copied()).collect();
+    let direct: Vec<f32> = frames.iter().flat_map(|f| f.pcm.iter().copied()).collect();
     assert_eq!(pcm, direct, "{name}: trait path diverges from direct");
 }

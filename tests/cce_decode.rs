@@ -157,7 +157,7 @@ fn finish_block(fa: FrameAssembler) -> Vec<u8> {
 
 /// Decode `frames` copies of `payload` through a fresh decoder,
 /// returning per-frame interleaved PCM.
-fn decode_frames(payload: &[u8], frames: usize) -> Vec<Vec<i16>> {
+fn decode_frames(payload: &[u8], frames: usize) -> Vec<Vec<f32>> {
     let mut dec = StreamDecoder::new();
     (0..frames)
         .map(|_| {
@@ -170,7 +170,7 @@ fn decode_frames(payload: &[u8], frames: usize) -> Vec<Vec<i16>> {
 }
 
 /// `got ≈ a + gain·b` within the stacked s16 rounding slack.
-fn assert_linear_sum(got: &[i16], a: &[i16], b: &[i16], gain: f64, what: &str) {
+fn assert_linear_sum(got: &[f32], a: &[f32], b: &[f32], gain: f64, what: &str) {
     assert_eq!(got.len(), a.len());
     assert_eq!(got.len(), b.len());
     let mut max_err = 0i32;
@@ -295,10 +295,10 @@ fn cce_gain_list_scales_second_target() {
     let b = decode_frames(&standalone_emb, 2);
     for f in 0..2 {
         // Interleaved [ch0, ch1] per time index.
-        let got0: Vec<i16> = got[f].iter().copied().step_by(2).collect();
-        let got1: Vec<i16> = got[f].iter().copied().skip(1).step_by(2).collect();
-        let a0: Vec<i16> = ab[f].iter().copied().step_by(2).collect();
-        let a1: Vec<i16> = ab[f].iter().copied().skip(1).step_by(2).collect();
+        let got0: Vec<f32> = got[f].iter().copied().step_by(2).collect();
+        let got1: Vec<f32> = got[f].iter().copied().skip(1).step_by(2).collect();
+        let a0: Vec<f32> = ab[f].iter().copied().step_by(2).collect();
+        let a1: Vec<f32> = ab[f].iter().copied().skip(1).step_by(2).collect();
         assert_linear_sum(&got0, &a0, &b[f], 1.0, &format!("frame {f} target 0"));
         assert_linear_sum(&got1, &a1, &b[f], 2.0, &format!("frame {f} target 1"));
     }
@@ -403,10 +403,10 @@ fn cce_cpe_target_left_only() {
     let ab = decode_frames(&base, 2);
     let b = decode_frames(&standalone_emb, 2);
     for f in 0..2 {
-        let got_l: Vec<i16> = got[f].iter().copied().step_by(2).collect();
-        let got_r: Vec<i16> = got[f].iter().copied().skip(1).step_by(2).collect();
-        let a_l: Vec<i16> = ab[f].iter().copied().step_by(2).collect();
-        let a_r: Vec<i16> = ab[f].iter().copied().skip(1).step_by(2).collect();
+        let got_l: Vec<f32> = got[f].iter().copied().step_by(2).collect();
+        let got_r: Vec<f32> = got[f].iter().copied().skip(1).step_by(2).collect();
+        let a_l: Vec<f32> = ab[f].iter().copied().step_by(2).collect();
+        let a_r: Vec<f32> = ab[f].iter().copied().skip(1).step_by(2).collect();
         assert_linear_sum(&got_l, &a_l, &b[f], 1.0, &format!("frame {f} left"));
         assert_eq!(got_r, a_r, "frame {f}: right channel must be untouched");
         assert_ne!(got_l, a_l, "frame {f}: left channel must be coupled");

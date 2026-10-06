@@ -52,7 +52,7 @@ fn decode(stream: &[u8]) -> Vec<i16> {
     dec.decode_all(stream)
         .unwrap()
         .iter()
-        .flat_map(|f| f.pcm.iter().copied())
+        .flat_map(|f| f.pcm.iter().map(|&s| (s * 32768.0) as i16))
         .collect()
 }
 

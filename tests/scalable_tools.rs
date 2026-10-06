@@ -268,13 +268,13 @@ fn stereo_intensity_layering() {
     let mut fb_r = oxideav_aac::filterbank::Filterbank::new();
     let mut dec = ScalableDecoder::new(cfg).unwrap();
     for f in 0..2 {
-        let want_l = oxideav_aac::pcm::channel_to_s16(&fb_l.synthesize(&l_spec, &ics).unwrap());
-        let want_r = oxideav_aac::pcm::channel_to_s16(&fb_r.synthesize(&r_spec, &ics).unwrap());
+        let want_l = oxideav_aac::pcm::interleave_f32(&[fb_l.synthesize(&l_spec, &ics).unwrap()]).unwrap_or_default();
+        let want_r = oxideav_aac::pcm::interleave_f32(&[fb_r.synthesize(&r_spec, &ics).unwrap()]).unwrap_or_default();
         let got = dec
             .decode_frame(&payloads.iter().map(Vec::as_slice).collect::<Vec<_>>())
             .unwrap();
-        let got_l: Vec<i16> = got.pcm.iter().step_by(2).copied().collect();
-        let got_r: Vec<i16> = got.pcm.iter().skip(1).step_by(2).copied().collect();
+        let got_l: Vec<f32> = got.pcm.iter().step_by(2).copied().collect();
+        let got_r: Vec<f32> = got.pcm.iter().skip(1).step_by(2).copied().collect();
         assert_eq!(got_l, want_l, "frame {f} left");
         assert_eq!(got_r, want_r, "frame {f} right");
     }
@@ -309,13 +309,13 @@ fn stereo_intensity_layering() {
     let mut fb_l2 = oxideav_aac::filterbank::Filterbank::new();
     let mut fb_r2 = oxideav_aac::filterbank::Filterbank::new();
     let mut dec2 = ScalableDecoder::new(cfg2).unwrap();
-    let want_l = oxideav_aac::pcm::channel_to_s16(&fb_l2.synthesize(&l_spec2, &ics).unwrap());
-    let want_r = oxideav_aac::pcm::channel_to_s16(&fb_r2.synthesize(&r_spec2, &ics).unwrap());
+    let want_l = oxideav_aac::pcm::interleave_f32(&[fb_l2.synthesize(&l_spec2, &ics).unwrap()]).unwrap_or_default();
+    let want_r = oxideav_aac::pcm::interleave_f32(&[fb_r2.synthesize(&r_spec2, &ics).unwrap()]).unwrap_or_default();
     let got = dec2
         .decode_frame(&payloads2.iter().map(Vec::as_slice).collect::<Vec<_>>())
         .unwrap();
-    let got_l: Vec<i16> = got.pcm.iter().step_by(2).copied().collect();
-    let got_r: Vec<i16> = got.pcm.iter().skip(1).step_by(2).copied().collect();
+    let got_l: Vec<f32> = got.pcm.iter().step_by(2).copied().collect();
+    let got_r: Vec<f32> = got.pcm.iter().skip(1).step_by(2).copied().collect();
     assert_eq!(got_l, want_l);
     assert_eq!(got_r, want_r);
 }
@@ -558,14 +558,14 @@ fn serial_tns_layout() {
     .unwrap();
     let mut fb_l = oxideav_aac::filterbank::Filterbank::new();
     let mut fb_r = oxideav_aac::filterbank::Filterbank::new();
-    let want_l = oxideav_aac::pcm::channel_to_s16(&fb_l.synthesize(&l_spec, &ics_s).unwrap());
-    let want_r = oxideav_aac::pcm::channel_to_s16(&fb_r.synthesize(&r_spec, &ics_s).unwrap());
+    let want_l = oxideav_aac::pcm::interleave_f32(&[fb_l.synthesize(&l_spec, &ics_s).unwrap()]).unwrap_or_default();
+    let want_r = oxideav_aac::pcm::interleave_f32(&[fb_r.synthesize(&r_spec, &ics_s).unwrap()]).unwrap_or_default();
     let mut dec = ScalableDecoder::new(cfg.clone()).unwrap();
     let got = dec
         .decode_frame(&payloads.iter().map(Vec::as_slice).collect::<Vec<_>>())
         .unwrap();
-    let got_l: Vec<i16> = got.pcm.iter().step_by(2).copied().collect();
-    let got_r: Vec<i16> = got.pcm.iter().skip(1).step_by(2).copied().collect();
+    let got_l: Vec<f32> = got.pcm.iter().step_by(2).copied().collect();
+    let got_r: Vec<f32> = got.pcm.iter().skip(1).step_by(2).copied().collect();
     assert_eq!(got_l, want_l, "serial M→L left");
     assert_eq!(got_r, want_r, "M-only right");
 
@@ -617,14 +617,14 @@ fn serial_tns_layout() {
     .unwrap();
     let mut fb_l2 = oxideav_aac::filterbank::Filterbank::new();
     let mut fb_r2 = oxideav_aac::filterbank::Filterbank::new();
-    let want_l2 = oxideav_aac::pcm::channel_to_s16(&fb_l2.synthesize(&l_spec2, &ics_s).unwrap());
-    let want_r2 = oxideav_aac::pcm::channel_to_s16(&fb_r2.synthesize(&r_spec2, &ics_s).unwrap());
+    let want_l2 = oxideav_aac::pcm::interleave_f32(&[fb_l2.synthesize(&l_spec2, &ics_s).unwrap()]).unwrap_or_default();
+    let want_r2 = oxideav_aac::pcm::interleave_f32(&[fb_r2.synthesize(&r_spec2, &ics_s).unwrap()]).unwrap_or_default();
     let mut dec2 = ScalableDecoder::new(cfg).unwrap();
     let got2 = dec2
         .decode_frame(&payloads2.iter().map(Vec::as_slice).collect::<Vec<_>>())
         .unwrap();
-    let got_l2: Vec<i16> = got2.pcm.iter().step_by(2).copied().collect();
-    let got_r2: Vec<i16> = got2.pcm.iter().skip(1).step_by(2).copied().collect();
+    let got_l2: Vec<f32> = got2.pcm.iter().step_by(2).copied().collect();
+    let got_r2: Vec<f32> = got2.pcm.iter().skip(1).step_by(2).copied().collect();
     assert_eq!(got_l2, want_l2, "override left");
     assert_eq!(got_r2, want_r2, "override right");
 }

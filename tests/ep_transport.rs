@@ -266,14 +266,15 @@ fn ep_transport_matches_plain_loas() {
     for (i, (a, b)) in ep_frames.iter().zip(&plain_frames).enumerate() {
         assert_eq!(a.pcm, b.pcm, "frame {i}");
         assert_eq!(a.channels, b.channels, "frame {i}");
-        assert!(a.pcm.iter().any(|&s| s != 0), "frame {i} silent");
+        assert!(a.pcm.iter().any(|&s| s != 0.0), "frame {i} silent");
     }
 
     // Docs-corpus fixture: the deterministic EP-protected LOAS
     // stream plus this crate's own decode.
     let mut pcm = Vec::new();
     for f in &ep_frames {
-        pcm.extend_from_slice(&f.pcm);
+        // Decoded f32 → the fixture WAV's i16 domain.
+        pcm.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     stage_or_pin(
         "aac-ep-writer-loas",

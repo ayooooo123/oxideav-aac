@@ -245,7 +245,7 @@ fn er_ltp_stream_matches_non_er_ltp_decode() {
             .unwrap();
         assert_eq!(er.channels, 1);
         assert_eq!(er.pcm, base.pcm, "frame {frame}");
-        assert!(er.pcm.iter().any(|&s| s != 0), "frame {frame} silent");
+        assert!(er.pcm.iter().any(|&s| s != 0.0), "frame {frame} silent");
     }
     // The pin is only meaningful if LTP actually contributed: a
     // second run with the prediction bands disabled must diverge
@@ -542,7 +542,7 @@ fn loas_er_ltp_stream_decodes() {
             .unwrap();
         assert_eq!(frame.pcm, expect.pcm, "sync frame {i}");
         assert_eq!(frame.sample_rate, SAMPLE_RATE);
-        assert!(frame.pcm.iter().any(|&s| s != 0));
+        assert!(frame.pcm.iter().any(|&s| s != 0.0));
     }
 }
 

@@ -152,7 +152,7 @@ fn protected_stream_decodes_identically() {
         assert_eq!(a.pcm, b.pcm);
         assert_eq!(a.sample_rate, b.sample_rate);
     }
-    assert!(base.iter().any(|f| f.pcm.iter().any(|&s| s != 0)));
+    assert!(base.iter().any(|f| f.pcm.iter().any(|&s| s != 0.0)));
 }
 
 #[test]
@@ -407,7 +407,7 @@ fn multi_rdb_frame_verifies_and_decodes() {
     // the same single-channel program.
     assert_eq!(decoded.channels, 1);
     assert_eq!(decoded.pcm.len(), 2 * 1024);
-    assert!(decoded.pcm.iter().any(|&s| s != 0));
+    assert!(decoded.pcm.iter().any(|&s| s != 0.0));
 }
 
 #[test]

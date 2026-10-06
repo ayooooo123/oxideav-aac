@@ -293,7 +293,8 @@ fn own_decode(stream: &[u8]) -> (Vec<i16>, usize, u32) {
     for f in &frames {
         ch = f.channels;
         rate = f.sample_rate;
-        pcm.extend_from_slice(&f.pcm);
+        // Decoded f32 → the encoder's i16 domain.
+        pcm.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     (pcm, ch.max(1), rate)
 }

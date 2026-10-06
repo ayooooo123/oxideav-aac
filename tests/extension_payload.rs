@@ -712,13 +712,16 @@ fn parser_dispatch_sbr_crc_extension_type_surfaced() {
 }
 
 #[test]
-fn parser_dispatch_reserved_extension_type_surfaced() {
-    // Byte 0: [type:4=0010, padding:4=0000] = 0x20.
+fn parser_dispatch_reserved_extension_type_skipped() {
+    // Byte 0: [type:4=0010, padding:4=0000] = 0x20. Reserved types are
+    // skipped whole (FFmpeg's decode_extension_payload default
+    // branch), so parse surfaces the skipped payload with the raw
+    // type — not an error.
     let bytes = [0x20u8];
     let mut r = BitReader::new(&bytes);
     assert_eq!(
         ExtensionPayload::parse(&mut r, 1),
-        Err(Error::UnsupportedExtensionType(0b0010))
+        Ok(ExtensionPayload::Reserved(0b0010, 1))
     );
 }
 

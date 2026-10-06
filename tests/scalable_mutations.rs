@@ -203,7 +203,7 @@ fn bit_flip_battery() {
     let mut dec = ScalableDecoder::new(cfg.clone()).unwrap();
     let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
     let pristine = dec.decode_frame(&refs).unwrap();
-    assert!(pristine.pcm.iter().any(|&s| s != 0));
+    assert!(pristine.pcm.iter().any(|&s| s != 0.0));
 
     let mut errors = 0usize;
     let mut oks = 0usize;
