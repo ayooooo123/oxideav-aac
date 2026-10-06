@@ -342,9 +342,22 @@ impl StreamDecoder {
             block: u8,
             parsed: ParsedChannel,
             sbr: Option<Box<SbrExtensionData>>,
+            /// PNS generator state at this element's bitstream position.
+            pns_start: u32,
         }
         let mut pending: Vec<PendingElement> = Vec::new();
         let mut cces: Vec<(u8, CouplingChannelElement)> = Vec::new();
+        let mut cce_pns_starts: Vec<u32> = Vec::new();
+        // FFmpeg draws every PNS value while it parses a channel, so its
+        // generator walks the elements in bitstream order. The CCEs are
+        // decoded ahead of their targets below; each element therefore
+        // records the state FFmpeg reaches at its position.
+        let mut pns_cursor = *self.pns_state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pns_take = |draws: usize| {
+            let start = pns_cursor;
+            pns_cursor = crate::pns::advance_rand_state(pns_cursor, draws);
+            start
+        };
         let fs_sbr = sample_rate.saturating_mul(2);
 
         // `num_raw_data_blocks` is the resolved count `N`. The walker
@@ -363,6 +376,11 @@ impl StreamDecoder {
                         let ics = body.ics_info.clone().ok_or(Error::ElementDecodeInvalid)?;
                         let spectral =
                             SpectralData::parse(&mut reader, &ics, &body.section_data, fs)?;
+                        let pns_start = pns_take(crate::pns::pns_draw_count(
+                            &body.section_data.sfb_cb,
+                            &ics,
+                            fs,
+                        )?);
                         pending.push(PendingElement {
                             key: (kind_id(kind), element_instance_tag),
                             kind,
@@ -373,6 +391,7 @@ impl StreamDecoder {
                                 spectral,
                             })),
                             sbr: None,
+                            pns_start,
                         });
                     }
                     Element::ChannelElement {
@@ -380,12 +399,24 @@ impl StreamDecoder {
                         element_instance_tag,
                     } => {
                         let parsed = parse_cpe_family(&mut reader, family, aot, fs)?;
+                        let (left, right, _) = parsed.channel_inputs();
+                        let draws = crate::pns::pns_draw_count(
+                            &left.body.section_data.sfb_cb,
+                            left.ics_info,
+                            fs,
+                        )? + crate::pns::pns_draw_count(
+                            &right.body.section_data.sfb_cb,
+                            right.ics_info,
+                            fs,
+                        )?;
+                        let pns_start = pns_take(draws);
                         pending.push(PendingElement {
                             key: (kind_id(IdSynEle::Cpe), element_instance_tag),
                             kind: IdSynEle::Cpe,
                             block,
                             parsed: ParsedChannel::Pair(Box::new(parsed)),
                             sbr: None,
+                            pns_start,
                         });
                     }
                     Element::ChannelElement {
@@ -405,6 +436,11 @@ impl StreamDecoder {
                             aot,
                             fs,
                         )?;
+                        cce_pns_starts.push(pns_take(crate::pns::pns_draw_count(
+                            &cce.body.section_data.sfb_cb,
+                            &cce.ics_info,
+                            fs,
+                        )?));
                         cces.push((block, cce));
                     }
                     Element::ChannelElement { kind, .. } => {
@@ -445,8 +481,13 @@ impl StreamDecoder {
         // single_channel_element() into its cc_spectrum (and, for an
         // independently switched CCE, its time signal), through the
         // per-instance-tag persistent CCE decoder slot.
+        let pns_shared = self.pns_state.clone();
+        let set_pns = move |state: u32| {
+            *pns_shared.lock().unwrap_or_else(|e| e.into_inner()) = state;
+        };
         let mut decoded_cces: Vec<DecodedCce> = Vec::with_capacity(cces.len());
-        for (_, cce) in &cces {
+        for ((_, cce), &pns_start) in cces.iter().zip(&cce_pns_starts) {
+            set_pns(pns_start);
             let dec = self
                 .cce_decoders
                 .entry(cce.element_instance_tag)
@@ -463,6 +504,7 @@ impl StreamDecoder {
         // is concatenated in time below.
         let mut elements: Vec<(u8, ElementOut)> = Vec::new();
         for pe in pending {
+            set_pns(pe.pns_start);
             let channels = match &pe.parsed {
                 ParsedChannel::Single(sce) => {
                     let coupling =
@@ -510,6 +552,7 @@ impl StreamDecoder {
                 },
             ));
         }
+        set_pns(pns_cursor);
 
         // HE-AAC: once any frame carries SBR data the stream is emitted
         // at the doubled rate; frames without SBR go through the pure

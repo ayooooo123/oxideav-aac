@@ -57,10 +57,10 @@
 //! (conformance-settled exponent sign — see [`CouplingGains::cc_gain`]),
 //! with `cc_scale` from Table 4.154 ([`CC_SCALE_TABLE`]) and — when
 //! `gain_element_sign == 1` — the in-phase / out-of-phase split taken
-//! off **each transmitted DPCM delta** (`cc_sign = 1 − 2·(dpcm & 1)`,
-//! accumulator fed with `dpcm >> 1`), per the ISO/IEC 14496-3:2001 /
-//! 13818-7:2004 `couple_channel()` text as ruled in
-//! `docs/audio/aac/cce-gain-sign-split.md` §3. A `common_gain_element`
+//! off the **accumulated** DPCM value (`cc_sign = 1 − 2·(a & 1)`,
+//! exponent `a >> 1`), the 14496-3:2009 `couple_channel()` reading that
+//! FFmpeg's `decode_cce` implements (and the reference this crate
+//! matches). A `common_gain_element`
 //! is **never** sign-split (`cc_sign = 1` forced in that branch — so an
 //! independently switched CCE, which must use common gains only, always
 //! couples in phase). The first coupled target (`list_index == 0`) is
@@ -265,19 +265,19 @@ impl CouplingHeader {
 }
 
 /// One decoded per-band coupling gain of a `dpcm_gain_element` list —
-/// the §4.6.8.3.3 (2001 / 13818-7:2004) `couple_channel()` gain-decode
-/// output for one `(g, sfb)`: the `cc_sign` out-of-phase flag split off
-/// the transmitted DPCM delta, and the accumulated `gain_element`
-/// exponent (see `docs/audio/aac/cce-gain-sign-split.md` §3).
+/// the §4.6.8.3.3 `couple_channel()` gain-decode output for one
+/// `(g, sfb)`: the `cc_sign` out-of-phase flag and the `gain_element`
+/// exponent, both split off the running DPCM sum as FFmpeg's
+/// `decode_cce` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DpcmGain {
-    /// `cc_sign == −1` (out-of-phase coupling) for this band. Set from
-    /// the delta LSB (`dpcm & 1`) when `gain_element_sign == 1`; always
+    /// `cc_sign == −1` (out-of-phase coupling) for this band: the LSB of
+    /// the accumulated DPCM sum when `gain_element_sign == 1`; always
     /// `false` when the sign bit is clear.
     pub negative: bool,
-    /// The accumulated `gain_element[g][sfb]` exponent —
-    /// `a += dpcm >> 1` under `gain_element_sign == 1`, `a += dpcm`
-    /// otherwise.
+    /// The `gain_element[g][sfb]` exponent — the accumulated DPCM sum
+    /// shifted right by one under `gain_element_sign == 1`, the sum
+    /// itself otherwise.
     pub gain: i32,
 }
 
@@ -309,9 +309,8 @@ pub struct CouplingGains {
     pub cc_scale: f64,
     /// `gain_element_sign` from the coupling header (informational —
     /// the in-phase / out-of-phase split is resolved per band at parse
-    /// time into [`DpcmGain::negative`], per the
-    /// `docs/audio/aac/cce-gain-sign-split.md` §3 ruling; the writer
-    /// keys off the [`CouplingHeader`] it is handed).
+    /// time into [`DpcmGain::negative`]; the writer keys off the
+    /// [`CouplingHeader`] it is handed).
     pub gain_element_sign: bool,
     /// The transmitted gain lists, in `c = 1 ..= num_gain_element_lists`
     /// order (`lists[0]` is the `c == 1` list).
@@ -357,45 +356,36 @@ impl CouplingGains {
                 if header.ind_sw_cce_flag {
                     return Err(Error::CceInvalid);
                 }
-                // §4.6.8.3.3 (2001 / 13818-7:2004) gain-decode loop —
-                // under `gain_element_sign` the out-of-phase flag is
-                // split off **each transmitted delta** (`cc_sign =
-                // 1 − 2·(dpcm & 1)`) and the accumulator is fed with
-                // the remaining magnitude (`a += dpcm >> 1`, arithmetic
-                // shift); with the sign bit clear the delta accumulates
-                // whole. Ruled in
-                // `docs/audio/aac/cce-gain-sign-split.md` §3 (the
-                // 14496-3:2009 fragment that splits the *accumulated*
-                // value is an editorial defect of that edition).
+                // §4.6.8.3.3 gain-decode loop as FFmpeg's `decode_cce`
+                // runs it: every transmitted delta feeds one running
+                // sum; under `gain_element_sign` the out-of-phase flag
+                // is that sum's LSB and the exponent the rest
+                // (`cc_sign = 1 − 2·(a & 1)`, `gain = a >> 1`).
                 let mut acc: i32 = 0;
+                let split = |acc: i32| {
+                    if header.gain_element_sign {
+                        DpcmGain {
+                            negative: (acc & 1) != 0,
+                            gain: acc >> 1,
+                        }
+                    } else {
+                        DpcmGain {
+                            negative: false,
+                            gain: acc,
+                        }
+                    }
+                };
                 let mut grid = vec![vec![DpcmGain::default(); max_sfb]; num_window_groups];
                 for (g, row) in grid.iter_mut().enumerate() {
                     let cb_row = sfb_cb.get(g).ok_or(Error::CceInvalid)?;
                     for (sfb, cell) in row.iter_mut().enumerate() {
                         let cb = *cb_row.get(sfb).ok_or(Error::CceInvalid)?;
                         if cb != ZERO_HCB {
-                            let dpcm = i32::from(hcod_sf_decode(reader)?);
-                            if header.gain_element_sign {
-                                acc += dpcm >> 1;
-                                *cell = DpcmGain {
-                                    negative: (dpcm & 1) != 0,
-                                    gain: acc,
-                                };
-                            } else {
-                                acc += dpcm;
-                                *cell = DpcmGain {
-                                    negative: false,
-                                    gain: acc,
-                                };
-                            }
-                        } else {
-                            // ZERO_HCB band carries the running value but
-                            // contributes no coupling (cc_gain unused).
-                            *cell = DpcmGain {
-                                negative: false,
-                                gain: acc,
-                            };
+                            acc += i32::from(hcod_sf_decode(reader)?);
                         }
+                        // A ZERO_HCB band carries the running value but
+                        // contributes no coupling (cc_gain unused).
+                        *cell = split(acc);
                     }
                 }
                 lists.push(GainList::Dpcm(grid));
@@ -437,33 +427,31 @@ impl CouplingGains {
                     }
                     // common_gain_element_present[c] = 0
                     writer.write_bit(false);
-                    // Exact inverse of the §4.6.8.3.3 gain-decode loop:
-                    // under `gain_element_sign` each delta packs the
-                    // out-of-phase flag into its LSB
-                    // (`dpcm = ((gain − prev) << 1) | negative`, which
-                    // `dpcm >> 1` / `dpcm & 1` recover for every signed
-                    // delta); with the sign bit clear the delta is the
-                    // plain gain difference and an out-of-phase band is
-                    // unrepresentable (rejected).
+                    // Exact inverse of the gain-decode loop: each delta
+                    // is the step of the running sum, whose value is
+                    // `(gain << 1) | negative` under `gain_element_sign`
+                    // and the plain gain otherwise (an out-of-phase band
+                    // is unrepresentable without the sign bit: rejected).
                     let mut prev: i32 = 0;
                     for (g, row) in grid.iter().enumerate() {
                         let cb_row = sfb_cb.get(g).ok_or(Error::CceInvalid)?;
                         for (sfb, cell) in row.iter().enumerate() {
                             let cb = *cb_row.get(sfb).ok_or(Error::CceInvalid)?;
                             if cb != ZERO_HCB {
-                                let delta = cell.gain - prev;
-                                let dpcm = if header.gain_element_sign {
-                                    (delta << 1) | i32::from(cell.negative)
+                                let sum = if header.gain_element_sign {
+                                    cell.gain.checked_mul(2).ok_or(Error::CceInvalid)?
+                                        | i32::from(cell.negative)
                                 } else {
                                     if cell.negative {
                                         return Err(Error::CceInvalid);
                                     }
-                                    delta
+                                    cell.gain
                                 };
-                                let dpcm = i8::try_from(dpcm).map_err(|_| Error::CceInvalid)?;
+                                let step = sum.checked_sub(prev).ok_or(Error::CceInvalid)?;
+                                let dpcm = i8::try_from(step).map_err(|_| Error::CceInvalid)?;
                                 let (len, cw) = hcod_sf_encode(dpcm)?;
                                 writer.write_u32(cw, u32::from(len));
-                                prev = cell.gain;
+                                prev = sum;
                             }
                         }
                     }
@@ -482,9 +470,8 @@ impl CouplingGains {
     ///
     /// Returns `cc_gain = cc_sign · cc_scale^(−gain_element)`:
     /// * for a [`GainList::Dpcm`] band, `cc_sign` and `gain_element`
-    ///   are the per-band values the parse loop split off the DPCM
-    ///   deltas (`docs/audio/aac/cce-gain-sign-split.md` §3 — the
-    ///   2001 / 13818-7:2004 `couple_channel()` gain decode);
+    ///   are the per-band values the parse loop split off the running
+    ///   DPCM sum (FFmpeg's `decode_cce`);
     /// * for a [`GainList::Common`] list, `cc_sign = 1` always — the
     ///   ruled text never sign-splits a `common_gain_element`, so an
     ///   independently switched CCE (common gains only) couples in
@@ -502,9 +489,9 @@ impl CouplingGains {
     /// `docs/audio/aac/cce-gain-sign-split.md` §4 left open (a
     /// black-box validator had measured the negated exponent; the
     /// conformance corpus now confirms it as the normative wire
-    /// convention). The §3 sign-split ruling is orthogonal (the
-    /// corpus's `gain_element_sign` is always 0) and is implemented in
-    /// the parse loop.
+    /// convention). The sign split is orthogonal (the corpus's
+    /// `gain_element_sign` is always 0) and is implemented in the parse
+    /// loop.
     pub fn cc_gain(&self, list_index: usize, g: usize, sfb: usize) -> Result<f64> {
         if list_index == 0 {
             // The first coupled target's gains are not transmitted; the
@@ -901,14 +888,13 @@ mod tests {
         assert!((gains.cc_gain(1, 0, 0).unwrap() - 0.125).abs() < 1e-12);
     }
 
-    /// The sign-split DPCM decode takes `cc_sign` from each **delta**
-    /// LSB and accumulates `dpcm >> 1` (§3 ruling): the worked
-    /// `[3, 3]` sequence from `cce-gain-sign-split.md` §2.2 must land
-    /// at `{−cc_scale^−1, −cc_scale^−2}` under the negated exponent
-    /// (per-band signs both negative, exponents 1 then 2) — not the
-    /// `{−1, +3}` split of the 2009 fragment-A misprint.
+    /// The sign-split DPCM decode takes `cc_sign` from the LSB of the
+    /// **running sum** and the exponent from the rest, as FFmpeg's
+    /// `decode_cce` does: the deltas `[3, 3]` sum to `3` then `6`, so
+    /// the bands land at `{−cc_scale^−1, +cc_scale^−3}` under the
+    /// negated exponent.
     #[test]
-    fn cc_gain_dpcm_delta_split() {
+    fn cc_gain_dpcm_running_sum_split() {
         let sfb_cb = vec![vec![2u8, 2u8]];
         let header = CouplingHeader {
             ind_sw_cce_flag: false,
@@ -942,7 +928,7 @@ mod tests {
         let bytes = writer.into_bytes();
         let mut reader = BitReader::new(&bytes);
         let gains = CouplingGains::parse(&mut reader, &header, 1, 2, &sfb_cb).unwrap();
-        // delta 3 => negative (3 & 1), a += 1 twice => gains 1, 2.
+        // Sums 3 then 6 => (negative, 3 >> 1 = 1), (positive, 6 >> 1 = 3).
         assert_eq!(
             gains.lists,
             vec![GainList::Dpcm(vec![vec![
@@ -951,13 +937,13 @@ mod tests {
                     gain: 1
                 },
                 DpcmGain {
-                    negative: true,
-                    gain: 2
+                    negative: false,
+                    gain: 3
                 },
             ]])]
         );
         assert!((gains.cc_gain(1, 0, 0).unwrap() + 0.5).abs() < 1e-12);
-        assert!((gains.cc_gain(1, 0, 1).unwrap() + 0.25).abs() < 1e-12);
+        assert!((gains.cc_gain(1, 0, 1).unwrap() - 0.125).abs() < 1e-12);
     }
 
     /// The sign-split writer is the exact inverse of the parse loop,
@@ -993,9 +979,10 @@ mod tests {
                 negative: true,
                 gain: -2,
             },
-            // ZERO_HCB carry cell (not transmitted).
+            // ZERO_HCB carry cell (not transmitted): the running sum
+            // split like its predecessor.
             DpcmGain {
-                negative: false,
+                negative: true,
                 gain: -2,
             },
             DpcmGain {

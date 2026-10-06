@@ -18,6 +18,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- AAC LTP: the LTP analysis of a `LONG_START` / `LONG_STOP` frame used a
+  128-point short transition (the short window's half length) instead of
+  the 256-point short transform, so the predicted spectrum differed from
+  FFmpeg's `windowing_and_mdct_ltp` around every block switch (FATE
+  `ap05_48`: 66 → 135 dB SNR against FFmpeg).
+- Coupling channel elements: a per-band DPCM gain list with
+  `gain_element_sign` set now takes the out-of-phase flag and exponent
+  from the running sum, as FFmpeg's `decode_cce` does (it was split off
+  each delta), and PNS noise is drawn in bitstream element order even
+  though CCEs are decoded ahead of their targets (FATE `al07_96`: 60 →
+  138 dB).
 - AAC from MP4 / Matroska failed to decode ("packet has neither an ADTS
   nor a LOAS syncword"): the registry decoder now parses the
   `AudioSpecificConfig` from `extradata` (`esds` DecoderSpecificInfo /

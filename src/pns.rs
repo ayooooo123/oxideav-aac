@@ -169,6 +169,35 @@ pub fn gen_rand_vector(out: &mut [f64], state: &mut u32) {
     }
 }
 
+/// The generator state after `draws` more [`gen_rand_vector`] values.
+pub fn advance_rand_state(mut state: u32, draws: usize) -> u32 {
+    for _ in 0..draws {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    }
+    state
+}
+
+/// Number of generator values [`apply_pns`] draws for one channel: the
+/// width of every `NOISE_HCB` band below `max_sfb`, once per window of
+/// its group. FFmpeg draws the same values while it parses the
+/// channel's spectrum, so its generator walks the elements of a
+/// `raw_data_block()` in bitstream order; a driver that decodes them in
+/// another order uses this count to hand each element the state FFmpeg
+/// reaches at that element.
+pub fn pns_draw_count(sfb_cb: &[Vec<u8>], ics_info: &IcsInfo, fs_index: u8) -> Result<usize> {
+    let offsets = ics_info.swb_offsets(fs_index)?;
+    let max_sfb = (ics_info.max_sfb as usize).min(offsets.len() - 1);
+    let mut draws = 0usize;
+    for (cbs, &wgl) in sfb_cb.iter().zip(&ics_info.window_group_length) {
+        for (sfb, &cb) in cbs.iter().take(max_sfb).enumerate() {
+            if is_noise(cb) {
+                draws += usize::from(offsets[sfb + 1] - offsets[sfb]) * usize::from(wgl);
+            }
+        }
+    }
+    Ok(draws)
+}
+
 /// Synthesise one PNS band in place from a pre-filled random vector.
 ///
 /// `band` is the generated random vector (length `size`); on return it
