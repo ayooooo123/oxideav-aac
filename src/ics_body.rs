@@ -778,7 +778,7 @@ struct ToolDispatch {
 fn parse_tools(
     reader: &mut BitReader<'_>,
     ics_info: &IcsInfo,
-    _audio_object_type: u8,
+    audio_object_type: u8,
     start: u64,
 ) -> Result<ToolDispatch> {
     let pulse_data_present = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
@@ -795,33 +795,57 @@ fn parse_tools(
         None
     };
 
+    // ER syntax (AOTs 17 / 19 / 23 / 39) defers the TNS *data* parse
+    // until after the gain-control flag — FFmpeg
+    // (aacdec.c `ff_aac_decode_ics`): `tns->present` is read, then the
+    // gain-control flag, then for er_syntax the TNS data. The fork read
+    // the TNS data immediately, desynchronising every element that
+    // follows in an ER frame (FATE er_ad6000np_44_ep0).
+    let is_er = matches!(audio_object_type, 17 | 19 | 23 | 39);
+    let mut tns_data: Option<TnsData> = None;
+    let mut gain_control_data: Option<GainControlData> = None;
     let tns_data_present = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
-    let tns_data = if tns_data_present {
-        // Family-aware widths: the ER AAC LD families read the
-        // reduced 1 / 4 / 3-bit Table 4.155 column (the
-        // corpus-resolved AOT-23 wire — see
-        // docs/audio/aac/er-ld-tns-divergence.md §0); everything
-        // else takes the literal window_sequence dispatch.
-        Some(TnsData::parse_family(
-            reader,
-            ics_info.family,
-            ics_info.window_sequence,
-        )?)
-    } else {
-        None
-    };
 
-    let gain_control_data_present = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
-    let gain_control_data = if gain_control_data_present {
-        // Per §4.6.12 the gain_control_data tool is AOT-3 (SSR) only;
-        // a conforming stream never sets the flag on any other AOT.
-        // The parser surfaces the literal bits regardless of AOT —
-        // the AOT-validity check is enforced on the writer side so
-        // we can ingest hostile streams without panicking, and the
-        // emitter side keeps us from emitting non-conforming streams.
-        Some(GainControlData::parse(reader, ics_info.window_sequence)?)
+    let gain_control_data_present = if !is_er {
+        // Non-ER order: TNS data, then the gain-control flag.
+        if tns_data_present {
+            tns_data = Some(TnsData::parse_family(
+                reader,
+                ics_info.family,
+                ics_info.window_sequence,
+            )?);
+        }
+        let present = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
+        gain_control_data = if present {
+            // Per §4.6.12 the gain_control_data tool is AOT-3 (SSR)
+            // only; a conforming stream never sets the flag on any
+            // other AOT. The parser surfaces the literal bits
+            // regardless of AOT — the AOT-validity check is enforced
+            // on the writer side so we can ingest hostile streams
+            // without panicking, and the emitter side keeps us from
+            // emitting non-conforming streams.
+            Some(GainControlData::parse(reader, ics_info.window_sequence)?)
+        } else {
+            None
+        };
+        present
     } else {
-        None
+        // ER order: the gain-control flag first, TNS data after. The
+        // gain tool is SSR-only (AOT 3), so ER streams never carry the
+        // data body — the flag is read and its body skipped.
+        let present = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
+        if tns_data_present {
+            tns_data = Some(TnsData::parse_family(
+                reader,
+                ics_info.family,
+                ics_info.window_sequence,
+            )?);
+        }
+        if present {
+            gain_control_data =
+                Some(GainControlData::parse(reader, ics_info.window_sequence)?);
+        }
+        present
     };
 
     let spectral_data_bit_offset = reader.bit_position() - start;
