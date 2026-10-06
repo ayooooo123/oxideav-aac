@@ -889,11 +889,13 @@ impl StreamDecoder {
     /// `reordered_spectral_data()` payload decoded by
     /// [`crate::hcr_decode::decode_reordered_spectral_data`].
     ///
-    /// Scope: the ER AAC LC (AOT 17), ER AAC LTP (AOT 19) and ER AAC
-    /// LD (AOT 23) object types — the three §4.4.2.3 Table 4.19
-    /// payloads. ER AAC scalable (AOT 20) rides its own layered
-    /// `aac_scalable_main_element()` walk (see [`crate::scalable`])
-    /// and is rejected here with [`Error::NotImplemented`]. For
+    /// Scope: the ER AAC LC (AOT 17), ER AAC LTP (AOT 19), ER AAC LD
+    /// (AOT 23) and ER AAC ELD (AOT 39) object types — the §4.4.2.3
+    /// Table 4.19 payloads (ELD without instance tags, with every CPE
+    /// sharing its window). ER AAC scalable (AOT 20) rides its own
+    /// layered `aac_scalable_main_element()` walk (see
+    /// [`crate::scalable`]) and is rejected here with
+    /// [`Error::NotImplemented`]. For
     /// AOT 19 the §4.6.7 LTP tool is live: `ics_info()` carries the
     /// Table 4.55 non-LD `ltp_data()` branch (11-bit lag, `M = 0`),
     /// and the per-element [`crate::element_decode::ElementDecoder`]
@@ -922,13 +924,14 @@ impl StreamDecoder {
         // below already thread. ER AAC scalable (AOT 20) uses the
         // layered aac_scalable_main_element() walk instead and stays
         // out of this entry point.
-        if aot != 17 && aot != 19 && aot != 23 {
+        if !matches!(aot, 17 | 19 | 23 | 39) {
             return Err(Error::NotImplemented);
         }
-        // An LD stream must run an LD family and vice versa — a
+        // An LD / ELD stream must run an LD family and vice versa — a
         // mismatch means the caller never installed the ASC-resolved
         // family, which would silently mis-decode every band.
-        if (aot == 23) != self.family.is_ld() {
+        let eld = aot == 39;
+        if (aot == 23 || eld) != self.family.is_ld() {
             return Err(Error::ElementDecodeInvalid);
         }
         let fs = fs_index;
@@ -953,8 +956,15 @@ impl StreamDecoder {
 
         let mut reader = BitReader::new(payload);
         let mut channels: Vec<Vec<f64>> = Vec::new();
-        for &kind in sequence {
-            let element_instance_tag = reader.read_u32(4).map_err(|_| Error::UnexpectedEnd)? as u8;
+        for (position, &kind) in sequence.iter().enumerate() {
+            // ELD elements carry no instance tag (FFmpeg
+            // `aac_decode_er_frame`); their slot is the position in the
+            // fixed sequence.
+            let element_instance_tag = if eld {
+                position as u8
+            } else {
+                reader.read_u32(4).map_err(|_| Error::UnexpectedEnd)? as u8
+            };
             let key = (kind_id(kind), element_instance_tag);
             match kind {
                 IdSynEle::Sce | IdSynEle::Lfe => {
@@ -975,7 +985,8 @@ impl StreamDecoder {
                     channels.push(dec.decode_sce(&ch, aot, fs)?);
                 }
                 IdSynEle::Cpe => {
-                    let common_window = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
+                    let common_window =
+                        eld || reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
                     let dec_out = if common_window {
                         // §4.4.2.3 shared ics_info + Table 4.4 ms_mask.
                         let ics = IcsInfo::parse_family(&mut reader, family, aot, fs, true)?;

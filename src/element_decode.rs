@@ -83,6 +83,7 @@ use crate::cce::CouplingChannelElement;
 use crate::decoded_spectrum::quant_to_spec;
 use crate::dequant::rescale_spectrum;
 use crate::filterbank::Filterbank;
+use crate::eld_filterbank::EldFilterbank;
 use crate::ics_body::IcsBody;
 use crate::ics_info::IcsInfo;
 use crate::intensity_stereo::{apply_intensity_stereo, IntensityPairSpectra};
@@ -261,7 +262,6 @@ fn reconstruct_pre_pair(
 /// `ltp_data_present == 0`, in which case no prediction is added but the
 /// history is still advanced so it stays continuous across frames.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn finish_channel(
     spec: &mut [f64],
     body: &IcsBody,
@@ -273,6 +273,7 @@ fn finish_channel(
     ltp_state: &mut LtpState,
     predictor_bank: &mut Option<PredictorBank>,
     ssr: &mut Option<Box<SsrChannelDecoder>>,
+    eld: &mut Option<Box<EldFilterbank>>,
     coupling: &[CouplingApply<'_>],
     run_main: bool,
 ) -> Result<Vec<f64>> {
@@ -331,6 +332,15 @@ fn finish_channel(
     let mut out = if aot == 3 {
         let dec = ssr.get_or_insert_with(Default::default);
         dec.decode_frame(spec, ics_info, body.gain_control_data.as_ref())?
+    } else if aot == 39 {
+        // ER AAC ELD: the low-delay filterbank (no LTP in ELD).
+        let eld_fb = match eld {
+            Some(eld_fb) => eld_fb,
+            slot @ None => {
+                slot.insert(Box::new(EldFilterbank::new(ics_info.family.frame_len())?))
+            }
+        };
+        eld_fb.synthesize(spec)?
     } else {
         // §4.6.11 filterbank → PCM, then advance the LTP history with
         // this frame's output and aliased IMDCT tail (§4.6.7.3).
@@ -604,6 +614,10 @@ pub struct ElementDecoder {
     /// persists across frames. Same channel-slot indexing as
     /// `filterbanks`.
     ssr_decoders: [Option<Box<SsrChannelDecoder>>; 2],
+    /// Per-channel ER AAC ELD low-delay synthesis (AOT 39), replacing
+    /// the §4.6.11 filterbank for ELD. `None` until the first ELD
+    /// frame. Same channel-slot indexing as `filterbanks`.
+    eld_filterbanks: [Option<Box<EldFilterbank>>; 2],
     /// §4.6.13.3 default generator state, advanced across every noise
     /// band of every frame so the noise is reproducible per decode run.
     pns_state: SharedPnsState,
@@ -639,6 +653,7 @@ impl ElementDecoder {
             ltp_states: [LtpState::new_family(family), LtpState::new_family(family)],
             predictor_banks: [None, None],
             ssr_decoders: [None, None],
+            eld_filterbanks: [None, None],
             pns_state: pns,
         }
     }
@@ -652,6 +667,7 @@ impl ElementDecoder {
             ltp_states: [LtpState::new(), LtpState::new()],
             predictor_banks: [None, None],
             ssr_decoders: [None, None],
+            eld_filterbanks: [None, None],
             pns_state: SharedPnsState::new(std::sync::Mutex::new(seed)),
         }
     }
@@ -708,6 +724,7 @@ impl ElementDecoder {
             &mut self.ltp_states[0],
             &mut self.predictor_banks[0],
             &mut self.ssr_decoders[0],
+            &mut self.eld_filterbanks[0],
             coupling,
             true,
         )
@@ -877,6 +894,7 @@ impl ElementDecoder {
             &mut self.ltp_states[0],
             &mut self.predictor_banks[0],
             &mut self.ssr_decoders[0],
+            &mut self.eld_filterbanks[0],
             left_coupling,
             false,
         )?;
@@ -891,6 +909,7 @@ impl ElementDecoder {
             &mut self.ltp_states[1],
             &mut self.predictor_banks[1],
             &mut self.ssr_decoders[1],
+            &mut self.eld_filterbanks[1],
             right_coupling,
             false,
         )?;

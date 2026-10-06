@@ -781,7 +781,10 @@ fn parse_tools(
     audio_object_type: u8,
     start: u64,
 ) -> Result<ToolDispatch> {
-    let pulse_data_present = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
+    // ER AAC ELD (AOT 39) has neither the pulse tool nor the
+    // gain-control flag (FFmpeg `ff_aac_decode_ics`, `eld_syntax`).
+    let eld = audio_object_type == 39;
+    let pulse_data_present = !eld && reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
     let pulse_data = if pulse_data_present {
         // Table 4.50 Note 1: pulse_data is illegal on
         // EIGHT_SHORT_SEQUENCE. A conforming stream never sets the
@@ -833,7 +836,7 @@ fn parse_tools(
         // ER order: the gain-control flag first, TNS data after. The
         // gain tool is SSR-only (AOT 3), so ER streams never carry the
         // data body — the flag is read and its body skipped.
-        let present = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
+        let present = !eld && reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
         if tns_data_present {
             tns_data = Some(TnsData::parse_family(
                 reader,

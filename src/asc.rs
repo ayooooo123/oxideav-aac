@@ -96,6 +96,9 @@ use crate::{Error, Result};
 /// `GASpecificConfig` per Table 1.17.
 const GA_AOTS: &[u8] = &[1, 2, 3, 4, 6, 7, 17, 19, 20, 21, 22, 23];
 
+/// ER AAC ELD, whose ASC body is `ELDSpecificConfig` (Table 1.17).
+const ELD_AOT: u8 = 39;
+
 /// AOTs that signal SBR (5) or SBR + PS (29) as an outer wrapper
 /// around an inner GA AOT (typically 2 = LC). The ASC walks the
 /// extension sample-rate/index and re-reads `GetAudioObjectType`
@@ -491,16 +494,20 @@ impl AudioSpecificConfig {
             }
         }
 
-        // Body dispatch — Phase 1 only handles GA.
-        if !GA_AOTS.contains(&effective_aot) {
+        // Body dispatch: GASpecificConfig for the GA types,
+        // ELDSpecificConfig for ER AAC ELD.
+        let ga_body = if effective_aot == ELD_AOT {
+            parse_eld_specific_config(reader)?
+        } else if GA_AOTS.contains(&effective_aot) {
+            parse_ga_specific_config(
+                reader,
+                channel_configuration,
+                effective_aot,
+                origin_bit_offset,
+            )?
+        } else {
             return Err(Error::UnsupportedAot(effective_aot));
-        }
-        let ga_body = parse_ga_specific_config(
-            reader,
-            channel_configuration,
-            effective_aot,
-            origin_bit_offset,
-        )?;
+        };
 
         // Table 1.15 outer `switch (audioObjectType)` — `epConfig`
         // for ER object types. `epConfig == 2 || epConfig == 3`
@@ -662,6 +669,58 @@ fn parse_ga_specific_config(
         pce,
         layer_nr,
         extension_body,
+    })
+}
+
+/// Parse `ELDSpecificConfig()` (ISO/IEC 14496-3 Table 4.180) for ER
+/// AAC ELD (AOT 39) into the [`GaSpecificConfig`] shape the ER decode
+/// path reads: `frameLengthFlag` selects the 512 / 480-line frame and
+/// the resilience triplet rides in the extension body. Like FFmpeg
+/// (`decode_eld_specific_config`), low-delay SBR and the resilience
+/// tools are not supported and the `eldExtType` payloads are skipped.
+fn parse_eld_specific_config(reader: &mut BitReader<'_>) -> Result<GaSpecificConfig> {
+    let frame_length = if read_bit(reader)? {
+        FrameLength::Long960
+    } else {
+        FrameLength::Long1024
+    };
+    let resilience = AacResilienceFlags {
+        section_data: read_bit(reader)?,
+        scalefactor_data: read_bit(reader)?,
+        spectral_data: read_bit(reader)?,
+    };
+    if resilience != AacResilienceFlags::default() {
+        return Err(Error::NotImplemented);
+    }
+    // ldSbrPresentFlag: low-delay SBR.
+    if read_bit(reader)? {
+        return Err(Error::NotImplemented);
+    }
+    // eldExtType / eldExtLen loop up to ELDEXT_TERM (0).
+    while read_u8(reader, 4)? != 0 {
+        let mut len = u32::from(read_u8(reader, 4)?);
+        if len == 15 {
+            len += read_u32(reader, 8)?;
+        }
+        if len == 15 + 255 {
+            len += read_u32(reader, 16)?;
+        }
+        for _ in 0..len {
+            read_u8(reader, 8)?;
+        }
+    }
+    Ok(GaSpecificConfig {
+        frame_length,
+        depends_on_core_coder: false,
+        core_coder_delay: None,
+        extension_flag: true,
+        pce: None,
+        layer_nr: None,
+        extension_body: Some(GaExtensionBody {
+            bsac_layer: None,
+            resilience: Some(resilience),
+            extension_flag3: false,
+        }),
     })
 }
 

@@ -8,6 +8,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- ER AAC ELD (AOT 39) decoding: `ELDSpecificConfig` parsing (low-delay
+  SBR and the resilience tools are rejected, as FFmpeg does), the ELD
+  element syntax (no instance tags, no window sequence / shape, pulse or
+  gain-control flags; every CPE shares its window) and the low-delay
+  synthesis filterbank `eld_filterbank` with FFmpeg's 512 / 480-line ELD
+  windows (LGPL port of `imdct_and_windowing_eld` and the `aactab.c`
+  tables). FATE `er_eld1001np_44`, `er_eld2000np_48`, `er_eld2100np_48`
+  match FFmpeg at 137-138 dB.
 - `adts_container`: the `"adts"` elementary-stream container (`.aac` /
   `.adts`) — demuxer (frame index, resync, duration, seeking, an
   equivalent `AudioSpecificConfig` in `extradata`, implicit-SBR / PS

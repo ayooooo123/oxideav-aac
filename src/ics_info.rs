@@ -441,10 +441,16 @@ impl IcsInfo {
             ));
         }
 
-        let ics_reserved_bit = read_bit(reader)?;
-        let window_sequence_bits = read_u8(reader, 2)?;
-        let window_sequence = WindowSequence::from_bits(window_sequence_bits);
-        let window_shape = WindowShape::from_bit(read_bit(reader)?);
+        // ER AAC ELD (AOT 39) carries no reserved bit, window sequence
+        // or window shape: every frame is a long low-delay block.
+        let eld = audio_object_type == 39;
+        let (ics_reserved_bit, window_sequence, window_shape) = if eld {
+            (false, WindowSequence::OnlyLong, WindowShape::Sine)
+        } else {
+            let reserved = read_bit(reader)?;
+            let sequence = WindowSequence::from_bits(read_u8(reader, 2)?);
+            (reserved, sequence, WindowShape::from_bit(read_bit(reader)?))
+        };
 
         if family.is_ld() && window_sequence != WindowSequence::OnlyLong {
             return Err(Error::LdShortWindow);
@@ -464,7 +470,7 @@ impl IcsInfo {
             scale_factor_grouping = Some(read_u8(reader, 7)?);
         } else {
             max_sfb = read_u8(reader, 6)?;
-            predictor_data_present = read_bit(reader)?;
+            predictor_data_present = !eld && read_bit(reader)?;
             if predictor_data_present {
                 if audio_object_type == 1 {
                     // Main predictor side info.

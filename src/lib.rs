@@ -440,6 +440,10 @@ pub mod dequant;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod element_decode;
+// internal — the ER AAC ELD low-delay synthesis (LGPL port)
+#[doc(hidden)]
+pub mod eld_filterbank;
+mod eld_window;
 pub mod encoder;
 pub mod he_aac_encoder;
 // internal — exposed for tests/fuzz; not part of the stable API

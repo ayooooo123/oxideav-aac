@@ -256,19 +256,20 @@ pub enum FrameFamily {
     /// 960 spectral lines per long frame, 120 per short window
     /// (`frameLengthFlag == 1`).
     Lc960,
-    /// ER AAC LD, 512 spectral lines (`frameLengthFlag == 0`);
+    /// ER AAC LD / ELD, 512 spectral lines (`frameLengthFlag == 0`);
     /// long-only.
     Ld512,
-    /// ER AAC LD, 480 spectral lines (`frameLengthFlag == 1`);
+    /// ER AAC LD / ELD, 480 spectral lines (`frameLengthFlag == 1`);
     /// long-only.
     Ld480,
 }
 
 impl FrameFamily {
     /// Resolve the family from the stream's `audioObjectType` and
-    /// `frameLengthFlag` per §4.5.1.1.
+    /// `frameLengthFlag` per §4.5.1.1: ER AAC LD (AOT 23) and ELD
+    /// (AOT 39) share the 512 / 480-line geometry.
     pub fn from_aot_and_flag(aot: u8, frame_length_flag: bool) -> Self {
-        match (aot == 23, frame_length_flag) {
+        match (aot == 23 || aot == 39, frame_length_flag) {
             (false, false) => FrameFamily::Lc1024,
             (false, true) => FrameFamily::Lc960,
             (true, false) => FrameFamily::Ld512,

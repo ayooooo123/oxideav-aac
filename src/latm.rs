@@ -1403,10 +1403,12 @@ pub fn decode_access_unit(
     // The ER General-Audio object types use the §4.4.2.3 Table 4.19
     // fixed-sequence er_raw_data_block() instead of the tagged
     // element walk; route AOT 17 (ER AAC LC), AOT 19 (ER AAC LTP —
-    // the §4.6.7 LTP tool over the same Table 4.19 walk) and
-    // AOT 23 (ER AAC LD, §4.6.17 — the 512/480-line family
-    // installed by the caller) there with the ASC's resilience triplet.
-    if asc.aot == 17 || asc.aot == 19 || asc.aot == 23 {
+    // the §4.6.7 LTP tool over the same Table 4.19 walk), AOT 23 (ER
+    // AAC LD, §4.6.17 — the 512/480-line family installed by the
+    // caller) and AOT 39 (ER AAC ELD, the same walk without instance
+    // tags, synthesized by the low-delay filterbank) there with the
+    // ASC's resilience triplet.
+    if matches!(asc.aot, 17 | 19 | 23 | 39) {
         let resilience = asc
             .ga_body
             .extension_body
