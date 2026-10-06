@@ -220,8 +220,15 @@ pub fn field_widths(seq: WindowSequence) -> (u32, u32, u32) {
 /// Every non-LD family keeps the literal Table 4.155 dispatch of
 /// [`field_widths`].
 pub fn field_widths_family(family: FrameFamily, seq: WindowSequence) -> (u32, u32, u32) {
+    // FFmpeg's ff_aac_decode_tns keys the widths on
+    // EIGHT_SHORT alone (is8): LD runs the long-window column —
+    // n_filt 2, length 6, order 5 — not a reduced 1/4/3 column. The
+    // reduced column came from an ISO/IEC 14496-26 corpus reading
+    // that cannot discriminate 4/3 from 6/5 (every LD TNS record in
+    // it carries n_filt == 0); the FATE ER AAC LD stream decodes
+    // correctly only with the long widths.
     if family.is_ld() {
-        (N_FILT_BITS_SHORT, LENGTH_BITS_SHORT, ORDER_BITS_SHORT)
+        field_widths(WindowSequence::OnlyLong)
     } else {
         field_widths(seq)
     }
