@@ -149,7 +149,13 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         if ch > 0 {
             channels = ch;
         }
-        ps_signaled = asc.ps_present;
+        // FFmpeg's `m4ac.ps == -1` implicit-PS state: a mono stream
+        // whose ASC signals SBR without a psPresentFlag may carry
+        // in-band PS; its output is stereo (duplicated mono until the
+        // first decodable ps_data) from the first SBR frame
+        // (aacdec.c decode_extension_payload EXT_SBR_DATA: `m4ac.ps ==
+        // -1 && nb_channels == 1` → reconfigure stereo).
+        ps_signaled = asc.ps_present || (asc.sbr_present && channels == 1);
     }
 
     let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
