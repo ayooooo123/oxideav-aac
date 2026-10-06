@@ -351,7 +351,6 @@ impl AacDecoder {
     /// the [`StreamDecoder`], queuing one [`AudioFrame`] per ADTS frame.
     fn send_adts(&mut self, data: &[u8], pts: Option<i64>) -> Result<()> {
         let mut pos = 0usize;
-        let mut produced_any = false;
         while pos + ADTS_HEADER_BYTES_NO_CRC <= data.len() {
             let (header, payload_offset) = AdtsHeader::parse(&data[pos..])
                 .map_err(|e| Error::other(format!("oxideav-aac: adts header: {e}")))?;
@@ -368,7 +367,7 @@ impl AacDecoder {
                 .stream
                 .decode_adts_frame(&data[pos..pos + frame_len])
                 .map_err(|e| Error::other(format!("oxideav-aac: decode_adts_frame: {e}")))?;
-            produced_any |= self.queue_decoded(&decoded, pts);
+            self.queue_decoded(&decoded, pts);
             pos += frame_len;
         }
 
