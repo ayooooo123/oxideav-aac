@@ -372,11 +372,9 @@ impl AacDecoder {
             pos += frame_len;
         }
 
-        if !produced_any && pos == 0 {
-            return Err(Error::other(
-                "oxideav-aac: packet held no complete ADTS frame",
-            ));
-        }
+        // A packet holding no complete ADTS frame (a truncated stream
+        // tail) is skipped silently: FFmpeg's ADTS decoder drops such a
+        // packet and the stream carries on.
         Ok(())
     }
 
@@ -478,19 +476,17 @@ impl AacDecoder {
     /// recovered access unit. A packet may carry one or several LOAS sync
     /// frames; the persistent [`LoasDecoder`] threads the
     /// `StreamMuxConfig` (and per-stream decode state) across packets.
+    ///
+    /// A packet whose sync frames all fail to frame (a truncated stream
+    /// tail, a config-only preamble) is skipped silently — FFmpeg's
+    /// `latm_decode_frame` drops such a packet and the stream carries on.
     fn send_loas(&mut self, data: &[u8], pts: Option<i64>) -> Result<()> {
         let decoded_frames = self
             .loas
             .decode_all(data)
             .map_err(|e| Error::other(format!("oxideav-aac: loas decode: {e}")))?;
-        let mut produced_any = false;
         for decoded in &decoded_frames {
-            produced_any |= self.queue_decoded(decoded, pts);
-        }
-        if !produced_any && decoded_frames.is_empty() {
-            return Err(Error::other(
-                "oxideav-aac: packet held no complete LOAS sync frame",
-            ));
+            self.queue_decoded(decoded, pts);
         }
         Ok(())
     }
