@@ -47,7 +47,9 @@
 //! the decode chain, so the spectrum passed in / out here is the
 //! pre-TNS reconstructed spectrum.
 
-use crate::filterbank::{forward_mdct, long_only_window_family, short_window_j};
+use crate::filterbank::{
+    forward_mdct, long_only_window_family, long_sequence_window_n, short_window_j,
+};
 use crate::ics_info::{IcsInfo, LtpData, WindowSequence, WindowShape};
 #[cfg(test)]
 use crate::swb_offset::long_window_offsets;
@@ -333,8 +335,26 @@ impl LtpState {
         // predict() → MDCT(x_est).
         let n_transform = self.family.long_transform_len();
         let x_est = self.predict_long(lag, coef);
+        // The LTP MDCT must use the frame's actual window sequence:
+        // LONG_START/LONG_STOP zero the 448-sample flanks and use the
+        // 128-sample short windows on the transition side (FFmpeg
+        // windowing_and_mdct_ltp). The fork previously applied the
+        // full long-only window on every sequence.
         let left_shape = prev_shape.unwrap_or(ics_info.window_shape);
-        let window = long_only_window_family(self.family, left_shape, ics_info.window_shape);
+        let window = if self.family.is_ld() {
+            long_only_window_family(self.family, left_shape, ics_info.window_shape)
+        } else {
+            long_sequence_window_n(
+                self.family.long_transform_len(),
+                128,
+                ics_info.window_sequence,
+                left_shape,
+                ics_info.window_shape,
+            )
+            .unwrap_or_else(|_| {
+                long_only_window_family(self.family, left_shape, ics_info.window_shape)
+            })
+        };
         let z: Vec<f64> = x_est
             .iter()
             .zip(window.iter())

@@ -261,6 +261,7 @@ fn reconstruct_pre_pair(
 /// `ltp_data_present == 0`, in which case no prediction is added but the
 /// history is still advanced so it stays continuous across frames.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn finish_channel(
     spec: &mut [f64],
     body: &IcsBody,
@@ -273,13 +274,14 @@ fn finish_channel(
     predictor_bank: &mut Option<PredictorBank>,
     ssr: &mut Option<Box<SsrChannelDecoder>>,
     coupling: &[CouplingApply<'_>],
+    run_main: bool,
 ) -> Result<Vec<f64>> {
     // §4.6.6 MPEG-2 frequency-domain prediction (AAC Main, AOT 1 only).
     // The backward-adaptive predictor bank is run on EVERY frame so its
     // coefficients keep tracking the signal statistics, whether or not
     // prediction is signalled this frame; a short block resets the whole
     // bank. The bank is created lazily on the first Main frame.
-    if aot == 1 {
+    if aot == 1 && run_main {
         let bank = match predictor_bank {
             Some(b) => b,
             None => {
@@ -707,6 +709,7 @@ impl ElementDecoder {
             &mut self.predictor_banks[0],
             &mut self.ssr_decoders[0],
             coupling,
+            true,
         )
     }
 
@@ -799,6 +802,19 @@ impl ElementDecoder {
             )?;
         }
 
+        // §4.6.6.3.2.1 Main-profile prediction runs BEFORE intensity
+        // stereo (FFmpeg decode_cpe: M/S → Main prediction → intensity
+        // stereo). The backward-adaptive bank is updated on every frame
+        // (even bands with prediction disabled), so the order matters
+        // for later predicted frames.
+        if aot == 1 {
+            let banks = &mut self.predictor_banks;
+            let bank0 = banks[0]            .get_or_insert_with(|| PredictorBank::new(fs_index).expect("predictor bank"));
+            bank0.apply_long(&mut left_spec, geom, geom.predictor_data.as_ref(), fs_index)?;
+            let bank1 = banks[1]            .get_or_insert_with(|| PredictorBank::new(fs_index).expect("predictor bank"));
+            bank1.apply_long(&mut right_spec, geom, geom.predictor_data.as_ref(), fs_index)?;
+        }
+
         // §4.6.8.2 intensity stereo: right derived from left on
         // intensity bands. invert_intensity reads the per-band M/S mask
         // only when ms_mask_present == 01 (Mask).
@@ -863,6 +879,7 @@ impl ElementDecoder {
             &mut self.predictor_banks[0],
             &mut self.ssr_decoders[0],
             left_coupling,
+            false,
         )?;
         let out_right = finish_channel(
             &mut right_spec,
@@ -876,6 +893,7 @@ impl ElementDecoder {
             &mut self.predictor_banks[1],
             &mut self.ssr_decoders[1],
             right_coupling,
+            false,
         )?;
         Ok((out_left, out_right))
     }
