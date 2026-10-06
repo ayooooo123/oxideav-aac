@@ -490,18 +490,13 @@ impl AacDecoder {
         if let Some(Ok(asc)) = &self.asc {
             self.stream
                 .set_frame_family(crate::latm::asc_frame_family(asc));
-            // Implicitly signalled HE-AAC (§1.6.5: the ASC says nothing
-            // about SBR, the payload carries EXT_SBR_DATA) in a container
-            // that declares the *core* rate: downstream consumers (a WAV
-            // muxer, an audio device) are configured from that declared
-            // rate before the first frame decodes, so emit at it through
-            // the §4.6.18.4.3 downsampled SBR mode rather than switching
-            // to the doubled rate mid-stream. A container declaring the
-            // SBR rate (the usual MP4 `mp4a` sample entry) keeps the
-            // dual-rate output.
-            if !asc.sbr_present && self.param_hint.0 == Some(asc.sample_rate) {
-                self.stream.set_sbr_downsampled(true);
-            }
+            // NOTE: a container that declares the *core* rate for an
+            // implicitly-signalled SBR stream used to select the
+            // §4.6.18.4.3 downsampled mode here. That heuristic
+            // halved the output (FATE CT_DecoderCheck/sbr_i-ps_i.mp4:
+            // 346112 vs FFmpeg's 692224 samples) and mismatches
+            // FFmpeg, which always renders the dual rate for HE-AAC.
+            // `{"sbr_downsampled": "true"}` remains the explicit opt-in.
             // FFmpeg's `ps = -1` implicit-PS promotion (mono SBR stream
             // reconfigured to stereo at the first SBR frame) is keyed
             // on the OUT-OF-BAND config path: an MP4 `esds` /
