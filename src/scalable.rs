@@ -961,10 +961,10 @@ impl ScalableDecoder {
     }
 
     /// Decode one frame (one payload per layer, layer 0 first) to
-    /// interleaved 16-bit PCM.
+    /// interleaved float PCM.
     pub fn decode_frame(&mut self, payloads: &[&[u8]]) -> Result<crate::decode::DecodedFrame> {
         let chans = self.decode_frame_channels(payloads)?;
-        let pcm = crate::pcm::interleave_s16(&chans)?;
+        let pcm = crate::pcm::interleave_f32(&chans)?;
         Ok(crate::decode::DecodedFrame {
             pcm,
             channels: chans.len(),

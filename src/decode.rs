@@ -55,7 +55,7 @@ use crate::ics_body::IcsBody;
 use crate::ics_info::IcsInfo;
 use crate::ms_stereo::MsMaskPresent;
 use crate::pce::Pce;
-use crate::pcm::interleave_s16;
+use crate::pcm::interleave_f32;
 use crate::raw_data_block::{Element, IdSynEle, Walker};
 use crate::sbr_decoder::SbrDecoder;
 use crate::sbr_extension::SbrExtensionData;
@@ -82,11 +82,12 @@ fn pce_kind(kind: IdSynEle) -> Option<PceElementKind> {
 /// ([`crate::swb_offset::FrameFamily::frame_len`]).
 pub const FRAME_LEN: usize = 1024;
 
-/// One decoded ADTS frame: the interleaved 16-bit PCM plus the geometry
+/// One decoded frame: the interleaved float PCM plus the geometry
 /// needed to interpret it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecodedFrame {
-    /// Interleaved 16-bit PCM, `channels` samples per time index. For a
+    /// Interleaved float PCM on the `[-1, 1)` axis, `channels` samples
+    /// per time index. For a
     /// default `channelConfiguration` (Table 1.19, values 1–6) the
     /// channels are in the canonical [`crate::channel_map`] output order
     /// (e.g. 5.1 is `L, R, C, LFE, Ls, Rs`); for the unmapped configs
@@ -95,8 +96,10 @@ pub struct DecodedFrame {
     /// `FRAME_LEN * channels` for the plain AAC path, or
     /// `2 * FRAME_LEN * channels` once the stream is SBR-active
     /// (HE-AAC dual-rate output; `FRAME_LEN * channels` again when
-    /// the §4.6.18.4.3 downsampled SBR mode is selected).
-    pub pcm: Vec<i16>,
+    /// the §4.6.18.4.3 downsampled SBR mode is selected). Samples are
+    /// float on the `[-1, 1)` axis (the filterbank's `±32768` output
+    /// scaled down), matching FFmpeg's float AAC decoder output.
+    pub pcm: Vec<f32>,
     /// Number of interleaved channels this frame produced.
     pub channels: usize,
     /// The frame's sampling rate in Hz: the ADTS-signalled core rate,
@@ -486,7 +489,7 @@ impl StreamDecoder {
         // Render block by block; each block contributes one hop of
         // interleaved PCM (all blocks of a frame must agree on the
         // channel count).
-        let mut pcm: Vec<i16> = Vec::new();
+        let mut pcm: Vec<f32> = Vec::new();
         let mut frame_channels: Option<usize> = None;
         for block in 0..num_raw_data_blocks {
             let mut channels: Vec<Vec<f64>> = Vec::new();
@@ -555,7 +558,7 @@ impl StreamDecoder {
                 }
                 Some(_) => {}
             }
-            pcm.extend(interleave_s16(&channels)?);
+            pcm.extend(interleave_f32(&channels)?);
         }
 
         Ok(DecodedFrame {
@@ -995,7 +998,7 @@ impl StreamDecoder {
 
         // Table 1.19 canonical output reorder, same as the non-ER walk.
         let channels = crate::channel_map::reorder_channels(channel_configuration, channels);
-        let pcm = interleave_s16(&channels)?;
+        let pcm = interleave_f32(&channels)?;
         Ok(DecodedFrame {
             pcm,
             channels: channels.len(),

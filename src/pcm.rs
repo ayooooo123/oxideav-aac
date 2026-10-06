@@ -113,6 +113,37 @@ pub fn interleave_s16(channels: &[Vec<f64>]) -> Result<Vec<i16>> {
     Ok(out)
 }
 
+/// Interleave a frame's per-channel time signals into the element-order
+/// interleaved 32-bit float PCM layout a float sink consumes.
+///
+/// `channels[c][n]` is channel `c`'s sample `n` on the filterbank's
+/// `±32768` amplitude axis; the output is
+/// `out[n * num_channels + c] = channels[c][n] as f32 / 32768.0` — the
+/// same `s16 = NINT(x)` grid FFmpeg's float AAC decoder renders
+/// (`av_clip_int16(lrint(x))`), minus the integer quantisation, so a
+/// consumer comparing against FFmpeg's float output sees only the
+/// filterbank's own numerical difference. Every channel buffer must be
+/// the same length; a disagreement is [`Error::PcmInvalid`]. An empty
+/// channel list yields an empty buffer.
+pub fn interleave_f32(channels: &[Vec<f64>]) -> Result<Vec<f32>> {
+    if channels.is_empty() {
+        return Ok(Vec::new());
+    }
+    let frame_len = channels[0].len();
+    if channels.iter().any(|c| c.len() != frame_len) {
+        return Err(Error::PcmInvalid);
+    }
+    let num_channels = channels.len();
+    let mut out = Vec::with_capacity(frame_len * num_channels);
+    const SCALE: f64 = 1.0 / 32768.0;
+    for n in 0..frame_len {
+        for ch in channels {
+            out.push((ch[n] * SCALE) as f32);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

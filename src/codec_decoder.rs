@@ -31,7 +31,7 @@
 //!   samples per channel for the default frame family (960 / 512 /
 //!   480 under the §4.5.1.1 families a LATM-carried ASC can select,
 //!   2048 for a dual-rate SBR frame), interleaved little-endian
-//!   `i16` in element order ([`SampleFormat::S16`]).
+//!   `f32` in element order ([`SampleFormat::F32`]).
 //! * [`flush`](Decoder::flush) marks end-of-stream so subsequent
 //!   `receive_frame` calls return [`Error::Eof`] once the pending queue
 //!   drains.
@@ -43,13 +43,20 @@
 //!
 //! ## Output format
 //!
-//! The decoder emits **interleaved** S16 PCM in `Frame::Audio`:
+//! The decoder emits **interleaved** float PCM in `Frame::Audio`:
 //! `data.len() == 1`, the single plane holding
-//! `samples_per_channel * channels * 2` little-endian `i16` bytes in the
-//! §4.4.2.1 element order an SCE/LFE contributes one channel, a CPE two.
-//! The §4.6.11 [`pcm`](crate::pcm) output stage has already applied the
-//! §1.3 `NINT()` round-half-away-from-zero and the 16-bit saturation, so
-//! this layer only widens each `i16` to its two little-endian bytes.
+//! `samples_per_channel * channels * 4` little-endian `f32` bytes in the
+//! §4.4.2.1 element order — an SCE/LFE contributes one channel, a CPE
+//! two. The §4.6.11 [`pcm`](crate::pcm) output stage scales the
+//! filterbank's `±32768` float output to the `[-1, 1)` axis without
+//! integer quantisation (matching FFmpeg's float AAC decoder); the
+//! `interleave_s16` rendering is still available for sinks that want
+//! the spec's `NINT()`-rounded integer grid.
+//!
+//! The out-of-band `AudioSpecificConfig` builder paths keep S16 as the
+//! default advertised sample format through
+//! [`build_params`](fn@Self::build_params)-style helpers; the live
+//! decoder advertises what it emits ([`SampleFormat::F32`]).
 //!
 //! ## Registration
 //!
@@ -146,7 +153,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
     out_params.sample_rate = Some(sample_rate);
     out_params.channels = Some(channels);
-    out_params.sample_format = Some(SampleFormat::S16);
+    out_params.sample_format = Some(SampleFormat::F32);
 
     let mut dec = AacDecoder::new(CodecId::new(CODEC_ID_STR), out_params);
     dec.asc = asc;
@@ -308,10 +315,10 @@ impl AacDecoder {
         &self.output
     }
 
-    /// Convert one [`DecodedFrame`]'s interleaved `i16` PCM to an
-    /// interleaved-S16 [`AudioFrame`] (single plane, little-endian).
+    /// Convert one [`DecodedFrame`]'s interleaved `f32` PCM to an
+    /// interleaved-F32 [`AudioFrame`] (single plane, little-endian).
     fn decoded_to_audio(decoded: &DecodedFrame, pts: Option<i64>) -> AudioFrame {
-        let mut bytes = Vec::with_capacity(decoded.pcm.len() * 2);
+        let mut bytes = Vec::with_capacity(decoded.pcm.len() * 4);
         for &s in &decoded.pcm {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
@@ -803,7 +810,7 @@ mod tests {
         // Reference: bare LoasDecoder.
         let mut reference = LoasDecoder::new();
         let ref_frames = reference.decode_all(&buf).expect("LoasDecoder");
-        let mut ref_pcm: Vec<i16> = Vec::new();
+        let mut ref_pcm: Vec<f32> = Vec::new();
         for f in &ref_frames {
             ref_pcm.extend_from_slice(&f.pcm);
         }
@@ -813,10 +820,10 @@ mod tests {
         pkt.pts = Some(0);
         let mut dec = make_decoder(&build_params(44_100, 2)).expect("decoder");
         dec.send_packet(&pkt).expect("send_packet");
-        let mut trait_pcm: Vec<i16> = Vec::new();
+        let mut trait_pcm: Vec<f32> = Vec::new();
         while let Ok(Frame::Audio(a)) = dec.receive_frame() {
-            for c in a.data[0].chunks_exact(2) {
-                trait_pcm.push(i16::from_le_bytes([c[0], c[1]]));
+            for c in a.data[0].chunks_exact(4) {
+                trait_pcm.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
             }
         }
         assert_eq!(trait_pcm, ref_pcm, "LOAS trait diverged from LoasDecoder");
@@ -895,8 +902,8 @@ mod tests {
             panic!("expected AudioFrame");
         };
         assert_eq!(a.samples as usize, FRAME_LEN);
-        // interleaved stereo → FRAME_LEN * 2 channels * 2 bytes.
-        assert_eq!(a.data[0].len(), FRAME_LEN * 2 * 2);
+        // interleaved stereo → FRAME_LEN * 2 channels * 4 bytes.
+        assert_eq!(a.data[0].len(), FRAME_LEN * 2 * 4);
     }
 
     #[test]
@@ -908,19 +915,19 @@ mod tests {
         };
         let mut reference = StreamDecoder::new();
         let ref_frames = reference.decode_all(&buf).expect("reference decode_all");
-        let mut ref_pcm: Vec<i16> = Vec::new();
+        let mut ref_pcm: Vec<f32> = Vec::new();
         for f in &ref_frames {
             ref_pcm.extend_from_slice(&f.pcm);
         }
 
         let packets = split_into_packets(&buf);
         let mut dec = make_decoder(&build_params(8_000, 1)).expect("decoder");
-        let mut trait_pcm: Vec<i16> = Vec::new();
+        let mut trait_pcm: Vec<f32> = Vec::new();
         for pkt in &packets {
             dec.send_packet(pkt).expect("send_packet");
             while let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for c in a.data[0].chunks_exact(2) {
-                    trait_pcm.push(i16::from_le_bytes([c[0], c[1]]));
+                for c in a.data[0].chunks_exact(4) {
+                    trait_pcm.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
                 }
             }
         }
