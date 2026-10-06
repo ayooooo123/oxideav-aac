@@ -173,7 +173,8 @@ pub fn gen_rand_vector(out: &mut [f64], state: &mut u32) {
 ///
 /// `band` is the generated random vector (length `size`); on return it
 /// holds the energy-normalised noise band whose L2 norm is exactly
-/// `2.0^(0.25 · noise_nrg)` (§4.6.13.3, 2009 measured-energy form).
+/// `2.0^(0.25 · noise_nrg)` (§4.6.13.3, 2009 measured-energy form),
+/// with `noise_nrg` clamped to FFmpeg's `[-100, 155]` noise-gain range.
 ///
 /// If the random vector is all-zero (sum of squares zero) the band
 /// cannot be normalised; per §4.6.13.3 a suitable generator yields a
@@ -185,7 +186,7 @@ fn normalise_band(band: &mut [f64], noise_nrg: i32) {
         return;
     }
     let sqrt_nrg = nrg.sqrt();
-    let scale = noise_target_norm(noise_nrg) / sqrt_nrg;
+    let scale = noise_target_norm(noise_nrg.clamp(-100, 155)) / sqrt_nrg;
     for x in band.iter_mut() {
         *x *= scale;
     }

@@ -311,14 +311,17 @@ pub struct AudioSpecificConfig {
     /// 29). Does **not** capture implicit SBR signalling carried in
     /// the FIL `extension_payload` of the AAC bitstream.
     pub sbr_present: bool,
-    /// `true` ⇔ the ASC explicitly signalled PS (outer AOT 29).
+    /// `true` ⇔ the ASC signals parametric stereo (FFmpeg's `ps = 1`:
+    /// the explicit outer AOT 29 wrapper or a trailing
+    /// `psPresentFlag == 1`, on a configuration of at most one channel).
     pub ps_present: bool,
-    /// `true` ⇔ the ASC rules PS out: the hierarchical SBR wrapper
-    /// (outer AOT 5) or a trailing probe carrying an explicit
-    /// `psPresentFlag == 0` was signalled. FFmpeg's `ps = 0` — an
-    /// in-band PS payload is then skipped, not decoded
-    /// (`read_sbr_extension`: "Parametric Stereo signaled to be
-    /// not-present").
+    /// `true` ⇔ the ASC rules PS out (FFmpeg's `ps = 0`): a trailing
+    /// `psPresentFlag == 0` or `sbrPresentFlag == 0`, a non-LC core
+    /// without explicit PS, or two or more channels. An in-band PS
+    /// payload is then skipped (`read_sbr_extension`: "Parametric
+    /// Stereo signaled to be not-present"). Neither flag set is the
+    /// implicit state (`ps = -1`): a mono stream whose first frame
+    /// carries SBR data is promoted to parametric stereo.
     pub ps_absent: bool,
     /// `extensionSamplingFrequencyIndex` (only present when
     /// `outer_aot ∈ {5, 29}`).
@@ -418,11 +421,6 @@ impl AudioSpecificConfig {
                             probe.extension_sampling_frequency_index;
                         asc.extension_sample_rate = probe.extension_sample_rate;
                     }
-                    if probe.ps_present_flag == Some(true) {
-                        asc.ps_present = true;
-                    } else if probe.ps_present_flag == Some(false) {
-                        asc.ps_absent = true;
-                    }
                 } else if probe.extension_audio_object_type == TRAILING_EXTENSION_AOT_BSAC {
                     if probe.sbr_present_flag {
                         asc.sbr_present = true;
@@ -433,6 +431,7 @@ impl AudioSpecificConfig {
                     asc.extension_channel_configuration = probe.extension_channel_configuration;
                 }
                 asc.trailing_sbr_probe = Some(probe);
+                asc.resolve_ps_signal();
             }
         }
         Ok(asc)
@@ -471,11 +470,6 @@ impl AudioSpecificConfig {
 
         // Hierarchical SBR / PS unwrap.
         let mut sbr_present = false;
-        let mut ps_present = false;
-        // PS explicitly ruled out: the hierarchical SBR wrapper
-        // (outer AOT 5) or a trailing probe whose `psPresentFlag` is
-        // set to 0 (FFmpeg's `ps = 0` state).
-        let mut ps_absent = outer_aot == SBR_AOT;
         let mut ext_sfi = None;
         let mut ext_rate = None;
         let mut ext_chan_cfg = None;
@@ -483,9 +477,6 @@ impl AudioSpecificConfig {
 
         if outer_aot == SBR_AOT || outer_aot == PS_AOT {
             sbr_present = true;
-            if outer_aot == PS_AOT {
-                ps_present = true;
-            }
             let sfi = read_u8(reader, 4)?;
             let rate = if sfi == 0xf {
                 read_u32(reader, 24)?
@@ -535,15 +526,15 @@ impl AudioSpecificConfig {
             None
         };
 
-        Ok(AudioSpecificConfig {
+        let mut asc = AudioSpecificConfig {
             outer_aot,
             aot: effective_aot,
             sampling_frequency_index,
             sample_rate: core_sample_rate,
             channel_configuration,
             sbr_present,
-            ps_present,
-            ps_absent,
+            ps_present: false,
+            ps_absent: false,
             extension_sampling_frequency_index: ext_sfi,
             extension_sample_rate: ext_rate,
             extension_channel_configuration: ext_chan_cfg,
@@ -552,7 +543,53 @@ impl AudioSpecificConfig {
             error_protection,
             direct_mapping,
             trailing_sbr_probe: None,
-        })
+        };
+        asc.resolve_ps_signal();
+        Ok(asc)
+    }
+
+    /// Resolve the parametric-stereo signal the way FFmpeg's
+    /// `ff_mpeg4audio_get_config_gb` does: `ps = 1` for the explicit
+    /// AOT 29 wrapper or a trailing `psPresentFlag == 1`; `ps = 0` for a
+    /// trailing `psPresentFlag == 0`, for a trailing `sbrPresentFlag ==
+    /// 0`, for an implicit (`ps = -1`) signal on a non-LC core, and for
+    /// any configuration of two or more channels; `ps = -1` (implicit:
+    /// a mono stream is promoted to PS at its first SBR frame)
+    /// otherwise. Sets [`Self::ps_present`] (`ps = 1`) and
+    /// [`Self::ps_absent`] (`ps = 0`).
+    fn resolve_ps_signal(&mut self) {
+        let mut sbr: i8 = -1;
+        let mut ps: i8 = -1;
+        if self.outer_aot == SBR_AOT || self.outer_aot == PS_AOT {
+            sbr = 1;
+            if self.outer_aot == PS_AOT {
+                ps = 1;
+            }
+        } else if let Some(probe) = &self.trailing_sbr_probe {
+            if probe.extension_audio_object_type == TRAILING_EXTENSION_AOT_SBR {
+                sbr = i8::from(probe.sbr_present_flag);
+                if probe.sbr_present_flag && probe.extension_sample_rate == Some(self.sample_rate) {
+                    sbr = -1;
+                }
+            }
+            if let Some(flag) = probe.ps_present_flag {
+                ps = i8::from(flag);
+            }
+        }
+        if sbr == 0 {
+            ps = 0;
+        }
+        // `ff_mpeg4audio_channels`, indexed by `channelConfiguration`.
+        const CHANNELS: [u8; 15] = [0, 1, 2, 3, 4, 5, 6, 8, 0, 0, 0, 7, 8, 24, 8];
+        let channels = CHANNELS
+            .get(usize::from(self.channel_configuration))
+            .copied()
+            .unwrap_or(0);
+        if (ps == -1 && self.aot != 2) || channels & !1 != 0 {
+            ps = 0;
+        }
+        self.ps_present = ps == 1;
+        self.ps_absent = ps == 0;
     }
 
     /// Number of audio channels implied by the

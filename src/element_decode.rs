@@ -88,7 +88,7 @@ use crate::ics_info::IcsInfo;
 use crate::intensity_stereo::{apply_intensity_stereo, IntensityPairSpectra};
 use crate::ltp::LtpState;
 use crate::ms_stereo::{apply_ms_stereo, ChannelPairSpectra, MsMaskPresent};
-use crate::pns::{apply_pns, apply_pns_pair, gen_rand_vector, PnsChannel};
+use crate::pns::{apply_pns, gen_rand_vector, PnsChannel};
 use crate::predictor::PredictorBank;
 use crate::scale_factor_data::{accumulate, AbsoluteScaleFactorEntry, AbsoluteScaleFactors};
 use crate::section_data::ZERO_HCB;
@@ -725,10 +725,10 @@ impl ElementDecoder {
     ///   no joint-stereo tools run.
     ///
     /// Runs the full §4.6 chain with the joint-stereo / noise tools in
-    /// block order: per-channel pulse → dequant → `quant_to_spec()`,
-    /// then M/S (§4.6.8.1) → intensity (§4.6.8.2) → PNS (§4.6.13) on the
-    /// pre-TNS pair, then per-channel TNS (§4.6.9) → filterbank
-    /// (§4.6.11).
+    /// FFmpeg's order: per-channel pulse → dequant → `quant_to_spec()`
+    /// → PNS (§4.6.13, left channel then right), then M/S (§4.6.8.1) →
+    /// Main prediction → intensity (§4.6.8.2) on the pre-TNS pair, then
+    /// per-channel LTP → TNS (§4.6.9) → filterbank (§4.6.11).
     ///
     /// Both channels must share `window_sequence` (the `common_window`
     /// geometry the §4.6.8 tools require) when any joint-stereo tool is
@@ -777,6 +777,29 @@ impl ElementDecoder {
 
         let (mut left_spec, left_abs) = reconstruct_pre_pair(left, fs_index)?;
         let (mut right_spec, right_abs) = reconstruct_pre_pair(right, fs_index)?;
+
+        // §4.6.13 PNS, generated like FFmpeg's spectral decode: the
+        // left channel's noise bands draw from the shared generator
+        // first, then the right channel's, each band independently (no
+        // M/S-correlated shared vector), and before the joint-stereo
+        // tools — so an intensity band on the right copies the left
+        // channel's noise. M/S skips noise bands.
+        let left_nrg = noise_nrg_table(&left_abs, &left.body.section_data.sfb_cb, max_sfb)?;
+        let right_nrg = noise_nrg_table(&right_abs, &right.body.section_data.sfb_cb, max_sfb)?;
+        {
+            let state = &mut self.pns_state.lock().unwrap_or_else(|e| e.into_inner());
+            for (spec, ch, nrg) in [
+                (&mut left_spec, left, &left_nrg),
+                (&mut right_spec, right, &right_nrg),
+            ] {
+                let mut chan = PnsChannel {
+                    spec,
+                    sfb_cb: &ch.body.section_data.sfb_cb,
+                    noise_nrg: nrg,
+                };
+                apply_pns(&mut chan, ch.ics_info, fs_index, |out| gen_rand_vector(out, state))?;
+            }
+        }
 
         // §4.6.8.1 M/S de-matrix (suppressed on intensity / noise bands
         // by apply_ms_stereo itself).
@@ -830,43 +853,19 @@ impl ElementDecoder {
             apply_intensity_stereo(&mut pair, is_mask, ms_used_slice, geom, fs_index)?;
         }
 
-        // §4.6.13 PNS with the shared-vector correlation rule. PNS and
-        // M/S are mutually exclusive per band (§4.6.13.5), so a noise
-        // band was skipped by the M/S de-matrix above; here it is filled.
-        let left_nrg = noise_nrg_table(&left_abs, &left.body.section_data.sfb_cb, max_sfb)?;
-        let right_nrg = noise_nrg_table(&right_abs, &right.body.section_data.sfb_cb, max_sfb)?;
-        let all_shared = joint.ms_mask_present == MsMaskPresent::AllOnes;
-        {
-            let mut left_chan = PnsChannel {
-                spec: &mut left_spec,
-                sfb_cb: &left.body.section_data.sfb_cb,
-                noise_nrg: &left_nrg,
-            };
-            let mut right_chan = PnsChannel {
-                spec: &mut right_spec,
-                sfb_cb: &right.body.section_data.sfb_cb,
-                noise_nrg: &right_nrg,
-            };
-            let state = &mut self.pns_state.lock().unwrap_or_else(|e| e.into_inner());
-            apply_pns_pair(
-                &mut left_chan,
-                &mut right_chan,
-                is_mask,
-                all_shared,
-                ms_used_slice,
-                geom,
-                fs_index,
-                |out| gen_rand_vector(out, state),
-            )?;
-        }
-
         // §4.6.7 LTP + §4.6.9 TNS + §4.6.11 filterbank, per channel.
         // Channel 0 reads the first ltp_data; channel 1 of a shared-
         // window CPE reads ltp_data_pair (the second ltp_data_present
-        // subtree, Table 4.4), falling back to its own ltp_data in the
-        // non-shared form where each channel carries separate side info.
+        // subtree, Table 4.4) and nothing else, while a non-shared CPE
+        // channel carries its own ltp_data. Like FFmpeg
+        // (`spectral_to_sample`), the pair's LTP runs only when channel
+        // 0 signals `predictor_data_present`.
         let left_ltp = ltp_for_channel(left.ics_info, false);
-        let right_ltp = ltp_for_channel(right.ics_info, true);
+        let right_ltp = if left.ics_info.predictor_data_present {
+            ltp_for_channel(right.ics_info, true)
+        } else {
+            None
+        };
         let out_left = finish_channel(
             &mut left_spec,
             left.body,
@@ -905,16 +904,15 @@ impl ElementDecoder {
 ///
 /// * `is_pair_slot == false` (SCE, CPE channel 0) reads the primary
 ///   `ltp_data` subtree.
-/// * `is_pair_slot == true` (CPE channel 1) reads the second
-///   `ltp_data_pair` subtree carried after `common_window == 1`
-///   (Table 4.4). In the non-shared CPE form the second channel parses
-///   its own `ics_info()` with the side info in `ltp_data` and
-///   `ltp_data_pair == None`; the fall-through keeps that case working.
+/// * `is_pair_slot == true` (CPE channel 1) of a shared-window CPE
+///   reads only the second `ltp_data_pair` subtree carried after
+///   `common_window == 1` (Table 4.4): a cleared pair flag means no LTP
+///   for that channel, never channel 0's side info. In the non-shared
+///   CPE form the second channel parses its own `ics_info()` (no pair
+///   flag) with the side info in `ltp_data`.
 fn ltp_for_channel(ics_info: &IcsInfo, is_pair_slot: bool) -> Option<&crate::ics_info::LtpData> {
-    if is_pair_slot {
-        if let Some(pair) = ics_info.ltp_data_pair.as_ref() {
-            return Some(pair);
-        }
+    if is_pair_slot && ics_info.ltp_data_present_pair.is_some() {
+        return ics_info.ltp_data_pair.as_ref();
     }
     ics_info.ltp_data.as_ref()
 }

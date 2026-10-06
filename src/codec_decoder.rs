@@ -142,28 +142,12 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         .options
         .get("sbr_downsampled")
         .is_some_and(|v| matches!(v, "true" | "1"));
-    let mut ps_signaled = false;
     if let Some(Ok(asc)) = &asc {
         let (rate, ch) = asc_output_geometry(asc, sbr_downsampled_opt);
         sample_rate = rate;
         if ch > 0 {
             channels = ch;
         }
-        // FFmpeg's `ff_mpeg4audio_get_config` defaults `ps = -1`
-        // ("unspecified") whenever the §1.6.5 trailing `0x2b7` probe
-        // signals implicit SBR on an LC stream without a
-        // `psPresentFlag`, and the decoder promotes a mono output to
-        // stereo at the first SBR frame in that state
-        // (aacdec.c `decode_extension_payload` EXT_SBR_DATA:
-        // `m4ac.ps == -1 && nb_channels == 1`). This is the MP4 /
-        // LOAS-LATM out-of-band-ASC carriage — the same
-        // extradata-ASC path this decoder serves. Plain ADTS has no
-        // ASC, so an in-band ASC parsed from ADTS must not take the
-        // implicit-PS default (FFmpeg's ADTS path keeps `ps = 0` and
-        // stays mono). A trailing probe without a `psPresentFlag`
-        // with the flag unset is the "implicit SBR" marker; the
-        // explicit outer-AOT-5/29 wrapper sets `ps_present` itself.
-        ps_signaled = asc.ps_present;
     }
 
     let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
@@ -171,7 +155,6 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     out_params.channels = Some(channels);
     out_params.sample_format = Some(SampleFormat::F32);
 
-    let asc_move = asc.clone();
     let mut dec = AacDecoder::new(CodecId::new(CODEC_ID_STR), out_params);
     dec.asc = asc;
     dec.param_hint = (params.sample_rate, params.channels);
@@ -186,19 +169,6 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     // rejected in this mode).
     if let Some(v) = params.options.get("sbr_low_power") {
         dec.set_sbr_low_power(matches!(v, "true" | "1"));
-    }
-    dec.stream.set_ps_signaled(ps_signaled);
-    dec.loas.set_ps_signaled(ps_signaled);
-    // `asc` was moved into the decoder above; recompute the absence
-    // flag from the same extradata.
-    if let Some(asc) = asc_move {
-        match asc {
-            Ok(a) => {
-                dec.stream.set_ps_absent(a.ps_absent);
-                dec.loas.set_ps_absent(a.ps_absent);
-            }
-            Err(_) => {}
-        }
     }
     Ok(Box::new(dec))
 }
@@ -497,26 +467,13 @@ impl AacDecoder {
             // 346112 vs FFmpeg's 692224 samples) and mismatches
             // FFmpeg, which always renders the dual rate for HE-AAC.
             // `{"sbr_downsampled": "true"}` remains the explicit opt-in.
-            // FFmpeg's `ps = -1` implicit-PS promotion (mono SBR stream
-            // reconfigured to stereo at the first SBR frame) is keyed
-            // on the OUT-OF-BAND config path: an MP4 `esds` /
-            // LOAS-LATM `AudioSpecificConfig` whose §1.6.5 trailing
-            // `0x2b7` probe signals SBR without a `psPresentFlag`
-            // (`ff_mpeg4audio_get_config` defaults `ps = -1`). Plain
-            // ADTS has no such config (FFmpeg's ADTS path keeps
-            // `ps = 0` and decodes mono), so this runs only on the
-            // raw-carrier selection, where the extradata ASC is
-            // authoritative.
-            if !asc.ps_present
-                && !asc.ps_absent
-                && asc.trailing_sbr_probe.is_some()
-                && asc.channel_count() == 1
-            {
-                self.stream.set_ps_signaled(true);
-                self.loas.set_ps_signaled(true);
-                self.stream.set_ps_absent(false);
-                self.loas.set_ps_absent(false);
-            }
+            // The ASC's parametric-stereo signal (FFmpeg's `m4ac.ps`):
+            // explicit, ruled out, or implicit (neither flag: the stream
+            // decoder promotes a mono stream at its first SBR frame). An
+            // ADTS or LOAS carrier takes its own in-band configuration
+            // instead.
+            self.stream.set_ps_signaled(asc.ps_present);
+            self.stream.set_ps_absent(asc.ps_absent);
         }
         Ok(Transport::Raw)
     }

@@ -28,8 +28,7 @@
 //! Figure 4.47 of the staged spec. No part of this implementation is
 //! derived from any external decoder.
 
-use crate::ps_decoder::PsDecoder;
-use crate::ps_hybrid::LOOKAHEAD;
+use crate::ps_decoder::{PsDecoder, PS_X_SLOTS};
 use crate::sbr_dequant::{dequant_coupled, dequant_single, DequantizedSbr};
 use crate::sbr_element::EXTENSION_ID_PS;
 use crate::sbr_env_adjust::{adjust, EnvAdjustState, EnvParams};
@@ -78,7 +77,7 @@ pub fn num_time_slots_for(family: crate::swb_offset::FrameFamily) -> Option<i32>
 /// bank that keeps the output at the core rate (fed the first 32
 /// subbands of the assembled `X` matrix; the SBR content above the
 /// core Nyquist is discarded by construction).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum SynthesisBank {
     /// §4.6.18.4.2 — 64 output samples per slot (2× rate).
     Dual(SynthesisQmf),
@@ -257,28 +256,95 @@ pub struct SbrDecoder {
     /// `numTimeSlots` of the core frame family (16 / 15).
     num_time_slots: i32,
     channels: Vec<ChannelState>,
-    /// Annex 8.A parametric stereo state, created when a
-    /// single-channel element first carries a PS extension. Holds the
-    /// PS decoder plus the second (right-channel) synthesis bank; the
-    /// channel's own bank renders the left channel.
+    /// Parametric stereo state of a single-channel element, created once
+    /// the stream is PS-signalled: the PS decoder plus the right
+    /// channel's synthesis bank (the element's own bank renders the
+    /// left channel).
     ps: Option<PsState>,
-    /// The stream's `AudioSpecificConfig` signals PS (§1.6.6 outer AOT
-    /// 29 or the trailing `psPresentFlag` probe). Until the first
-    /// decodable `ps_data()` the §8.6.5.1 output duplicates the mono
-    /// synthesis into both channels — FFmpeg's SBR renders stereo from
-    /// the first frame in this configuration, not mono.
+    /// The stream is PS-signalled (FFmpeg's `m4ac.ps == 1`: from the
+    /// `AudioSpecificConfig`, or the stream decoder's implicit promotion
+    /// of a mono HE-AAC stream): a single-channel element renders a
+    /// stereo pair and decodes its in-band PS payloads. Otherwise PS
+    /// payloads are skipped.
     ps_signaled: bool,
-    /// The ASC ruled PS out (explicit `psPresentFlag == 0` or the
-    /// hierarchical wrapper): in-band PS payloads are skipped, not
-    /// decoded, and the output stays mono.
-    ps_absent: bool,
 }
 
-/// PS decoder + right-channel synthesis bank (Annex 8.A).
+/// PS decoder + right-channel synthesis bank + the scratch `X`
+/// matrices the PS tool rewrites (FFmpeg `sbr->X[0]` / `sbr->X[1]`).
 #[derive(Debug)]
 struct PsState {
     dec: PsDecoder,
     synthesis_r: SynthesisBank,
+    x_l: Box<[[Complex; 64]; PS_X_SLOTS]>,
+    x_r: Box<[[Complex; 64]; PS_X_SLOTS]>,
+}
+
+impl PsState {
+    /// A fresh PS state whose right synthesis bank continues from the
+    /// left one: until PS starts, FFmpeg feeds both banks the same `X`.
+    fn new(synthesis_l: &SynthesisBank) -> Self {
+        PsState {
+            dec: PsDecoder::new(),
+            synthesis_r: synthesis_l.clone(),
+            x_l: Box::new([[Complex::default(); 64]; PS_X_SLOTS]),
+            x_r: Box::new([[Complex::default(); 64]; PS_X_SLOTS]),
+        }
+    }
+}
+
+/// Synthesize a single-channel element's assembled `X` (`x_cols`, the
+/// frame's QMF slots). Without PS state the output is mono. With it
+/// (FFmpeg `ff_aac_sbr_apply`, `m4ac.ps == 1`) the output is a stereo
+/// pair: the PS tool's left/right rendering once a `ps_data()` header
+/// has been decoded, the mono signal on both channels before. The PS
+/// tool also reads 6 look-ahead slots of the low band (`XLow` below
+/// `kx`, offset by `tHFAdj`), as FFmpeg's 38-slot `X` matrix carries.
+fn render_single(
+    synthesis: &mut SynthesisBank,
+    ps: Option<&mut PsState>,
+    x_cols: &[[Complex; 64]],
+    x_low: &[[Complex; 32]],
+    k_x: usize,
+    top: usize,
+    out: &mut Vec<Vec<f64>>,
+) -> Result<()> {
+    let lf = x_cols.len();
+    let sps = synthesis.samples_per_slot();
+    let mut pcm_l = Vec::with_capacity(lf * sps);
+    let Some(ps) = ps else {
+        for x in x_cols {
+            synthesis.push_slot(x, &mut pcm_l)?;
+        }
+        out.push(pcm_l);
+        return Ok(());
+    };
+    let mut pcm_r = Vec::with_capacity(lf * sps);
+    if ps.dec.started() {
+        if lf > PS_X_SLOTS {
+            return Err(Error::SbrQmfInvalid);
+        }
+        ps.x_l[..lf].copy_from_slice(x_cols);
+        for (l, col) in ps.x_l.iter_mut().enumerate().skip(lf) {
+            *col = [Complex::default(); 64];
+            if let Some(low) = x_low.get(l + T_HF_ADJ) {
+                let n = k_x.min(32);
+                col[..n].copy_from_slice(&low[..n]);
+            }
+        }
+        ps.dec.apply(&mut ps.x_l, &mut ps.x_r, top)?;
+        for l in 0..lf {
+            synthesis.push_slot(&ps.x_l[l], &mut pcm_l)?;
+            ps.synthesis_r.push_slot(&ps.x_r[l], &mut pcm_r)?;
+        }
+    } else {
+        for x in x_cols {
+            synthesis.push_slot(x, &mut pcm_l)?;
+            ps.synthesis_r.push_slot(x, &mut pcm_r)?;
+        }
+    }
+    out.push(pcm_l);
+    out.push(pcm_r);
+    Ok(())
 }
 
 impl SbrDecoder {
@@ -316,7 +382,6 @@ impl SbrDecoder {
                 .collect(),
             ps: None,
             ps_signaled: false,
-            ps_absent: false,
         })
     }
 
@@ -359,6 +424,13 @@ impl SbrDecoder {
         self.downsampled
     }
 
+    /// Mark the stream as PS-signalled: a single-channel element renders
+    /// a stereo pair (the mono synthesis on both channels until the
+    /// first decodable `ps_data()`) and decodes its PS payloads.
+    pub fn set_ps_signaled(&mut self, ps_signaled: bool) {
+        self.ps_signaled = ps_signaled;
+    }
+
     /// Select the §4.6.18.8 low-power SBR mode: the whole signal path
     /// runs on real-valued subband signals (the §4.6.18.8.2 real
     /// filterbanks), the envelope adjuster applies the §4.6.18.8.4
@@ -370,21 +442,6 @@ impl SbrDecoder {
     ///
     /// Must be selected before the first frame is processed
     /// ([`Error::SbrQmfInvalid`] otherwise).
-    /// Mark the stream as PS-signalled (§1.6.6): until the first
-    /// decodable `ps_data()` the mono synthesis is duplicated into both
-    /// channels (§8.6.5.1). See [`Self::set_low_power`] for the
-    /// before-the-first-frame rule.
-    pub fn set_ps_signaled(&mut self, ps_signaled: bool) {
-        self.ps_signaled = ps_signaled;
-    }
-
-    /// Mark the ASC as ruling PS out: in-band PS payloads are skipped
-    /// (FFmpeg `read_sbr_extension`: "signaled to be not-present"),
-    /// the output stays mono.
-    pub fn set_ps_absent(&mut self, ps_absent: bool) {
-        self.ps_absent = ps_absent;
-    }
-
     pub fn set_low_power(&mut self, low_power: bool) -> Result<()> {
         if self.started {
             return Err(Error::SbrQmfInvalid);
@@ -438,40 +495,15 @@ impl SbrDecoder {
                 x[..32].copy_from_slice(&x_low[l + T_HF_ADJ]);
                 x_cols.push(x);
             }
-            let sps = ch.synthesis.samples_per_slot();
-            // A PS-active stream holds its stereo parameters over a
-            // frame without SBR/PS payload (Annex 8.A.3); the whole
-            // 32-band spectrum counts as SBR-covered for the partial
-            // reset.
-            let mut emitted = false;
-            if n_ch == 1 {
-                if let Some(ps) = self.ps.as_mut() {
-                    let x_input = build_x_input(&x_cols, &x_low);
-                    if let Some((lq, rq)) = ps.dec.process(None, &x_input, 32)? {
-                        let mut pcm_l = Vec::with_capacity(lf * sps);
-                        let mut pcm_r = Vec::with_capacity(lf * sps);
-                        for l in 0..lf {
-                            ch.synthesis.push_slot(&lq[l], &mut pcm_l)?;
-                            ps.synthesis_r.push_slot(&rq[l], &mut pcm_r)?;
-                        }
-                        out.push(pcm_l);
-                        out.push(pcm_r);
-                        emitted = true;
-                    }
-                }
+            // A PS-signalled single-channel element keeps rendering
+            // stereo over a frame without SBR payload: FFmpeg applies
+            // the PS tool with the held parameters and the whole
+            // 32-band spectrum below `top`.
+            if n_ch == 1 && self.ps_signaled && self.ps.is_none() {
+                self.ps = Some(PsState::new(&ch.synthesis));
             }
-            if !emitted {
-                let mut pcm = Vec::with_capacity(lf * sps);
-                for x in &x_cols {
-                    ch.synthesis.push_slot(x, &mut pcm)?;
-                }
-                if n_ch == 1 && self.ps_signaled {
-                    // §8.6.5.1: mono in both channels until the first
-                    // decodable ps_data().
-                    out.push(pcm.clone());
-                }
-                out.push(pcm);
-            }
+            let ps = if n_ch == 1 { self.ps.as_mut() } else { None };
+            render_single(&mut ch.synthesis, ps, &x_cols, &x_low, 32, 32, &mut out)?;
             // No Y for this frame; the next frame's lTemp splice sees
             // an empty previous envelope span.
             ch.y_prev
@@ -669,73 +701,26 @@ impl SbrDecoder {
                 x_cols.push(x);
             }
 
-            // Annex 8.A: a single-channel element carrying an
-            // EXTENSION_ID_PS payload renders stereo through the PS
-            // tool (the element's own bank = left, the PS state's =
-            // right). Until the first decodable ps_data() the mono
-            // path below stays in effect.
-            let ps_payload = if n_ch == 1 {
-                ext.element
-                    .extension
-                    .as_ref()
-                    .filter(|e| e.id == EXTENSION_ID_PS)
-                    .map(|e| e.data.as_slice())
-            } else {
-                None
-            };
-            if ps_payload.is_some() && !self.ps_absent {
-                // Annex 8.A in-band signalling: an EXTENSION_ID_PS
-                // payload on a single-channel element marks the stream
-                // as parametric stereo even without the ASC
-                // `psPresentFlag` — stereo output (duplicated mono
-                // until the first decodable ps_data) starts here.
-                // An ASC that rules PS out keeps the mono output (the
-                // payload is skipped, FFmpeg's "signaled to be
-                // not-present").
-                self.ps_signaled = true;
-            }
-            if ps_payload.is_some() && self.low_power {
-                // §4.6.18.8: the real-valued tool cannot host the
-                // complex-domain PS processing.
-                return Err(Error::SbrLowPowerPs);
-            }
-            if ps_payload.is_some() && self.ps.is_none() {
-                self.ps = Some(PsState {
-                    dec: PsDecoder::new_slots(lf),
-                    synthesis_r: SynthesisBank::new(self.downsampled, self.low_power),
-                });
-            }
-            let sps = ch.synthesis.samples_per_slot();
-            let mut emitted = false;
-            if n_ch == 1 {
-                if let Some(ps) = self.ps.as_mut() {
-                    let x_input = build_x_input(&x_cols, &x_low);
-                    let kx_plus_m = (bands.k_x + bands.m).max(0) as usize;
-                    if let Some((lq, rq)) = ps.dec.process(ps_payload, &x_input, kx_plus_m)? {
-                        let mut pcm_l = Vec::with_capacity(lf * sps);
-                        let mut pcm_r = Vec::with_capacity(lf * sps);
-                        for l in 0..lf {
-                            ch.synthesis.push_slot(&lq[l], &mut pcm_l)?;
-                            ps.synthesis_r.push_slot(&rq[l], &mut pcm_r)?;
-                        }
-                        out.push(pcm_l);
-                        out.push(pcm_r);
-                        emitted = true;
+            // Annex 8.A: once the stream is PS-signalled a single-channel
+            // element renders a stereo pair, and its EXTENSION_ID_PS
+            // payload feeds the PS parameter parse; otherwise PS payloads
+            // are skipped (FFmpeg applies PS only when `m4ac.ps == 1`).
+            if n_ch == 1 && self.ps_signaled {
+                let ps = self.ps.get_or_insert_with(|| PsState::new(&ch.synthesis));
+                let payload = ext.element.extension.as_ref().filter(|e| e.id == EXTENSION_ID_PS);
+                if let Some(payload) = payload {
+                    if self.low_power {
+                        // §4.6.18.8: the real-valued tool cannot host
+                        // the complex-domain PS processing.
+                        return Err(Error::SbrLowPowerPs);
                     }
+                    ps.dec.read_extension(&payload.data);
                 }
             }
-            if !emitted {
-                let mut pcm = Vec::with_capacity(lf * sps);
-                for x in &x_cols {
-                    ch.synthesis.push_slot(x, &mut pcm)?;
-                }
-                if n_ch == 1 && self.ps_signaled {
-                    // §8.6.5.1: mono in both channels until the first
-                    // decodable ps_data().
-                    out.push(pcm.clone());
-                }
-                out.push(pcm);
-            }
+            let ps = if n_ch == 1 { self.ps.as_mut() } else { None };
+            let top = (bands.k_x + bands.m).max(0) as usize;
+            let k_x = bands.k_x.max(0) as usize;
+            render_single(&mut ch.synthesis, ps, &x_cols, &x_low, k_x, top, &mut out)?;
 
             // Thread cross-frame state.
             ch.y_prev = y;
@@ -750,22 +735,6 @@ impl SbrDecoder {
         }
         Ok(out)
     }
-}
-
-/// Assemble the Annex 8.A.3 `Xinput` matrix: the `numQMFSlots`
-/// assembled `X` columns followed by `LOOKAHEAD` slots taken from
-/// `XLow` beyond the frame (`XLow(k, l + tHFAdj)`, `k < 5` — the
-/// split bands the hybrid filterbank consumes ahead of time).
-fn build_x_input(x_cols: &[[Complex; 64]], x_low: &[[Complex; 32]]) -> Vec<[Complex; 64]> {
-    let lf = x_cols.len();
-    let mut v = Vec::with_capacity(lf + LOOKAHEAD);
-    v.extend_from_slice(x_cols);
-    for l in lf..lf + LOOKAHEAD {
-        let mut col = [Complex::default(); 64];
-        col[..5].copy_from_slice(&x_low[l + T_HF_ADJ][..5]);
-        v.push(col);
-    }
-    v
 }
 
 /// The effective `bs_amp_res` after the single-envelope FIXFIX
@@ -1301,6 +1270,7 @@ mod tests {
         });
         let mut lp = SbrDecoder::new(fs_sbr, 1).unwrap();
         lp.set_low_power(true).unwrap();
+        lp.set_ps_signaled(true);
         let core = sine(0.05, 1024, 0);
         assert!(matches!(
             lp.process_frame(&ext, &[&core]),

@@ -734,7 +734,9 @@ mod tests {
 
     /// The emitted frames are LC-profile ADTS at the core rate with an
     /// SBR fill element the crate's own decoder detects: it emits
-    /// 2048-sample frames at the full rate.
+    /// 2048-sample frames at the full rate. Like FFmpeg (implicit PS
+    /// promotion of a mono HE-AAC stream), the decoder renders the mono
+    /// SBR output on both channels of a stereo pair.
     #[test]
     fn frames_decode_as_sbr_active_at_full_rate() {
         let mut enc = HeAacEncoder::new(HeAacConfig::new(44_100, 1, 40_000)).unwrap();
@@ -750,7 +752,11 @@ mod tests {
         let frames = dec.decode_all(&stream).unwrap();
         assert_eq!(frames.len(), 5);
         assert!(frames.iter().all(|f| f.sample_rate == 44_100));
-        assert!(frames.iter().all(|f| f.pcm.len() == HE_FRAME_LEN));
+        assert!(frames.iter().all(|f| f.channels == 2));
+        assert!(frames.iter().all(|f| f.pcm.len() == 2 * HE_FRAME_LEN));
+        assert!(frames
+            .iter()
+            .all(|f| f.pcm.chunks_exact(2).all(|lr| lr[0] == lr[1])));
         assert!(enc.last_sbr_frame().is_some());
     }
 

@@ -128,18 +128,25 @@ pub struct StreamDecoder {
     /// The threaded previous `sbr_header()` per slot (the
     /// `bs_header_flag == 0` reuse path).
     sbr_prev_header: HashMap<(u8, u8), SbrHeader>,
-    /// The stream's `AudioSpecificConfig` signals parametric stereo
-    /// (§1.6.6): an SBR renderer for a single-channel element
-    /// duplicates its mono synthesis into both channels until the
-    /// first decodable `ps_data()`.
+    /// The stream signals parametric stereo (FFmpeg's `m4ac.ps == 1`):
+    /// the SBR renderer of a single-channel element outputs a stereo
+    /// pair — the mono synthesis on both channels until the first
+    /// decodable `ps_data()`. Set from the `AudioSpecificConfig`
+    /// ([`Self::set_ps_signaled`]) or by the implicit promotion of a
+    /// mono stream whose first frame carries SBR data.
     ps_signaled: bool,
     /// Decoder-global PNS RNG (FFmpeg's single `0x1f2e3d4c`-seeded
     /// LCG, advanced across every PNS band of every element in decode
     /// order). Shared into each `ElementDecoder`.
     pns_state: crate::element_decode::SharedPnsState,
-    /// The stream's `AudioSpecificConfig` rules PS out: in-band PS
-    /// payloads are skipped and the output stays mono.
+    /// The stream's `AudioSpecificConfig` rules PS out (FFmpeg's
+    /// `m4ac.ps == 0`): no implicit promotion, in-band PS payloads are
+    /// skipped and the output stays mono.
     ps_absent: bool,
+    /// Set once a frame has produced audio (FFmpeg's `OC_LOCKED`
+    /// output configuration): the implicit PS promotion only happens
+    /// before that.
+    locked: bool,
     /// Latched once any frame carries SBR data: from then on every
     /// frame is emitted at the SBR output rate (doubled, or the core
     /// rate in downsampled mode) — SBR-less frames go through the
@@ -216,9 +223,10 @@ impl StreamDecoder {
     }
 
     /// Mark the stream's `AudioSpecificConfig` as ruling PS out
-    /// (explicit `psPresentFlag == 0` or the hierarchical wrapper):
-    /// in-band PS payloads are then skipped, not decoded, and the
-    /// output stays mono (FFmpeg's `ps = 0` state).
+    /// (FFmpeg's `m4ac.ps == 0`, see
+    /// [`crate::asc::AudioSpecificConfig::ps_absent`]): no implicit PS
+    /// promotion, in-band PS payloads are skipped and the output of a
+    /// mono HE-AAC stream stays mono.
     pub fn set_ps_absent(&mut self, ps_absent: bool) {
         self.ps_absent = ps_absent;
     }
@@ -509,6 +517,26 @@ impl StreamDecoder {
         if elements.iter().any(|(_, e)| e.sbr.is_some()) {
             self.sbr_active = true;
         }
+        // FFmpeg's implicit-PS promotion (aacdec.c `EXT_SBR_DATA` with
+        // `m4ac.ps == -1`): a mono stream whose first frame carries an
+        // SBR extension (decodable or still waiting for its first
+        // `sbr_header()`) is reconfigured as parametric stereo for good.
+        let first_block_channels: usize = elements
+            .iter()
+            .filter(|(b, _)| *b == 0)
+            .map(|(_, e)| e.channels.len())
+            .sum();
+        if self.sbr_active
+            && !self.locked
+            && !self.ps_signaled
+            && !self.ps_absent
+            && first_block_channels == 1
+        {
+            self.ps_signaled = true;
+            for d in self.sbr.values_mut() {
+                d.set_ps_signaled(true);
+            }
+        }
         let out_rate = if self.sbr_active && !self.sbr_downsampled {
             fs_sbr
         } else {
@@ -538,7 +566,6 @@ impl StreamDecoder {
                             d.set_downsampled(self.sbr_downsampled)?;
                             d.set_low_power(self.sbr_low_power)?;
                             d.set_ps_signaled(self.ps_signaled);
-                            d.set_ps_absent(self.ps_absent);
                             v.insert(d)
                         }
                     };
@@ -592,6 +619,9 @@ impl StreamDecoder {
             pcm.extend(interleave_f32(&channels)?);
         }
 
+        if frame_channels.unwrap_or(0) > 0 {
+            self.locked = true;
+        }
         Ok(DecodedFrame {
             pcm,
             channels: frame_channels.unwrap_or(0),
@@ -1350,6 +1380,7 @@ impl Default for StreamDecoder {
             sbr_prev_header: Default::default(),
             ps_signaled: false,
             ps_absent: false,
+            locked: false,
             pns_state: crate::element_decode::SharedPnsState::new(std::sync::Mutex::new(
                 0x1f2e_3d4c,
             )),

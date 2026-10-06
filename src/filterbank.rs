@@ -432,9 +432,9 @@ pub struct Filterbank {
     /// windowed signal (§4.6.11.3.3). `family.frame_len()` long.
     overlap: Vec<f64>,
     /// `window_shape` of the previous block, governing the left-half
-    /// window shape of the next block. [`None`] before the first
-    /// frame: per §4.6.11.3.2 the first block's left and right halves
-    /// share its own `window_shape`.
+    /// window shape of the next block. Starts as [`WindowShape::Sine`]:
+    /// the block before the first one is taken to be sine-windowed, as
+    /// FFmpeg's zero-initialised `use_kb_window` history does.
     prev_shape: Option<WindowShape>,
 }
 
@@ -445,9 +445,8 @@ impl Default for Filterbank {
 }
 
 impl Filterbank {
-    /// A fresh filterbank with a zeroed overlap buffer and no
-    /// previous-block shape (so the first frame uses its own
-    /// `window_shape` for both halves, per §4.6.11.3.2).
+    /// A fresh filterbank with a zeroed overlap buffer and a sine
+    /// previous-block shape.
     pub fn new() -> Self {
         Self::new_family(FrameFamily::Lc1024)
     }
@@ -460,7 +459,7 @@ impl Filterbank {
         Filterbank {
             family,
             overlap: vec![0.0f64; family.frame_len()],
-            prev_shape: None,
+            prev_shape: Some(WindowShape::Sine),
         }
     }
 
@@ -487,8 +486,7 @@ impl Filterbank {
 
     /// §4.6.11.3.2 — the previous block's `window_shape`, which governs
     /// the left-half shape of the *next* block's analysis/synthesis
-    /// window. [`None`] before the first frame (the first block uses its
-    /// own shape for both halves).
+    /// window ([`WindowShape::Sine`] before the first frame).
     ///
     /// The §4.6.7.4.1 LTP analysis MDCT must window `x_est` with the
     /// same composite long window the filterbank uses for this frame, so
@@ -1361,24 +1359,23 @@ mod tests {
     }
 
     #[test]
-    fn first_frame_uses_own_shape_for_left_half() {
-        // Before any frame, prev_shape is None, so the first frame's
-        // left half uses its own window_shape (KBD here). Confirm the
-        // left half equals the KBD left window, not the sine one.
-        let info = long_info(WindowShape::Kbd, WindowSequence::OnlyLong);
+    fn first_frame_uses_sine_for_left_half() {
+        // The block before the first one counts as sine-windowed
+        // (FFmpeg's zero-initialised `use_kb_window[1]`), so a KBD first
+        // frame keeps a sine left half.
         let fb = Filterbank::new();
-        let w = fb
-            .windowed_signal(&vec![0.0; LONG_WINDOW_LEN as usize], &info)
+        assert_eq!(fb.prev_shape(), Some(WindowShape::Sine));
+        let mut spec = vec![0.0; LONG_WINDOW_LEN as usize];
+        spec[3] = 1.0;
+        let kbd_first = fb
+            .windowed_signal(&spec, &long_info(WindowShape::Kbd, WindowSequence::OnlyLong))
             .unwrap();
-        // All-zero spectrum → zero time signal regardless, so instead
-        // inspect the window directly.
-        let _ = w;
-        let win = fb
-            .long_window(WindowShape::Kbd, WindowShape::Kbd, LongKind::OnlyLong)
+        let x = imdct(&spec, 2 * LONG_WINDOW_LEN as usize);
+        let sine = fb
+            .long_window(WindowShape::Sine, WindowShape::Kbd, LongKind::OnlyLong)
             .unwrap();
-        let kbd = kbd_left(1024, 4.0);
-        for n in 0..1024 {
-            assert!((win[n] - kbd[n]).abs() < 1e-15);
+        for n in 0..2 * LONG_WINDOW_LEN as usize {
+            assert!((kbd_first[n] - x[n] * sine[n]).abs() < 1e-12, "n = {n}");
         }
     }
 
