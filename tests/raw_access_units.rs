@@ -257,7 +257,7 @@ fn adts_container_round_trip() {
 }
 
 #[test]
-fn implicit_sbr_follows_the_container_declared_rate() {
+fn implicit_sbr_renders_dual_rate_whatever_the_container_declares() {
     // Implicitly signalled HE-AAC: the ASC is plain AAC-LC at the core
     // rate; SBR is only discovered in the payload.
     let pcm = signal(44_100, 2, 22_050);
@@ -270,27 +270,12 @@ fn implicit_sbr_follows_the_container_declared_rate() {
     let lc_asc = oxideav_aac::asc_writer::aac_lc_asc(22_050, 2);
 
     // Container declares the SBR output rate (the usual MP4 sample
-    // entry): full dual-rate output, 2048 samples per access unit.
-    let mut dec = make_decoder(&params(44_100, 2, lc_asc.clone())).unwrap();
-    assert_eq!(decode_all(&mut *dec, &raw).len() / 2, raw.len() * 2048);
-
-    // Container declares only the core rate (a Matroska track written
-    // without OutputSamplingFrequency knowledge): a consumer configured
-    // from that rate must receive that rate — downsampled SBR output,
-    // 1024 samples per access unit.
-    let mut dec = make_decoder(&params(22_050, 2, lc_asc)).unwrap();
-    let out = decode_all(&mut *dec, &raw);
-    assert_eq!(out.len() / 2, raw.len() * 1024);
-    let (snr, _) = {
-        // Compare against the source decimated 2:1: the test tones sit
-        // far below the 11.025 kHz core Nyquist, so plain decimation is
-        // a faithful reference for the band-limited output.
-        let dec2: Vec<i16> = pcm
-            .chunks_exact(4)
-            .map(|c| c[0])
-            .flat_map(|l| [l, l])
-            .collect();
-        snr_db(&dec2, &out, 2, 3000)
-    };
-    assert!(snr > 15.0, "downsampled SBR SNR {snr:.1} dB");
+    // entry) or only the core rate (a Matroska track written without
+    // OutputSamplingFrequency): like FFmpeg, both render the dual-rate
+    // SBR output, 2048 samples per access unit. `sbr_downsampled` is
+    // the explicit opt-in for core-rate output.
+    for declared in [44_100, 22_050] {
+        let mut dec = make_decoder(&params(declared, 2, lc_asc.clone())).unwrap();
+        assert_eq!(decode_all(&mut *dec, &raw).len() / 2, raw.len() * 2048, "{declared}");
+    }
 }

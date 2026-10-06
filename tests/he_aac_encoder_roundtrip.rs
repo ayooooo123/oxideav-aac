@@ -140,8 +140,11 @@ fn round_trip(pcm: &[i16], cfg: HeAacConfig) -> Metrics {
     assert!(frames.iter().all(|f| f.sample_rate == cfg.sample_rate));
     let mut out: Vec<i16> = Vec::new();
     for f in &frames {
-        assert_eq!(f.channels, ch);
-        out.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
+        // A mono stream renders on both channels of a stereo pair
+        // (FFmpeg's implicit PS promotion): keep channel 0.
+        assert!(f.channels == ch || (ch == 1 && f.channels == 2));
+        let step = f.channels / ch;
+        out.extend(f.pcm.iter().step_by(step).map(|&s| (s * 32768.0) as i16));
     }
     let input = channel(pcm, ch, 0);
     let output = channel(&out, ch, 0);

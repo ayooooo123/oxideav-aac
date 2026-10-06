@@ -829,10 +829,12 @@ fn sbr_on_960_family_decodes_at_fifteen_slots() {
                 &frame(with_sbr, 0x9600 + i as u32),
             )
             .unwrap();
-        assert_eq!(f.pcm.len(), 1920, "frame {i}: 15 slots × 2 × 64");
+        // The mono SBR stream renders on both channels of a stereo pair
+        // (FFmpeg's implicit PS promotion); channel 0 carries the signal.
+        assert_eq!(f.pcm.len(), 2 * 1920, "frame {i}: 15 slots × 2 × 64, two channels");
         assert_eq!(f.sample_rate, fs_sbr, "frame {i}");
-        assert_eq!(f.channels, 1);
-        pcm.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
+        assert_eq!(f.channels, 2);
+        pcm.extend(f.pcm.iter().step_by(2).map(|&s| (s * 32768.0) as i16));
     }
     assert!(pcm.iter().any(|&s| s != 0));
     // High band populated: energy above the core Nyquist over the
@@ -862,7 +864,7 @@ fn sbr_on_960_family_decodes_at_fifteen_slots() {
     let frames = LoasDecoder::new().decode_all(&loas).unwrap();
     assert_eq!(frames.len(), 4);
     for f in &frames {
-        assert_eq!(f.pcm.len(), 1920);
+        assert_eq!(f.pcm.len(), 2 * 1920);
         assert_eq!(f.sample_rate, fs_sbr);
     }
 
@@ -1011,9 +1013,9 @@ fn he_aac_960_round_trips_and_core_band_matches_the_reference_binary() {
     assert_eq!(frames.len(), n_frames);
     let mut ours: Vec<i16> = Vec::new();
     for (i, f) in frames.iter().enumerate() {
-        assert_eq!(f.pcm.len(), 1920, "frame {i}");
+        assert_eq!(f.pcm.len(), 2 * 1920, "frame {i}");
         assert_eq!(f.sample_rate, fs_sbr, "frame {i}");
-        ours.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
+        ours.extend(f.pcm.iter().step_by(2).map(|&s| (s * 32768.0) as i16));
     }
     let band_energies = |pcm: &[i16], channels: usize| -> [f64; 64] {
         let mono: Vec<f64> = pcm

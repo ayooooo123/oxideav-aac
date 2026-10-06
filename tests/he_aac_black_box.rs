@@ -154,9 +154,12 @@ fn reference_binary_decodes_our_he_aac_like_our_decoder() {
         // Our decoder on the same stream.
         let mut dec = StreamDecoder::new();
         let frames = dec.decode_all(&stream).expect("own decode");
+        // A mono HE-AAC stream decodes as a stereo pair carrying the mono
+        // signal twice (FFmpeg's implicit PS promotion): keep channel 0.
         let mut ours: Vec<i16> = Vec::new();
         for f in &frames {
-            ours.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
+            let step = (f.channels / usize::from(channels)).max(1);
+            ours.extend(f.pcm.iter().step_by(step).map(|&s| (s * 32768.0) as i16));
         }
         // Duration: within one frame of ours.
         let n_ours = ours.len() / usize::from(channels);
@@ -274,7 +277,7 @@ fn reference_binary_accepts_double_onset_varvar_frames() {
     let frames = dec.decode_all(&stream).expect("own decode");
     let ours: Vec<i16> = frames
         .iter()
-        .flat_map(|f| f.pcm.iter().map(|&s| (s * 32768.0) as i16))
+        .flat_map(|f| f.pcm.iter().step_by(f.channels.max(1)).map(|&s| (s * 32768.0) as i16))
         .collect();
     let ref_pcm_i16: Vec<i16> = ref_pcm.iter().map(|&s| (s * 32768.0) as i16).collect();
     let e_ref = band_energies(&ref_pcm_i16, ref_ch, 0);
@@ -335,7 +338,7 @@ fn cross_decode(
     let frames = dec.decode_all(stream).expect("own decode");
     let ours: Vec<i16> = frames
         .iter()
-        .flat_map(|f| f.pcm.iter().map(|&s| (s * 32768.0) as i16))
+        .flat_map(|f| f.pcm.iter().step_by(f.channels.max(1)).map(|&s| (s * 32768.0) as i16))
         .collect();
     let ref_pcm_i16: Vec<i16> = ref_pcm.iter().map(|&s| (s * 32768.0) as i16).collect();
     let e_ref = band_energies(&ref_pcm_i16, ref_ch, 0);
