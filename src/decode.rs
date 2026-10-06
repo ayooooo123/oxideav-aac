@@ -128,6 +128,11 @@ pub struct StreamDecoder {
     /// The threaded previous `sbr_header()` per slot (the
     /// `bs_header_flag == 0` reuse path).
     sbr_prev_header: HashMap<(u8, u8), SbrHeader>,
+    /// The stream's `AudioSpecificConfig` signals parametric stereo
+    /// (§1.6.6): an SBR renderer for a single-channel element
+    /// duplicates its mono synthesis into both channels until the
+    /// first decodable `ps_data()`.
+    ps_signaled: bool,
     /// Latched once any frame carries SBR data: from then on every
     /// frame is emitted at the SBR output rate (doubled, or the core
     /// rate in downsampled mode) — SBR-less frames go through the
@@ -192,6 +197,15 @@ impl StreamDecoder {
     /// rate-specific).
     pub fn set_sbr_downsampled(&mut self, downsampled: bool) {
         self.sbr_downsampled = downsampled;
+    }
+
+    /// Mark the stream's `AudioSpecificConfig` as signalling parametric
+    /// stereo (§1.6.6 `psPresentFlag`): the §4.6.18 SBR back-end
+    /// duplicates its mono synthesis into both channels until the first
+    /// decodable `ps_data()` (§8.6.5.1), so the output is stereo from
+    /// the first frame.
+    pub fn set_ps_signaled(&mut self, ps_signaled: bool) {
+        self.ps_signaled = ps_signaled;
     }
 
     /// Install the §4.5.1.1 frame-length family (from
@@ -508,6 +522,7 @@ impl StreamDecoder {
                             let mut d = SbrDecoder::new_slots(fs_sbr, n_ch, slots)?;
                             d.set_downsampled(self.sbr_downsampled)?;
                             d.set_low_power(self.sbr_low_power)?;
+                            d.set_ps_signaled(self.ps_signaled);
                             v.insert(d)
                         }
                     };

@@ -1123,6 +1123,10 @@ pub struct LoasDecoder {
     /// whose extension sampling frequency equals the core rate selects
     /// the mode per stream regardless.
     sbr_downsampled: bool,
+    /// The stream's `AudioSpecificConfig` signals parametric stereo
+    /// (§1.6.6): mono synthesis duplicates into both channels until the
+    /// first decodable `ps_data()` (§8.6.5.1).
+    ps_signaled: bool,
     /// Caller-forced §4.6.18.8 low-power SBR mode (see
     /// [`Self::set_sbr_low_power`]).
     sbr_low_power: bool,
@@ -1150,6 +1154,12 @@ impl LoasDecoder {
     /// this LOAS driver creates (real-valued filterbanks + the LP
     /// adjustment chain; PS streams are rejected in this mode). Select
     /// before decoding.
+    /// Mark the stream's `AudioSpecificConfig` as signalling parametric
+    /// stereo (§1.6.6).
+    pub fn set_ps_signaled(&mut self, ps_signaled: bool) {
+        self.ps_signaled = ps_signaled;
+    }
+
     pub fn set_sbr_low_power(&mut self, low_power: bool) {
         self.sbr_low_power = low_power;
     }
@@ -1318,10 +1328,12 @@ impl LoasDecoder {
         let dec = self.streams.entry(payload.stream_id).or_insert_with({
             let force_down = self.sbr_downsampled;
             let force_lp = self.sbr_low_power;
+            let ps_sig = self.ps_signaled;
             move || {
                 let mut d = StreamDecoder::new();
                 d.set_sbr_downsampled(force_down);
                 d.set_sbr_low_power(force_lp);
+                d.set_ps_signaled(ps_sig);
                 d.set_frame_family(family);
                 d
             }
@@ -1334,6 +1346,7 @@ impl LoasDecoder {
             let mut d = StreamDecoder::new();
             d.set_sbr_downsampled(self.sbr_downsampled);
             d.set_sbr_low_power(self.sbr_low_power);
+            d.set_ps_signaled(self.ps_signaled);
             d.set_frame_family(family);
             *dec = d;
         }

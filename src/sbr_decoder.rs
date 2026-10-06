@@ -262,6 +262,12 @@ pub struct SbrDecoder {
     /// PS decoder plus the second (right-channel) synthesis bank; the
     /// channel's own bank renders the left channel.
     ps: Option<PsState>,
+    /// The stream's `AudioSpecificConfig` signals PS (§1.6.6 outer AOT
+    /// 29 or the trailing `psPresentFlag` probe). Until the first
+    /// decodable `ps_data()` the §8.6.5.1 output duplicates the mono
+    /// synthesis into both channels — FFmpeg's SBR renders stereo from
+    /// the first frame in this configuration, not mono.
+    ps_signaled: bool,
 }
 
 /// PS decoder + right-channel synthesis bank (Annex 8.A).
@@ -305,6 +311,7 @@ impl SbrDecoder {
                 .map(|_| ChannelState::new(false, false, num_time_slots))
                 .collect(),
             ps: None,
+            ps_signaled: false,
         })
     }
 
@@ -358,6 +365,14 @@ impl SbrDecoder {
     ///
     /// Must be selected before the first frame is processed
     /// ([`Error::SbrQmfInvalid`] otherwise).
+    /// Mark the stream as PS-signalled (§1.6.6): until the first
+    /// decodable `ps_data()` the mono synthesis is duplicated into both
+    /// channels (§8.6.5.1). See [`Self::set_low_power`] for the
+    /// before-the-first-frame rule.
+    pub fn set_ps_signaled(&mut self, ps_signaled: bool) {
+        self.ps_signaled = ps_signaled;
+    }
+
     pub fn set_low_power(&mut self, low_power: bool) -> Result<()> {
         if self.started {
             return Err(Error::SbrQmfInvalid);
@@ -437,6 +452,11 @@ impl SbrDecoder {
                 let mut pcm = Vec::with_capacity(lf * sps);
                 for x in &x_cols {
                     ch.synthesis.push_slot(x, &mut pcm)?;
+                }
+                if n_ch == 1 && self.ps_signaled {
+                    // §8.6.5.1: mono in both channels until the first
+                    // decodable ps_data().
+                    out.push(pcm.clone());
                 }
                 out.push(pcm);
             }
@@ -685,6 +705,11 @@ impl SbrDecoder {
                 let mut pcm = Vec::with_capacity(lf * sps);
                 for x in &x_cols {
                     ch.synthesis.push_slot(x, &mut pcm)?;
+                }
+                if n_ch == 1 && self.ps_signaled {
+                    // §8.6.5.1: mono in both channels until the first
+                    // decodable ps_data().
+                    out.push(pcm.clone());
                 }
                 out.push(pcm);
             }
