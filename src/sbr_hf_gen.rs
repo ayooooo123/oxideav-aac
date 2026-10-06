@@ -151,7 +151,13 @@ pub fn build_patches(f_master: &[i32], k0: i32, k_x: i32, m: i32, fs_sbr: u32) -
         let n = (sb - usb).max(0);
         let s = k0 - odd - n;
         if n > 0 {
-            if s < 0 || start.len() >= MAX_PATCHES {
+            // FFmpeg's requirement text caps patches at 5, but its own
+            // decoder tolerates a final count of 6 ("the Coding
+            // Technologies decoder check stream has a final count of 6
+            // patches", aacsbr_template.c) before the trailing
+            // small-patch trim — the FATE CT_DecoderCheck streams
+            // exercise exactly that. Error only past 6.
+            if s < 0 || start.len() > MAX_PATCHES {
                 return Err(Error::SbrFreqBandInvalid);
             }
             start.push(s as usize);
