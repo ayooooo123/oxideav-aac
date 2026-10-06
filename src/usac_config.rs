@@ -7,9 +7,11 @@
 // Distributed under the GNU Lesser General Public License, version 2.1
 // or (at your option) any later version. See LICENSE-LGPL.
 
-//! USAC (AOT 42) AudioSpecificConfig for the 1024-line FD decoder.
+//! USAC (AOT 42) configuration for the 1024-line FD decoder.
 //!
-//! Mono and stereo, without eSBR, MPS212 or time-warped MDCT, are supported.
+//! Supported: mono and stereo SCE/CPE layouts without eSBR, MPS212 or
+//! time-warped MDCT. LFE elements, other frame lengths, other layouts and an
+//! AudioPreRoll element after an audio element are rejected as unsupported.
 //! Length-delimited extension metadata is consumed without affecting audio;
 //! program/anchor loudness for the unprocessed layout is retained for the
 //! decoder's optional `target_level` normalization. DRC is not applied.
@@ -19,8 +21,11 @@ use oxideav_core::{Error, Result};
 
 use crate::usac_tables::SAMPLE_RATES;
 
+/// `ID_EXT_ELE_AUDIOPREROLL`.
+pub(crate) const EXT_AUDIO_PREROLL: u32 = 3;
+
 /// Validated mono/stereo, 1024-line FD configuration and loudness metadata.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UsacConfig {
     /// Core and output sample rate in Hz (no eSBR rate expansion).
     pub sample_rate: u32,
@@ -32,10 +37,10 @@ pub struct UsacConfig {
     pub(crate) elements: Vec<ElementConfig>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ElementConfig {
     Audio { channels: u8, noise_fill: bool },
-    Extension { default_length: u32, fragmented: bool },
+    Extension { kind: u32, default_length: u32, fragmented: bool },
 }
 
 pub(crate) fn is_usac(data: &[u8]) -> bool {
@@ -90,6 +95,16 @@ impl UsacConfig {
             return Err(Error::invalid("AAC USAC: reserved outer sample rate"));
         }
         bits.skip(4)?; // Outer channelConfiguration; UsacConfig is authoritative.
+        Self::read(&mut bits)
+    }
+
+    /// Read the UsacConfig() an AudioPreRoll() embeds; trailing padding is
+    /// ignored.
+    pub(crate) fn parse_embedded(data: &[u8]) -> Result<Self> {
+        Self::read(&mut BitReader::new(data))
+    }
+
+    fn read(bits: &mut BitReader<'_>) -> Result<Self> {
         let index = bits.read_u32(5)? as usize;
         let sample_rate = if index == 31 {
             bits.read_u32(24)?
@@ -110,7 +125,7 @@ impl UsacConfig {
         let channels = match channel_configuration {
             1 | 2 => channel_configuration as u8,
             0 => {
-                let count = escaped(&mut bits, 5, 8, 16)?;
+                let count = escaped(bits, 5, 8, 16)?;
                 if !(1..=2).contains(&count) {
                     return Err(Error::unsupported("AAC USAC: only mono and stereo layouts are supported"));
                 }
@@ -125,39 +140,44 @@ impl UsacConfig {
             }
             _ => return Err(Error::unsupported("AAC USAC: only mono and stereo layouts are supported")),
         };
-        let count = escaped(&mut bits, 4, 8, 16)? + 1;
+        let count = escaped(bits, 4, 8, 16)? + 1;
         if count > 64 {
             return Err(Error::invalid("AAC USAC: too many configured elements"));
         }
         let mut elements = Vec::with_capacity(count as usize);
         let mut audio_channels = 0;
         for _ in 0..count {
-            let kind = bits.read_u32(2)?;
-            if kind == 3 {
-                let _extension_type = escaped(&mut bits, 4, 8, 16)?;
-                let config_length = escaped(&mut bits, 4, 8, 16)?;
-                let default_length = if bits.read_bit()? {
-                    escaped(&mut bits, 8, 16, 0)? + 1
-                } else { 0 };
-                let fragmented = bits.read_bit()?;
-                // DRC gains and ancillary/preroll metadata are not applied,
-                // as in the reference FD decoder's default rendering mode.
-                bits.skip(config_length * 8)?;
-                elements.push(ElementConfig::Extension { default_length, fragmented });
-            } else {
-                let mut noise_fill = false;
-                if kind != 2 {
+            match bits.read_u32(2)? {
+                // lfe_channel_element() has its own restricted FD syntax.
+                2 => return Err(Error::unsupported("AAC USAC: LFE elements are not supported")),
+                3 => {
+                    let kind = escaped(bits, 4, 8, 16)?;
+                    let config_length = escaped(bits, 4, 8, 16)?;
+                    let default_length = if bits.read_bit()? {
+                        escaped(bits, 8, 16, 0)? + 1
+                    } else { 0 };
+                    let fragmented = bits.read_bit()?;
+                    if kind == EXT_AUDIO_PREROLL && audio_channels != 0 {
+                        // Pre-roll priming must happen before this AU's audio.
+                        return Err(Error::unsupported("AAC USAC: AudioPreRoll must precede the audio elements"));
+                    }
+                    // DRC gains and ancillary metadata are not applied, as in
+                    // the reference FD decoder's default rendering mode.
+                    bits.skip(config_length * 8)?;
+                    elements.push(ElementConfig::Extension { kind, default_length, fragmented });
+                }
+                kind => {
                     if bits.read_bit()? {
                         return Err(Error::unsupported("AAC USAC: time-warped MDCT"));
                     }
-                    noise_fill = bits.read_bit()?;
+                    let noise_fill = bits.read_bit()?;
+                    let element_channels = if kind == 1 { 2 } else { 1 };
+                    audio_channels += element_channels;
+                    if audio_channels > channels {
+                        return Err(Error::invalid("AAC USAC: element channels exceed the declared layout"));
+                    }
+                    elements.push(ElementConfig::Audio { channels: element_channels, noise_fill });
                 }
-                let element_channels = if kind == 1 { 2 } else { 1 };
-                audio_channels += element_channels;
-                if audio_channels > channels {
-                    return Err(Error::invalid("AAC USAC: element channels exceed the declared layout"));
-                }
-                elements.push(ElementConfig::Audio { channels: element_channels, noise_fill });
             }
         }
         if audio_channels != channels {
@@ -165,17 +185,17 @@ impl UsacConfig {
         }
         let mut loudness_method_value = None;
         if bits.read_bit()? {
-            let extensions = escaped(&mut bits, 2, 4, 8)? + 1;
+            let extensions = escaped(bits, 2, 4, 8)? + 1;
             for _ in 0..extensions {
-                let kind = escaped(&mut bits, 4, 8, 16)?;
-                let bytes = escaped(&mut bits, 4, 8, 16)?;
-                let end = payload_end(&bits, bytes * 8)?;
+                let kind = escaped(bits, 4, 8, 16)?;
+                let bytes = escaped(bits, 4, 8, 16)?;
+                let end = payload_end(bits, bytes * 8)?;
                 match kind {
-                    2 => parse_loudness_set(&mut bits, &mut loudness_method_value)?,
+                    2 => parse_loudness_set(bits, &mut loudness_method_value)?,
                     7 => { bits.skip(16)?; }
                     _ => {}
                 }
-                finish_payload(&mut bits, end)?;
+                finish_payload(bits, end)?;
             }
         }
         let thresholds = [92017, 75132, 55426, 46009, 37566, 27713, 23004, 18783, 13856, 11502, 9391];
@@ -234,6 +254,7 @@ fn parse_loudness_set(bits: &mut BitReader<'_>, selected: &mut Option<u8>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxideav_core::bits::BitWriter;
 
     #[test]
     fn fd_configs_resolve_authoritative_geometry() {
@@ -261,7 +282,9 @@ mod tests {
         let conformance = [0xf9,0x46,0x43,0x22,0x14,0xc0,0x08,0x5a,0x00,0x11,0x38,0x40,0x02,0x00,0x00,0x2b,0xc0,0x11,0x87,0x2c,0x00];
         let exhale = [0xf9,0x46,0x43,0x22,0x1c,0xc0,0x58,0x52,0x00,0x20,0x00,0xa0,0x40,0x46,0xd0,0xb8,0x00];
         assert!(UsacConfig::parse(&conformance).unwrap().loudness_method_value.is_some());
-        assert!(UsacConfig::parse(&exhale).unwrap().loudness_method_value.is_some());
+        let xhe = UsacConfig::parse(&exhale).unwrap();
+        assert!(xhe.loudness_method_value.is_some());
+        assert!(matches!(xhe.elements[0], ElementConfig::Extension { kind: EXT_AUDIO_PREROLL, .. }));
         for bytes in [&conformance[..], &exhale[..]] {
             for length in 0..bytes.len() {
                 assert!(UsacConfig::parse(&bytes[..length]).is_err());
@@ -286,5 +309,83 @@ mod tests {
             let result = std::panic::catch_unwind(|| UsacConfig::parse(&bytes[..length]));
             assert!(result.is_ok(), "config mutation {run}, seed {state:#x}");
         }
+    }
+
+    /// AOT-42 ASC at 48 kHz with the given coreSbrFrameLengthIndex,
+    /// channelConfigurationIndex and element writers.
+    fn asc(core: u32, layout: u32, elements: &[fn(&mut BitWriter)]) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_u32(31, 5);
+        w.write_u32(10, 6);
+        w.write_u32(3, 4);
+        w.write_u32(2, 4);
+        w.write_u32(3, 5);
+        w.write_u32(core, 3);
+        w.write_u32(layout, 5);
+        w.write_u32(elements.len() as u32 - 1, 4);
+        for element in elements {
+            element(&mut w);
+        }
+        w.write_u32(0, 1);
+        w.finish()
+    }
+
+    fn sce(w: &mut BitWriter) { w.write_u32(0, 2); w.write_u32(0, 2); }
+    fn cpe(w: &mut BitWriter) { w.write_u32(1, 2); w.write_u32(0, 2); }
+    fn lfe(w: &mut BitWriter) { w.write_u32(2, 2); }
+    fn warped(w: &mut BitWriter) { w.write_u32(1, 2); w.write_u32(2, 2); }
+    fn preroll(w: &mut BitWriter) { w.write_u32(3, 2); w.write_u32(3, 4); w.write_u32(0, 4); w.write_u32(0, 2); }
+    fn fill(w: &mut BitWriter) { w.write_u32(3, 2); w.write_u32(0, 4); w.write_u32(0, 4); w.write_u32(0, 2); }
+
+    #[test]
+    fn incompatible_and_unsupported_configurations_are_rejected() {
+        let config = UsacConfig::parse(&asc(1, 2, &[preroll, cpe, fill])).unwrap();
+        assert_eq!((config.channels, config.elements.len()), (2, 3));
+        assert_eq!(UsacConfig::parse(&asc(1, 2, &[sce, sce])).unwrap().channels, 2);
+        for (bytes, message) in [
+            (asc(1, 1, &[lfe]), "LFE"),
+            (asc(1, 2, &[sce, lfe]), "LFE"),
+            (asc(1, 1, &[cpe]), "exceed"),
+            (asc(1, 2, &[sce, cpe]), "exceed"),
+            (asc(1, 2, &[sce]), "cover"),
+            (asc(1, 2, &[fill]), "cover"),
+            (asc(1, 2, &[warped]), "time-warped"),
+            (asc(1, 2, &[cpe, preroll]), "AudioPreRoll"),
+            (asc(0, 2, &[cpe]), "1024-line"),
+            (asc(2, 2, &[cpe]), "1024-line"),
+            (asc(3, 2, &[cpe]), "1024-line"),
+            (asc(4, 2, &[cpe]), "1024-line"),
+            (asc(1, 3, &[sce, cpe]), "mono and stereo"),
+            (asc(1, 6, &[cpe]), "mono and stereo"),
+        ] {
+            let error = UsacConfig::parse(&bytes).unwrap_err();
+            assert!(error.to_string().contains(message), "{message}: {error}");
+        }
+    }
+
+    #[test]
+    fn explicit_layouts_are_limited_to_canonical_mono_and_stereo() {
+        let explicit = |positions: &[u32], element: fn(&mut BitWriter)| {
+            let mut w = BitWriter::new();
+            w.write_u32(31, 5);
+            w.write_u32(10, 6);
+            w.write_u32(3, 4);
+            w.write_u32(2, 4);
+            w.write_u32(3, 5);
+            w.write_u32(1, 3);
+            w.write_u32(0, 5);
+            w.write_u32(positions.len() as u32, 5);
+            for &position in positions {
+                w.write_u32(position, 5);
+            }
+            w.write_u32(0, 4);
+            element(&mut w);
+            w.write_u32(0, 1);
+            UsacConfig::parse(&w.finish())
+        };
+        assert_eq!(explicit(&[0, 1], cpe).unwrap().channels, 2);
+        assert_eq!(explicit(&[2], sce).unwrap().channels, 1);
+        assert!(explicit(&[1, 0], cpe).unwrap_err().to_string().contains("noncanonical"));
+        assert!(explicit(&[0, 1, 2], cpe).unwrap_err().to_string().contains("mono and stereo"));
     }
 }

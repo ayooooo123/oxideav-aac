@@ -11,13 +11,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - USAC (AOT 42) mono/stereo 1024-line FD decoding behind the AAC
   registry: bounded `UsacConfig`, context-adaptive arithmetic spectra,
   noise filling, grouped short windows, MS/complex stereo prediction and
-  USAC's four-bit long-window TNS orders. Optional `target_level` applies
-  program/anchor loudness for the unprocessed layout; extension payloads
-  are length-bounded. This is an LGPL-2.1-or-later port of FFmpeg
+  USAC's four-bit long-window TNS orders. AudioPreRoll primes fresh, reset
+  or reconfigured decoders and applies embedded configuration changes; it
+  is skipped during continuous decoding (ISO/IEC 23003-3 7.18.3.3). FFmpeg
+  2da55bf parses it as fill, so non-silent pre-roll intentionally differs
+  from FFmpeg. Optional `target_level` (-70..=0 dBFS, FFmpeg's range)
+  applies program/anchor loudness for the unprocessed layout; extension
+  payloads are length-bounded. This is an LGPL-2.1-or-later port of FFmpeg
   `aacdec_usac.c` / `aacdec_ac.c` and their tables at 2da55bf.
-  LPD/ACELP, FAC transitions, eSBR/MPS212 and time-warped MDCT remain
-  explicit unsupported errors. MP4 presentation trimming still requires
-  packet side data from the container, not a codec latency adjustment.
+  LPD/ACELP, FAC transitions, eSBR/MPS212, time-warped MDCT, LFE elements
+  and other layouts are explicit unsupported errors. Complex prediction
+  with `complex_coef = 1` and channel-pair TNS with `common_window = 0`
+  and `tns_on_lr = 0` mirror FFmpeg but are unverified: no available
+  vector exercises them. MP4 presentation trimming still requires packet
+  side data from the container, not a codec latency adjustment.
+- The crate forbids `unsafe` code.
 - ER AAC ELD (AOT 39) decoding: `ELDSpecificConfig` parsing (low-delay
   SBR and the resilience tools are rejected, as FFmpeg does), the ELD
   element syntax (no instance tags, no window sequence / shape, pulse or

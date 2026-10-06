@@ -399,6 +399,7 @@
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
+#![forbid(unsafe_code)]
 
 use oxideav_core::RuntimeContext;
 
@@ -408,6 +409,8 @@ pub mod adts_crc;
 pub mod asc;
 pub mod usac_config;
 mod usac;
+#[doc(hidden)]
+pub use usac::{usac_tool_counts, ToolCounts};
 mod usac_arith;
 mod usac_tables;
 pub mod asc_writer;

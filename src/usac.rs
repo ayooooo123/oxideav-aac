@@ -10,6 +10,16 @@
 // Distributed under the GNU Lesser General Public License, version 2.1
 // or (at your option) any later version. See LICENSE-LGPL.
 
+//! USAC 1024-line FD decoding.
+//!
+//! AudioPreRoll follows ISO/IEC 23003-3 7.18.3 and FFmpeg's
+//! `parse_audio_preroll` (which FFmpeg 2da55bf never reaches: its config
+//! parser turns the element into fill). Complex prediction with
+//! `complex_coef = 1` (persistent MDST estimate, previous downmix from the
+//! current spectra) and channel-pair TNS with `common_window = 0` and
+//! `tns_on_lr = 0` (not applied) mirror FFmpeg; [`ToolCounts`] records
+//! whether a stream exercises them.
+
 use std::collections::VecDeque;
 use std::sync::LazyLock;
 
@@ -21,11 +31,13 @@ use crate::ics_info::{IcsInfo, WindowSequence, WindowShape};
 use crate::scale_factor_data::hcod_sf_decode;
 use crate::swb_offset::{FrameFamily, long_window_offsets, short_window_offsets};
 use crate::usac_arith;
-use crate::usac_config::{ElementConfig, UsacConfig};
+use crate::usac_config::{escaped, ElementConfig, UsacConfig, EXT_AUDIO_PREROLL};
 use crate::usac_tables::{MDST_FILTERS, TNS_REFLECTION};
 
 const N: usize = 1024;
 const MAX_BANDS: usize = 128;
+/// Bound on a (possibly fragmented) AudioPreRoll payload.
+const MAX_PREROLL_BYTES: usize = 1 << 20;
 const TNS_LONG: [usize; 12] = [31, 31, 34, 40, 42, 51, 47, 47, 43, 43, 43, 40];
 const TNS_SHORT: [usize; 12] = [9, 9, 10, 14, 14, 14, 15, 15, 15, 15, 15, 15];
 static SCALE_FACTORS: LazyLock<[f32; 428]> = LazyLock::new(||
@@ -37,41 +49,239 @@ fn codec_error(error: crate::Error) -> Error {
     Error::invalid(format!("AAC USAC: {error}"))
 }
 
+/// Counts of the USAC coding tools a decode exercised, for establishing
+/// which paths a conformance corpus verifies.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ToolCounts {
+    /// Access units whose PCM was emitted.
+    pub frames: u64,
+    /// Complete AudioPreRoll payloads.
+    pub preroll_payloads: u64,
+    /// Pre-roll AUs decoded, output discarded, to prime a fresh or
+    /// reconfigured decoder.
+    pub preroll_decoded: u64,
+    /// AudioPreRoll payloads skipped during continuous decoding with an
+    /// unchanged configuration (ISO/IEC 23003-3 7.18.3.3).
+    pub preroll_skipped: u64,
+    /// Configuration changes applied from AudioPreRoll.
+    pub config_changes: u64,
+    /// Channels coded as eight short windows.
+    pub short_window_channels: u64,
+    /// Channels with noise filling active.
+    pub noise_filled_channels: u64,
+    /// Channels with at least one TNS filter of nonzero order.
+    pub tns_channels: u64,
+    /// Of those, channel-pair channels with `common_window = 0` and
+    /// `tns_on_lr = 0`, whose filters are not applied (as in FFmpeg).
+    pub tns_unapplied: u64,
+    /// Channel pairs with mid/side stereo (`ms_mask_present` 1 or 2).
+    pub ms_frames: u64,
+    /// Channel pairs with complex prediction (`ms_mask_present` 3).
+    pub prediction_frames: u64,
+    /// Complex prediction with `complex_coef = 1`.
+    pub complex_coef_frames: u64,
+    /// Complex prediction with `use_prev_frame = 1`.
+    pub previous_frame_frames: u64,
+}
+
+/// Decode `packets` with a fresh USAC decoder and return its tool counts.
+#[doc(hidden)]
+pub fn usac_tool_counts(params: &CodecParameters, packets: &[Packet]) -> Result<ToolCounts> {
+    let mut decoder = UsacDecoder::new(params)?;
+    for packet in packets {
+        decoder.send_packet(packet)?;
+        decoder.pending.clear();
+    }
+    Ok(decoder.stats)
+}
+
 pub(crate) struct UsacDecoder {
     codec_id: CodecId,
+    /// The extradata configuration, restored by `reset`.
+    initial: UsacConfig,
     config: UsacConfig,
     cores: Vec<Core>,
+    /// Per-element AudioPreRoll fragment buffers.
+    payloads: Vec<Vec<u8>>,
     pending: VecDeque<AudioFrame>,
+    target_level: i32,
     gain: f32,
+    /// False until an AU decodes after construction or `reset`: such a
+    /// decoder primes itself from AudioPreRoll.
+    primed: bool,
     eof: bool,
+    stats: ToolCounts,
+}
+
+fn loudness_gain(target: i32, value: Option<u8>) -> f32 {
+    match (target, value) {
+        (0, _) | (_, None) => 1.0,
+        (_, Some(value)) => {
+            let input_loudness = -57.75f32 + 0.25 * value as f32;
+            10.0f32.powf((target as f32 - input_loudness) / 20.0)
+        }
+    }
 }
 
 impl UsacDecoder {
     pub(crate) fn new(params: &CodecParameters) -> Result<Self> {
         let config = UsacConfig::parse(&params.extradata)?;
-        let target = params.options.get("target_level")
+        let target_level = params.options.get("target_level")
             .map(|v| v.parse::<i32>().map_err(|_| Error::invalid("AAC USAC: invalid target_level")))
             .transpose()?.unwrap_or(0);
-        if !(-63..=0).contains(&target) {
-            return Err(Error::invalid("AAC USAC: target_level must be between -63 and 0 dBFS"));
+        // FFmpeg's option range; 0 disables normalization.
+        if !(-70..=0).contains(&target_level) {
+            return Err(Error::invalid("AAC USAC: target_level must be between -70 and 0 dBFS"));
         }
-        let gain = match (target, config.loudness_method_value) {
-            (0, _) | (_, None) => 1.0,
-            (_, Some(value)) => {
-                let input_loudness = -57.75f32 + 0.25 * value as f32;
-                10.0f32.powf((target as f32 - input_loudness) / 20.0)
-            }
+        let mut decoder = Self {
+            codec_id: CodecId::new("aac"),
+            initial: config.clone(),
+            config,
+            cores: Vec::new(),
+            payloads: Vec::new(),
+            pending: VecDeque::new(),
+            target_level,
+            gain: 1.0,
+            primed: false,
+            eof: false,
+            stats: ToolCounts::default(),
         };
-        let cores = make_cores(&config)?;
-        Ok(Self { codec_id: CodecId::new("aac"), config, cores, pending: VecDeque::new(), gain, eof: false })
+        decoder.configure()?;
+        Ok(decoder)
     }
-}
 
-fn make_cores(config: &UsacConfig) -> Result<Vec<Core>> {
-    config.elements.iter().filter_map(|element| match *element {
-        ElementConfig::Audio { channels, .. } => Some(Core::new(channels, config.rate_index)),
-        ElementConfig::Extension { .. } => None,
-    }).collect()
+    /// Rebuild every per-element state for `self.config`.
+    fn configure(&mut self) -> Result<()> {
+        let rate_index = self.config.rate_index;
+        self.cores = self.config.elements.iter().filter_map(|element| match *element {
+            ElementConfig::Audio { channels, .. } => Some(Core::new(channels, rate_index)),
+            ElementConfig::Extension { .. } => None,
+        }).collect::<Result<_>>()?;
+        self.payloads = vec![Vec::new(); self.config.elements.len()];
+        self.gain = loudness_gain(self.target_level, self.config.loudness_method_value);
+        Ok(())
+    }
+
+    /// Decode one UsacFrame() into the element state without emitting PCM.
+    /// `nested` marks a pre-roll AU, which may not carry AudioPreRoll itself.
+    fn decode_access_unit(&mut self, data: &[u8], nested: bool) -> Result<()> {
+        let mut bits = BitReader::new(data);
+        let independent = bits.read_bit()?;
+        let mut core_index = 0;
+        let mut index = 0;
+        while index < self.config.elements.len() {
+            let rate_index = self.config.rate_index;
+            match self.config.elements[index].clone() {
+                ElementConfig::Audio { noise_fill, .. } => {
+                    self.cores[core_index].decode(&mut bits, independent, noise_fill, rate_index, &mut self.stats)?;
+                    core_index += 1;
+                }
+                ElementConfig::Extension { kind, default_length, fragmented } => {
+                    if let Some(payload) = self.extension_payload(&mut bits, index, kind, default_length, fragmented)? {
+                        if nested {
+                            return Err(Error::invalid("AAC USAC: AudioPreRoll inside a pre-roll access unit"));
+                        }
+                        self.preroll(&payload)?;
+                    }
+                }
+            }
+            index += 1;
+        }
+        Ok(())
+    }
+
+    /// Read one UsacExtElement(); returns a completed AudioPreRoll payload.
+    fn extension_payload(
+        &mut self,
+        bits: &mut BitReader<'_>,
+        index: usize,
+        kind: u32,
+        default_length: u32,
+        fragmented: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        if !bits.read_bit()? {
+            return Ok(None);
+        }
+        let length = if bits.read_bit()? { default_length } else {
+            let n = bits.read_u32(8)?;
+            if n == 255 { n + bits.read_u32(16)? - 2 } else { n }
+        };
+        if length == 0 {
+            return Ok(None);
+        }
+        let (start, end) = if fragmented { (bits.read_bit()?, bits.read_bit()?) } else { (true, true) };
+        if length as u64 * 8 > bits.bits_remaining() {
+            return Err(Error::invalid("AAC USAC: truncated extension payload"));
+        }
+        if kind != EXT_AUDIO_PREROLL {
+            bits.skip(length * 8)?;
+            return Ok(None);
+        }
+        let buffer = &mut self.payloads[index];
+        if start {
+            buffer.clear();
+        }
+        if buffer.len() + length as usize > MAX_PREROLL_BYTES {
+            buffer.clear();
+            return Err(Error::invalid("AAC USAC: AudioPreRoll payload too large"));
+        }
+        for _ in 0..length {
+            buffer.push(bits.read_u32(8)? as u8);
+        }
+        Ok(end.then(|| std::mem::take(buffer)))
+    }
+
+    /// AudioPreRoll(): apply an embedded configuration change, then prime a
+    /// fresh or reconfigured decoder with the pre-roll AUs, discarding their
+    /// PCM. Continuous decoding with an unchanged configuration skips the
+    /// payload (ISO/IEC 23003-3 7.18.3.3). applyCrossfade is not applied, as
+    /// in FFmpeg.
+    fn preroll(&mut self, payload: &[u8]) -> Result<()> {
+        self.stats.preroll_payloads += 1;
+        let mut bits = BitReader::new(payload);
+        let truncated = || Error::invalid("AAC USAC: truncated AudioPreRoll");
+        let config_length = escaped(&mut bits, 4, 4, 8)? as u64;
+        if config_length * 8 > bits.bits_remaining() {
+            return Err(truncated());
+        }
+        let config: Vec<u8> = (0..config_length).map(|_| bits.read_u32(8).map(|b| b as u8)).collect::<Result<_>>()?;
+        let mut changed = false;
+        if !config.is_empty() {
+            let next = UsacConfig::parse_embedded(&config)?;
+            if !matches!(next.elements.first(), Some(ElementConfig::Extension { kind: EXT_AUDIO_PREROLL, .. })) {
+                return Err(Error::invalid("AAC USAC: embedded configuration without a leading AudioPreRoll"));
+            }
+            let current = &self.config;
+            if (next.sample_rate, next.channels, next.rate_index, &next.elements)
+                != (current.sample_rate, current.channels, current.rate_index, &current.elements)
+            {
+                self.config = next;
+                self.configure()?;
+                self.stats.config_changes += 1;
+                changed = true;
+            } else if next.loudness_method_value != current.loudness_method_value {
+                self.config.loudness_method_value = next.loudness_method_value;
+                self.gain = loudness_gain(self.target_level, next.loudness_method_value);
+            }
+        }
+        if self.primed && !changed {
+            self.stats.preroll_skipped += 1;
+            return Ok(());
+        }
+        bits.skip(2)?; // applyCrossfade, reserved
+        let count = escaped(&mut bits, 2, 4, 0)?;
+        for _ in 0..count {
+            let length = escaped(&mut bits, 16, 16, 0)? as u64;
+            if length * 8 > bits.bits_remaining() {
+                return Err(truncated());
+            }
+            let unit: Vec<u8> = (0..length).map(|_| bits.read_u32(8).map(|b| b as u8)).collect::<Result<_>>()?;
+            self.decode_access_unit(&unit, true)?;
+            self.stats.preroll_decoded += 1;
+        }
+        Ok(())
+    }
 }
 
 impl Decoder for UsacDecoder {
@@ -84,30 +294,10 @@ impl Decoder for UsacDecoder {
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         if self.eof { return Err(Error::other("AAC USAC: send_packet after flush")); }
         if packet.data.is_empty() { return Ok(()); }
-        let mut bits = BitReader::new(&packet.data);
-        let independent = bits.read_bit()?;
-        let mut core_index = 0;
-        for element in &self.config.elements {
-            match *element {
-                ElementConfig::Audio { noise_fill, .. } => {
-                    self.cores[core_index].decode(&mut bits, independent, noise_fill, self.config.rate_index)?;
-                    core_index += 1;
-                }
-                ElementConfig::Extension { default_length, fragmented } => {
-                    if bits.read_bit()? {
-                        let length = if bits.read_bit()? { default_length } else {
-                            let n = bits.read_u32(8)?;
-                            if n == 255 { n + bits.read_u32(16)? - 2 } else { n }
-                        };
-                        if length != 0 {
-                            if fragmented { bits.skip(2)?; }
-                            bits.skip(length * 8)?;
-                        }
-                    }
-                }
-            }
-        }
-        let mut bytes = Vec::with_capacity(N * self.config.channels as usize * 4);
+        self.decode_access_unit(&packet.data, false)?;
+        self.primed = true;
+        let channels: usize = self.cores.iter().map(|core| core.channels.len()).sum();
+        let mut bytes = Vec::with_capacity(N * channels * 4);
         for i in 0..N {
             for core in &self.cores {
                 for channel in &core.channels {
@@ -119,6 +309,7 @@ impl Decoder for UsacDecoder {
                 }
             }
         }
+        self.stats.frames += 1;
         self.pending.push_back(AudioFrame { samples: N as u32, pts: packet.pts, data: vec![bytes] });
         Ok(())
     }
@@ -130,8 +321,10 @@ impl Decoder for UsacDecoder {
     fn flush(&mut self) -> Result<()> { self.eof = true; Ok(()) }
 
     fn reset(&mut self) -> Result<()> {
-        self.cores = make_cores(&self.config)?;
+        self.config = self.initial.clone();
+        self.configure()?;
         self.pending.clear();
+        self.primed = false;
         self.eof = false;
         Ok(())
     }
@@ -299,7 +492,7 @@ impl Core {
         Ok(Self { channels: (0..channels).map(|ch| Channel::new(rate_index, ch)).collect::<Result<_>>()?, stereo: Stereo::default() })
     }
 
-    fn decode(&mut self, bits: &mut BitReader<'_>, independent: bool, noise_fill: bool, rate_index: u8) -> Result<()> {
+    fn decode(&mut self, bits: &mut BitReader<'_>, independent: bool, noise_fill: bool, rate_index: u8, stats: &mut ToolCounts) -> Result<()> {
         for channel in &mut self.channels {
             channel.tns.counts.fill(0);
             if bits.read_bit()? { return Err(Error::unsupported("AAC USAC: LPD/ACELP core mode")); }
@@ -307,6 +500,7 @@ impl Core {
         let mut tns_present = [false; 2];
         self.stereo.common = false;
         self.stereo.common_tns = false;
+        self.stereo.tns_on_lr = false;
         if self.channels.len() == 2 {
             self.stereo.parse(bits, &mut self.channels, independent, rate_index, &mut tns_present)?;
         }
@@ -329,6 +523,26 @@ impl Core {
             }
             if bits.read_bit()? { return Err(Error::unsupported("AAC USAC: FAC transition from an LPD core")); }
             channel.scale(rate_index, noise_level, noise_offset)?;
+            stats.short_window_channels += u64::from(channel.ics.window_sequence.is_eight_short());
+            stats.noise_filled_channels += u64::from(noise_level != 0);
+        }
+        for ch in 0..channel_count {
+            let tns = if self.stereo.common_tns { &self.channels[0].tns } else { &self.channels[ch].tns };
+            if (tns_present[ch] || self.stereo.common_tns) && tns.active() {
+                stats.tns_channels += 1;
+                stats.tns_unapplied += u64::from(channel_count == 2 && !self.stereo.common && !self.stereo.tns_on_lr);
+            }
+        }
+        if channel_count == 2 && self.stereo.common {
+            match self.stereo.mode {
+                1 | 2 => stats.ms_frames += 1,
+                3 => {
+                    stats.prediction_frames += 1;
+                    stats.complex_coef_frames += u64::from(self.stereo.complex_coef);
+                    stats.previous_frame_frames += u64::from(self.stereo.use_previous);
+                }
+                _ => {}
+            }
         }
         if self.channels.len() == 2 && self.stereo.common {
             if !self.stereo.tns_on_lr { self.apply_tns(rate_index)?; }
@@ -363,6 +577,7 @@ struct Stereo {
     max_sfb: usize,
     used: [bool; MAX_BANDS],
     direction: bool,
+    complex_coef: bool,
     use_previous: bool,
     re: [f32; MAX_BANDS],
     im: [f32; MAX_BANDS],
@@ -374,7 +589,7 @@ struct Stereo {
 impl Default for Stereo {
     fn default() -> Self {
         Self { common: false, common_tns: false, tns_on_lr: false, mode: 0, max_sfb: 0,
-            used: [false; MAX_BANDS], direction: false, use_previous: false,
+            used: [false; MAX_BANDS], direction: false, complex_coef: false, use_previous: false,
             re: [0.0; MAX_BANDS], im: [0.0; MAX_BANDS], prev_re: [0.0; MAX_BANDS],
             prev_im: [0.0; MAX_BANDS], downmix_im: [0.0; N] }
     }
@@ -446,6 +661,7 @@ impl Stereo {
         }
         self.direction = bits.read_bit()?;
         let complex = bits.read_bit()?;
+        self.complex_coef = complex;
         self.use_previous = complex && !independent && bits.read_bit()?;
         let delta_time = !independent && bits.read_bit()?;
         for g in 0..groups {
@@ -507,6 +723,7 @@ impl Stereo {
                 (WindowShape::Sine, WindowShape::Kbd) => 2,
                 (WindowShape::Kbd, WindowShape::Sine) => 3,
             };
+            // As in FFmpeg, the MDST estimate accumulates across frames.
             interpolate_imag(&mut self.downmix_im, &current, &MDST_FILTERS[window][shape], 1.0);
             if self.use_previous {
                 let window = usize::from(left.ics.window_sequence == WindowSequence::LongStop);
@@ -572,6 +789,11 @@ struct Tns {
 }
 
 impl Tns {
+    /// Whether any parsed filter has a nonzero order.
+    fn active(&self) -> bool {
+        self.counts.iter().zip(&self.filters).any(|(&count, filters)| filters[..count as usize].iter().any(|f| f.order != 0))
+    }
+
     fn parse(&mut self, bits: &mut BitReader<'_>, ics: &IcsInfo) -> Result<()> {
         let short = ics.window_sequence.is_eight_short();
         for w in 0..ics.num_windows as usize {
@@ -711,5 +933,121 @@ mod tests {
         assert_eq!(reader.bit_position(), 60);
         assert_eq!(tns.filters[0][0].order, 15);
         assert_eq!(tns.filters[0][0].lpc, [0.0; 15]);
+        assert!(tns.active());
+    }
+
+    #[test]
+    fn target_level_accepts_the_ffmpeg_range() {
+        for (value, accepted) in [("-70", true), ("0", true), ("-24", true), ("-71", false), ("1", false), ("x", false)] {
+            let mut params = mono_params();
+            params.options.insert("target_level", value);
+            assert_eq!(UsacDecoder::new(&params).is_ok(), accepted, "{value}");
+        }
+    }
+
+    /// UsacConfig() for 48 kHz mono [AudioPreRoll, SCE].
+    fn write_usac_config(w: &mut BitWriter, core: u32) {
+        w.write_u32(3, 5);
+        w.write_u32(core, 3);
+        w.write_u32(1, 5);
+        w.write_u32(1, 4); // two elements
+        w.write_u32(3, 2); // AudioPreRoll extension, no config, no default length, unfragmented
+        w.write_u32(3, 4);
+        w.write_u32(0, 4);
+        w.write_u32(0, 2);
+        w.write_u32(0, 2); // SCE without time warping or noise filling
+        w.write_u32(0, 2);
+        w.write_u32(0, 1); // no config extension
+    }
+
+    fn usac_config(core: u32) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        write_usac_config(&mut w, core);
+        w.finish()
+    }
+
+    fn preroll_params() -> CodecParameters {
+        let mut w = BitWriter::new();
+        w.write_u32(31, 5);
+        w.write_u32(10, 6);
+        w.write_u32(3, 4);
+        w.write_u32(1, 4);
+        write_usac_config(&mut w, 1);
+        let mut params = CodecParameters::audio(CodecId::new("aac"));
+        params.extradata = w.finish();
+        params
+    }
+
+    /// A silent AU for `preroll_params`, optionally carrying AudioPreRoll.
+    fn preroll_frame(payload: Option<&[u8]>) -> Packet {
+        let mut w = BitWriter::new();
+        w.write_u32(1, 1);
+        match payload {
+            None => w.write_u32(0, 1),
+            Some(payload) => {
+                w.write_u32(2, 2); // present, explicit length
+                w.write_u32(payload.len() as u32, 8);
+                for &byte in payload { w.write_u32(byte.into(), 8); }
+            }
+        }
+        w.write_u32(0, 2); // FD core, no TNS
+        w.write_u32(100, 8);
+        w.write_u32(0, 3); // ONLY_LONG, sine
+        w.write_u32(0, 6);
+        w.write_u32(0, 1); // no FAC
+        Packet::new(0, TimeBase::new(1, 48000), w.finish())
+    }
+
+    fn preroll_payload(config: &[u8], units: &[&[u8]]) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_u32(config.len() as u32, 4);
+        for &byte in config { w.write_u32(byte.into(), 8); }
+        w.write_u32(0, 2); // applyCrossfade, reserved
+        w.write_u32(units.len() as u32, 2);
+        for unit in units {
+            w.write_u32(unit.len() as u32, 16);
+            for &byte in *unit { w.write_u32(byte.into(), 8); }
+        }
+        w.finish()
+    }
+
+    #[test]
+    fn preroll_primes_fresh_decoders_and_is_skipped_when_continuous() {
+        let unit = preroll_frame(None).data;
+        let ipf = preroll_frame(Some(&preroll_payload(&[], &[&unit])));
+        let mut decoder = UsacDecoder::new(&preroll_params()).unwrap();
+        decoder.send_packet(&ipf).unwrap();
+        assert_eq!((decoder.stats.preroll_payloads, decoder.stats.preroll_decoded, decoder.stats.preroll_skipped), (1, 1, 0));
+        assert_eq!(decoder.pending.len(), 1, "pre-roll PCM is discarded");
+        decoder.send_packet(&ipf).unwrap();
+        assert_eq!((decoder.stats.preroll_decoded, decoder.stats.preroll_skipped), (1, 1));
+        decoder.reset().unwrap();
+        assert!(decoder.pending.is_empty());
+        decoder.send_packet(&ipf).unwrap();
+        assert_eq!(decoder.stats.preroll_decoded, 2);
+        let same = preroll_frame(Some(&preroll_payload(&usac_config(1), &[&unit])));
+        decoder.send_packet(&same).unwrap();
+        assert_eq!((decoder.stats.config_changes, decoder.stats.preroll_skipped), (0, 2));
+    }
+
+    #[test]
+    fn preroll_rejects_nesting_unsupported_configurations_and_truncation() {
+        let unit = preroll_frame(None).data;
+        let nested = preroll_frame(Some(&preroll_payload(&[], &[&unit]))).data;
+        for (payload, message) in [
+            (preroll_payload(&[], &[&nested]), "inside a pre-roll"),
+            (preroll_payload(&usac_config(2), &[&unit]), "1024-line"),
+            (preroll_payload(&[], &[&unit[..1]]), ""),
+        ] {
+            let mut decoder = UsacDecoder::new(&preroll_params()).unwrap();
+            let error = decoder.send_packet(&preroll_frame(Some(&payload))).unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+            assert!(decoder.pending.is_empty());
+        }
+        let mut packet = preroll_frame(Some(&preroll_payload(&[], &[&unit])));
+        packet.data.truncate(4);
+        let mut decoder = UsacDecoder::new(&preroll_params()).unwrap();
+        assert!(decoder.send_packet(&packet).is_err());
+        assert!(decoder.pending.is_empty());
     }
 }

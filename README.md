@@ -16,10 +16,17 @@ cached mixed-radix FFT plans for all supported frame families, including
 ELD and LTP analysis; synthesis windows and transform scratch are reused.
 
 USAC (AOT 42) accepts raw access units with `UsacConfig` in extradata:
-mono/stereo 1024-line FD, arithmetic spectra, noise filling, MS/complex
-stereo and TNS. The optional `target_level` codec option (-63..=0 dBFS;
-0 disables it) applies program/anchor loudness for the unprocessed layout.
-LPD/ACELP, FAC transitions, eSBR/MPS212 and time-warped MDCT are rejected.
+mono/stereo SCE/CPE 1024-line FD with arithmetic spectra, noise filling,
+M/S and complex stereo prediction, and TNS. AudioPreRoll primes a fresh,
+reset or reconfigured decoder with its pre-roll AUs (output discarded) and
+applies embedded configuration changes; continuous decoding with an
+unchanged configuration skips it (ISO/IEC 23003-3 7.18.3.3).
+applyCrossfade is not applied. FFmpeg 2da55bf parses AudioPreRoll as fill,
+so a stream that starts with non-silent pre-roll (FATE xhe_target_level)
+intentionally differs from FFmpeg. The optional `target_level` codec option
+(-70..=0 dBFS, FFmpeg's range; 0 disables it) applies program/anchor
+loudness for the unprocessed layout. See "Not yet supported" for the
+rejected and unverified USAC tools.
 USAC and two ELD MP4 fixtures still need container-provided sample trimming;
 the decoder deliberately retains its complete raw PCM. The workspace's
 `check-aac` tests assert those exact presentation gaps separately from
@@ -1319,6 +1326,18 @@ component still open (see below):
 
 ## Not yet supported
 
+- **USAC beyond mono/stereo 1024-line FD.** LPD/ACELP cores, FAC
+  transitions, eSBR (coreSbrFrameLengthIndex other than 1) and therefore
+  MPS212, time-warped MDCT, LFE elements, other layouts, and AudioPreRoll
+  after an audio element or inside a pre-roll AU are rejected with errors.
+  AudioPreRoll's applyCrossfade is ignored.
+- **Unverified USAC paths.** Complex prediction with `complex_coef = 1`
+  (its MDST estimate accumulates across frames and `use_prev_frame` builds
+  the previous downmix from current spectra) and channel-pair TNS with
+  `common_window = 0` and `tns_on_lr = 0` (not applied) mirror FFmpeg
+  2da55bf. These look suspicious, but no available conformance vector
+  exercises them (the `check-aac` coverage counts are zero) and no normative
+  text or independent decoder output was available to settle them.
 - **The deployed ER AAC LD `tns_data()` filter record.** The
   ISO/IEC 14496-26 LD conformance bitstreams transmit an
   extra-spec TNS record: the corpus-resolved 1-bit-`n_filt` reading
