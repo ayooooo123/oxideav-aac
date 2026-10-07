@@ -11,9 +11,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - USAC (AOT 42) mono/stereo 1024-line FD decoding behind the AAC
   registry: bounded `UsacConfig`, context-adaptive arithmetic spectra,
   noise filling, grouped short windows, MS/complex stereo prediction and
-  USAC's four-bit long-window TNS orders. AudioPreRoll primes fresh, reset
-  or reconfigured decoders and applies embedded configuration changes; it
-  is skipped during continuous decoding (ISO/IEC 23003-3 7.18.3.3).
+  USAC's four-bit long-window TNS orders. AudioPreRoll, valid only as the
+  first element, primes fresh, reset or reconfigured decoders and applies
+  embedded configuration changes; it is skipped during continuous decoding
+  (ISO/IEC 23003-3 7.18.3.3). A decoder that rejects an AU before it is
+  primed rebuilds its cores, so the next AudioPreRoll primes exactly.
   Noise filling uses ISO/libxaac channel seeds and advances the PRNG even
   at zero noise level. Complex prediction uses per-band integer alpha
   history, recomputed MDST and saved previous-frame spectra with distinct

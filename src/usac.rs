@@ -114,8 +114,11 @@ pub(crate) struct UsacDecoder {
     pending: VecDeque<AudioFrame>,
     target_level: i32,
     gain: f32,
-    /// False until an AU decodes after construction or `reset`: such a
-    /// decoder primes itself from AudioPreRoll.
+    /// Whether the cores hold a completely decoded AU since they were built
+    /// (construction, `reset` or a configuration change). An unprimed
+    /// decoder primes itself from AudioPreRoll; if it rejects an AU, its
+    /// cores are rebuilt so the next AudioPreRoll primes from the configured
+    /// initial state.
     primed: bool,
     eof: bool,
     stats: ToolCounts,
@@ -158,7 +161,7 @@ impl UsacDecoder {
         Ok(decoder)
     }
 
-    /// Rebuild every per-element state for `self.config`.
+    /// Rebuild every per-element state for `self.config`, unprimed.
     fn configure(&mut self) -> Result<()> {
         let rate_index = self.config.rate_index;
         self.cores = self.config.elements.iter().filter_map(|element| match *element {
@@ -167,6 +170,7 @@ impl UsacDecoder {
         }).collect::<Result<_>>()?;
         self.payloads = vec![Vec::new(); self.config.elements.len()];
         self.gain = loudness_gain(self.target_level, self.config.loudness_method_value);
+        self.primed = false;
         Ok(())
     }
 
@@ -189,6 +193,11 @@ impl UsacDecoder {
                         if nested {
                             return Err(Error::invalid("AAC USAC: AudioPreRoll inside a pre-roll access unit"));
                         }
+                        // UsacConfig admits AudioPreRoll only as element 0,
+                        // in the current and any embedded configuration: a
+                        // configuration change precedes all audio, and the AU
+                        // resumes at element 1 of the new layout.
+                        debug_assert_eq!((index, core_index), (0, 0));
                         self.preroll(&payload)?;
                     }
                 }
@@ -253,7 +262,6 @@ impl UsacDecoder {
             return Err(truncated());
         }
         let config: Vec<u8> = (0..config_length).map(|_| bits.read_u32(8).map(|b| b as u8)).collect::<Result<_>>()?;
-        let mut changed = false;
         if !config.is_empty() {
             let next = UsacConfig::parse_embedded(&config)?;
             if !matches!(next.elements.first(), Some(ElementConfig::Extension { kind: EXT_AUDIO_PREROLL, .. })) {
@@ -266,13 +274,13 @@ impl UsacDecoder {
                 self.config = next;
                 self.configure()?;
                 self.stats.config_changes += 1;
-                changed = true;
             } else if next.loudness_method_value != current.loudness_method_value {
                 self.config.loudness_method_value = next.loudness_method_value;
                 self.gain = loudness_gain(self.target_level, next.loudness_method_value);
             }
         }
-        if self.primed && !changed {
+        // Rebuilt cores are unprimed, so a configuration change always primes.
+        if self.primed {
             self.stats.preroll_skipped += 1;
             return Ok(());
         }
@@ -289,20 +297,10 @@ impl UsacDecoder {
         }
         Ok(())
     }
-}
 
-impl Decoder for UsacDecoder {
-    fn codec_id(&self) -> &CodecId { &self.codec_id }
-
-    fn output_audio_format(&self) -> Option<AudioFormat> {
-        Some(AudioFormat { sample_format: SampleFormat::F32, sample_rate: self.config.sample_rate, channels: self.config.channels as u16 })
-    }
-
-    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if self.eof { return Err(Error::other("AAC USAC: send_packet after flush")); }
-        if packet.data.is_empty() { return Ok(()); }
+    /// Decode one AU and interleave its PCM.
+    fn decode_frame(&mut self, packet: &Packet) -> Result<AudioFrame> {
         self.decode_access_unit(&packet.data, false)?;
-        self.primed = true;
         let channels: usize = self.cores.iter().map(|core| core.channels.len()).sum();
         let mut bytes = Vec::with_capacity(N * channels * 4);
         for i in 0..N {
@@ -316,9 +314,37 @@ impl Decoder for UsacDecoder {
                 }
             }
         }
-        self.stats.frames += 1;
-        self.pending.push_back(AudioFrame { samples: N as u32, pts: packet.pts, data: vec![bytes] });
-        Ok(())
+        Ok(AudioFrame { samples: N as u32, pts: packet.pts, data: vec![bytes] })
+    }
+}
+
+impl Decoder for UsacDecoder {
+    fn codec_id(&self) -> &CodecId { &self.codec_id }
+
+    fn output_audio_format(&self) -> Option<AudioFormat> {
+        Some(AudioFormat { sample_format: SampleFormat::F32, sample_rate: self.config.sample_rate, channels: self.config.channels as u16 })
+    }
+
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        if self.eof { return Err(Error::other("AAC USAC: send_packet after flush")); }
+        if packet.data.is_empty() { return Ok(()); }
+        match self.decode_frame(packet) {
+            Ok(frame) => {
+                self.primed = true;
+                self.stats.frames += 1;
+                self.pending.push_back(frame);
+                Ok(())
+            }
+            Err(error) => {
+                // The rejected AU may have reconfigured or partly primed the
+                // cores. Rebuilding them keeps an unprimed decoder equal to
+                // a fresh one, so the next AudioPreRoll primes exactly.
+                if !self.primed {
+                    self.configure()?;
+                }
+                Err(error)
+            }
+        }
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
@@ -331,7 +357,6 @@ impl Decoder for UsacDecoder {
         self.config = self.initial.clone();
         self.configure()?;
         self.pending.clear();
-        self.primed = false;
         self.eof = false;
         Ok(())
     }
@@ -1038,9 +1063,9 @@ mod tests {
         }
     }
 
-    /// UsacConfig() for 48 kHz mono [AudioPreRoll, SCE].
-    fn write_usac_config(w: &mut BitWriter, core: u32) {
-        w.write_u32(3, 5);
+    /// UsacConfig() for mono [AudioPreRoll, SCE] at sampling index `rate`.
+    fn write_usac_config(w: &mut BitWriter, rate: u32, core: u32) {
+        w.write_u32(rate, 5);
         w.write_u32(core, 3);
         w.write_u32(1, 5);
         w.write_u32(1, 4); // two elements
@@ -1053,9 +1078,9 @@ mod tests {
         w.write_u32(0, 1); // no config extension
     }
 
-    fn usac_config(core: u32) -> Vec<u8> {
+    fn usac_config(rate: u32, core: u32) -> Vec<u8> {
         let mut w = BitWriter::new();
-        write_usac_config(&mut w, core);
+        write_usac_config(&mut w, rate, core);
         w.finish()
     }
 
@@ -1065,7 +1090,7 @@ mod tests {
         w.write_u32(10, 6);
         w.write_u32(3, 4);
         w.write_u32(1, 4);
-        write_usac_config(&mut w, 1);
+        write_usac_config(&mut w, 3, 1);
         let mut params = CodecParameters::audio(CodecId::new("aac"));
         params.extradata = w.finish();
         params
@@ -1118,9 +1143,33 @@ mod tests {
         assert!(decoder.pending.is_empty());
         decoder.send_packet(&ipf).unwrap();
         assert_eq!(decoder.stats.preroll_decoded, 2);
-        let same = preroll_frame(Some(&preroll_payload(&usac_config(1), &[&unit])));
+        let same = preroll_frame(Some(&preroll_payload(&usac_config(3, 1), &[&unit])));
         decoder.send_packet(&same).unwrap();
         assert_eq!((decoder.stats.config_changes, decoder.stats.preroll_skipped), (0, 2));
+    }
+
+    #[test]
+    fn rejected_reconfiguration_leaves_the_rebuilt_decoder_unprimed() {
+        let unit = preroll_frame(None).data;
+        let config = usac_config(4, 1); // 44.1 kHz
+        let mut decoder = UsacDecoder::new(&preroll_params()).unwrap();
+        decoder.send_packet(&preroll_frame(None)).unwrap();
+        decoder.pending.clear();
+        // A valid configuration change whose pre-roll auLen claims one byte
+        // more than the payload holds.
+        let mut w = BitWriter::new();
+        w.write_u32(config.len() as u32, 4);
+        for &byte in &config { w.write_u32(byte.into(), 8); }
+        w.write_u32(0, 2);
+        w.write_u32(1, 2);
+        w.write_u32(unit.len() as u32 + 1, 16);
+        for &byte in &unit { w.write_u32(byte.into(), 8); }
+        assert!(decoder.send_packet(&preroll_frame(Some(&w.finish()))).is_err());
+        assert!(decoder.pending.is_empty());
+        decoder.send_packet(&preroll_frame(Some(&preroll_payload(&config, &[&unit])))).unwrap();
+        assert_eq!(decoder.output_audio_format().unwrap().sample_rate, 44100);
+        assert_eq!((decoder.stats.preroll_decoded, decoder.stats.preroll_skipped), (1, 0), "the rebuilt cores must be primed");
+        assert_eq!(decoder.pending.len(), 1);
     }
 
     #[test]
@@ -1129,7 +1178,7 @@ mod tests {
         let nested = preroll_frame(Some(&preroll_payload(&[], &[&unit]))).data;
         for (payload, message) in [
             (preroll_payload(&[], &[&nested]), "inside a pre-roll"),
-            (preroll_payload(&usac_config(2), &[&unit]), "1024-line"),
+            (preroll_payload(&usac_config(3, 2), &[&unit]), "1024-line"),
             (preroll_payload(&[], &[&unit[..1]]), ""),
         ] {
             let mut decoder = UsacDecoder::new(&preroll_params()).unwrap();

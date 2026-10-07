@@ -10,8 +10,9 @@
 //! USAC (AOT 42) configuration for the 1024-line FD decoder.
 //!
 //! Supported: mono and stereo SCE/CPE layouts without eSBR, MPS212 or
-//! time-warped MDCT. LFE elements, other frame lengths, other layouts and an
-//! AudioPreRoll element after an audio element are rejected as unsupported.
+//! time-warped MDCT. LFE elements, other frame lengths and other layouts are
+//! rejected as unsupported; an AudioPreRoll element anywhere but first is
+//! invalid (ISO/IEC 23003-3 UsacExtElementConfig()).
 //! Length-delimited extension metadata is consumed without affecting audio;
 //! program/anchor loudness for the unprocessed layout is retained for the
 //! decoder's optional `target_level` normalization. DRC is not applied.
@@ -157,9 +158,13 @@ impl UsacConfig {
                         escaped(bits, 8, 16, 0)? + 1
                     } else { 0 };
                     let fragmented = bits.read_bit()?;
-                    if kind == EXT_AUDIO_PREROLL && audio_channels != 0 {
-                        // Pre-roll priming must happen before this AU's audio.
-                        return Err(Error::unsupported("AAC USAC: AudioPreRoll must precede the audio elements"));
+                    // ISO/IEC 23003-3 UsacExtElementConfig(): "The first
+                    // element of every frame shall be an extension element
+                    // (UsacExtElement) of type ID_EXT_ELE_AUDIOPREROLL". The
+                    // ISO reference decoder and libxaac read it only there,
+                    // so a configuration change resumes the AU at element 1.
+                    if kind == EXT_AUDIO_PREROLL && !elements.is_empty() {
+                        return Err(Error::invalid("AAC USAC: AudioPreRoll is valid only as the first element"));
                     }
                     // DRC gains and ancillary metadata are not applied, as in
                     // the reference FD decoder's default rendering mode.
@@ -338,6 +343,38 @@ mod tests {
     fn fill(w: &mut BitWriter) { w.write_u32(3, 2); w.write_u32(0, 4); w.write_u32(0, 4); w.write_u32(0, 2); }
 
     #[test]
+    fn audio_preroll_is_valid_only_as_the_first_element() {
+        for (name, elements, valid) in [
+            ("[AudioPreRoll, SCE]", &[preroll, sce][..], true),
+            ("[AudioPreRoll, fill, SCE]", &[preroll, fill, sce][..], true),
+            ("[fill, SCE]", &[fill, sce][..], true),
+            ("[fill, AudioPreRoll, SCE]", &[fill, preroll, sce][..], false),
+            ("[AudioPreRoll, AudioPreRoll, SCE]", &[preroll, preroll, sce][..], false),
+            ("[SCE, AudioPreRoll]", &[sce, preroll][..], false),
+        ] {
+            let full = asc(1, 1, elements);
+            // The same UsacConfig() as an AudioPreRoll Config(): without the
+            // escaped AOT and the outer rate and channel fields.
+            let mut reader = BitReader::new(&full);
+            reader.skip(19).unwrap();
+            let mut writer = BitWriter::new();
+            while reader.bits_remaining() != 0 {
+                writer.write_u32(reader.read_u32(1).unwrap(), 1);
+            }
+            let embedded = writer.finish();
+            for (path, result) in [("ASC", UsacConfig::parse(&full)), ("embedded", UsacConfig::parse_embedded(&embedded))] {
+                match result {
+                    Ok(_) => assert!(valid, "{path} {name} accepted"),
+                    Err(error) => {
+                        assert!(!valid, "{path} {name}: {error}");
+                        assert!(error.to_string().contains("AudioPreRoll"), "{path} {name}: {error}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn incompatible_and_unsupported_configurations_are_rejected() {
         let config = UsacConfig::parse(&asc(1, 2, &[preroll, cpe, fill])).unwrap();
         assert_eq!((config.channels, config.elements.len()), (2, 3));
@@ -350,7 +387,6 @@ mod tests {
             (asc(1, 2, &[sce]), "cover"),
             (asc(1, 2, &[fill]), "cover"),
             (asc(1, 2, &[warped]), "time-warped"),
-            (asc(1, 2, &[cpe, preroll]), "AudioPreRoll"),
             (asc(0, 2, &[cpe]), "1024-line"),
             (asc(2, 2, &[cpe]), "1024-line"),
             (asc(3, 2, &[cpe]), "1024-line"),

@@ -17,10 +17,13 @@ ELD and LTP analysis; synthesis windows and transform scratch are reused.
 
 USAC (AOT 42) accepts raw access units with `UsacConfig` in extradata:
 mono/stereo SCE/CPE 1024-line FD with arithmetic spectra, noise filling,
-M/S and complex stereo prediction, and TNS. AudioPreRoll primes a fresh,
+M/S and complex stereo prediction, and TNS. AudioPreRoll, valid only as
+the first element (ISO/IEC 23003-3 UsacExtElementConfig()), primes a fresh,
 reset or reconfigured decoder with its pre-roll AUs (output discarded) and
 applies embedded configuration changes; continuous decoding with an
-unchanged configuration skips it (ISO/IEC 23003-3 7.18.3.3).
+unchanged configuration skips it (ISO/IEC 23003-3 7.18.3.3). A decoder that
+rejects an AU before it is primed rebuilds its cores, so the next
+AudioPreRoll primes it exactly as a fresh decoder.
 applyCrossfade is not applied. Noise filling seeds the first channel 0x3039
 and the second 0x10932 and advances the PRNG even at zero noise level,
 following the ISO reference. FFmpeg 2da55bf leaves the first seed at zero
@@ -1344,9 +1347,9 @@ component still open (see below):
 
 - **USAC beyond mono/stereo 1024-line FD.** LPD/ACELP cores, FAC
   transitions, eSBR (coreSbrFrameLengthIndex other than 1) and therefore
-  MPS212, time-warped MDCT, LFE elements, other layouts, and AudioPreRoll
-  after an audio element or inside a pre-roll AU are rejected with errors.
-  AudioPreRoll's applyCrossfade is ignored.
+  MPS212, time-warped MDCT, LFE elements and other layouts are rejected with
+  errors, as is AudioPreRoll anywhere but the first element or inside a
+  pre-roll AU. AudioPreRoll's applyCrossfade is ignored.
 - **The deployed ER AAC LD `tns_data()` filter record.** The
   ISO/IEC 14496-26 LD conformance bitstreams transmit an
   extra-spec TNS record: the corpus-resolved 1-bit-`n_filt` reading
