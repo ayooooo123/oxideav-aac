@@ -547,11 +547,20 @@ impl Filterbank {
     /// Errors: [`Error::FilterbankInvalid`] if `spec.len()` disagrees
     /// with `ics_info.window_sequence`.
     pub fn synthesize(&mut self, spec: &[f64], ics_info: &IcsInfo) -> Result<Vec<f64>> {
+        self.synthesize_usac(spec, ics_info, false)
+    }
+
+    /// [`Self::synthesize`] for a USAC frame. `stop_start` marks a coded
+    /// `LONG_START_SEQUENCE` that follows an `EIGHT_SHORT`, `LONG_START` or
+    /// `STOP_START` block, which USAC decodes as `STOP_START_SEQUENCE`
+    /// (ISO/IEC 23003-3; the reference decoder's `usacMapWindowSequences`):
+    /// short overlap on both sides.
+    pub(crate) fn synthesize_usac(&mut self, spec: &[f64], ics_info: &IcsInfo, stop_start: bool) -> Result<Vec<f64>> {
         if ics_info.family != self.family {
             return Err(Error::FilterbankInvalid);
         }
         let left_shape = self.prev_shape.unwrap_or(ics_info.window_shape);
-        windowed_signal(self.family, spec, ics_info, left_shape, &mut self.z)?;
+        windowed_signal(self.family, spec, ics_info, left_shape, stop_start, &mut self.z)?;
 
         // §4.6.11.3.3 overlap-add: out[n] = z[i][n] + z[i-1][n + N/2].
         let half = self.family.frame_len();
@@ -576,7 +585,7 @@ impl Filterbank {
     fn windowed_signal(&self, spec: &[f64], ics_info: &IcsInfo) -> Result<Vec<f64>> {
         let mut z = vec![0.0f64; self.family.long_transform_len()];
         let left_shape = self.prev_shape.unwrap_or(ics_info.window_shape);
-        windowed_signal(self.family, spec, ics_info, left_shape, &mut z)?;
+        windowed_signal(self.family, spec, ics_info, left_shape, false, &mut z)?;
         Ok(z)
     }
 
@@ -616,11 +625,13 @@ fn windowed_signal(
     spec: &[f64],
     ics_info: &IcsInfo,
     left_shape: WindowShape,
+    stop_start: bool,
     z: &mut [f64],
 ) -> Result<()> {
     let right_shape = ics_info.window_shape;
     let kind = match ics_info.window_sequence {
         WindowSequence::OnlyLong => LongKind::OnlyLong,
+        WindowSequence::LongStart if stop_start => LongKind::StopStart,
         WindowSequence::LongStart => LongKind::Start,
         WindowSequence::LongStop => LongKind::Stop,
         WindowSequence::EightShort => {
@@ -731,6 +742,8 @@ fn short_windowed(
 ///   short left half-window over `[(N_l − N_s)/4, (N_l + N_s)/4)`, and
 ///   a flat `1.0` plateau over `[(N_l + N_s)/4, N_l/2)`; the right half
 ///   is `W_RIGHT_l`.
+/// * `StopStart` (USAC `STOP_START_SEQUENCE`, ISO/IEC 23003-3):
+///   the `Stop` left half and the `Start` right half.
 fn apply_long_window(
     z: &mut [f64],
     n_s: usize,
@@ -749,7 +762,7 @@ fn apply_long_window(
                 *v *= w;
             }
         }
-        LongKind::Stop => {
+        LongKind::Stop | LongKind::StopStart => {
             let a = (n_l - n_s) / 4;
             let short_left = half_window_style(n_s, left_shape, style);
             head[..a].fill(0.0);
@@ -765,7 +778,7 @@ fn apply_long_window(
                 *v *= w;
             }
         }
-        LongKind::Start => {
+        LongKind::Start | LongKind::StopStart => {
             let b = (3 * n_l - n_s) / 4 - half_l;
             let short_right = half_window_style(n_s, right_shape, style);
             for (v, &w) in tail[b..b + n_s / 2].iter_mut().zip(short_right.iter().rev()) {
@@ -817,13 +830,15 @@ fn build_long_window_style(
     w
 }
 
-/// Discriminates the three long-transform `window_sequence` shapes
-/// inside [`apply_long_window`].
+/// Discriminates the long-transform window shapes inside
+/// [`apply_long_window`]: the three AAC `window_sequence` shapes and
+/// USAC's `STOP_START_SEQUENCE`.
 #[derive(Clone, Copy)]
 enum LongKind {
     OnlyLong,
     Start,
     Stop,
+    StopStart,
 }
 
 #[cfg(test)]

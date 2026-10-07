@@ -22,13 +22,26 @@ reset or reconfigured decoder with its pre-roll AUs (output discarded) and
 applies embedded configuration changes; continuous decoding with an
 unchanged configuration skips it (ISO/IEC 23003-3 7.18.3.3).
 applyCrossfade is not applied. Noise filling seeds the first channel 0x3039
-as libxaac does; FFmpeg 2da55bf leaves it 0 and parses AudioPreRoll as fill,
-so it never primes. On FATE xhe_target_level the fork matches libxaac
-2fbadd5 at 112 dB over the presented samples but FFmpeg's reference only near
-20 dB; which oracle governs that file is unresolved. The optional `target_level` codec option
-(-70..=0 dBFS, FFmpeg's range; 0 disables it) applies program/anchor
-loudness for the unprocessed layout. See "Not yet supported" for the
-rejected and unverified USAC tools.
+and the second 0x10932 and advances the PRNG even at zero noise level,
+following the ISO reference. FFmpeg 2da55bf leaves the first seed at zero
+and parses AudioPreRoll as fill, so it never primes. Unmodified FATE
+xhe_target_level is therefore checked against native libxaac 2fbadd5:
+112.04–112.19 dB per channel over all raw PCM at target -24, rather than
+FFmpeg's defective output near 20 dB. The optional `target_level` codec
+option (-70..=0 dBFS; 0 disables it) applies program/anchor loudness for
+the unprocessed layout.
+
+Complex prediction recomputes MDST per window with saved final spectra,
+distinct current/previous filters, and integer per-band alpha history.
+TNS applies with independent windows for either `tns_on_lr` value.
+STOP_START windows retain short overlap on both sides. Sixteen unmodified
+ISO/IEC 23003-7 vectors at 7350 and 44100 Hz measure 108.53–123.22 dB per
+channel against the ISO presentation PCM and 98.43–108.39 dB against full
+raw native libxaac output. A separate independent-window TNS equivalence
+fixture matches native output at 106.11/104.10 dB; both bitstream variants
+decode identically. Exact commands, hashes, raw/presented boundaries and
+measured-minus-0.5 dB floors live in the media workspace's
+`crates/check-aac/tests/data/{iso-usac,libxaac}`.
 
 USAC and two ELD MP4 fixtures still need container-provided sample trimming;
 the decoder deliberately retains its complete raw PCM. The workspace's
@@ -1334,13 +1347,6 @@ component still open (see below):
   MPS212, time-warped MDCT, LFE elements, other layouts, and AudioPreRoll
   after an audio element or inside a pre-roll AU are rejected with errors.
   AudioPreRoll's applyCrossfade is ignored.
-- **Unverified USAC paths.** Complex prediction with `complex_coef = 1`
-  (its MDST estimate accumulates across frames and `use_prev_frame` builds
-  the previous downmix from current spectra) and channel-pair TNS with
-  `common_window = 0` and `tns_on_lr = 0` (not applied) mirror FFmpeg
-  2da55bf. These look suspicious, but no available conformance vector
-  exercises them (the `check-aac` coverage counts are zero) and no normative
-  text or independent decoder output was available to settle them.
 - **The deployed ER AAC LD `tns_data()` filter record.** The
   ISO/IEC 14496-26 LD conformance bitstreams transmit an
   extra-spec TNS record: the corpus-resolved 1-bit-`n_filt` reading

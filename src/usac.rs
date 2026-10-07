@@ -14,11 +14,11 @@
 //!
 //! AudioPreRoll follows ISO/IEC 23003-3 7.18.3 and FFmpeg's
 //! `parse_audio_preroll` (which FFmpeg 2da55bf never reaches: its config
-//! parser turns the element into fill). Complex prediction with
-//! `complex_coef = 1` (persistent MDST estimate, previous downmix from the
-//! current spectra) and channel-pair TNS with `common_window = 0` and
-//! `tns_on_lr = 0` (not applied) mirror FFmpeg; [`ToolCounts`] records
-//! whether a stream exercises them.
+//! parser turns the element into fill). Complex prediction, STOP_START
+//! windows and zero-level noise filling follow ISO reference semantics
+//! and independently decoded conformance PCM, rather than FFmpeg's
+//! defective paths. TNS also applies with independent windows regardless
+//! of `tns_on_lr`; [`ToolCounts`] records actual tool use.
 
 use std::collections::VecDeque;
 use std::sync::LazyLock;
@@ -32,7 +32,7 @@ use crate::scale_factor_data::hcod_sf_decode;
 use crate::swb_offset::{FrameFamily, long_window_offsets, short_window_offsets};
 use crate::usac_arith;
 use crate::usac_config::{escaped, ElementConfig, UsacConfig, EXT_AUDIO_PREROLL};
-use crate::usac_tables::{MDST_FILTERS, TNS_REFLECTION};
+use crate::usac_tables::{MDST_CURRENT, MDST_PREVIOUS, TNS_REFLECTION};
 
 const N: usize = 1024;
 const MAX_BANDS: usize = 128;
@@ -43,7 +43,7 @@ const TNS_SHORT: [usize; 12] = [9, 9, 10, 14, 14, 14, 15, 15, 15, 15, 15, 15];
 static SCALE_FACTORS: LazyLock<[f32; 428]> = LazyLock::new(||
     std::array::from_fn(|i| 2.0f64.powf((i as f64 - 200.0) * 0.25) as f32));
 static NOISE_LEVELS: LazyLock<[f32; 8]> = LazyLock::new(||
-    std::array::from_fn(|i| 2.0f32.powf((i as f32 - 14.0) / 3.0)));
+    std::array::from_fn(|i| if i == 0 { 0.0 } else { 2.0f32.powf((i as f32 - 14.0) / 3.0) }));
 
 fn codec_error(error: crate::Error) -> Error {
     Error::invalid(format!("AAC USAC: {error}"))
@@ -72,15 +72,22 @@ pub struct ToolCounts {
     pub noise_filled_channels: u64,
     /// Channels with at least one TNS filter of nonzero order.
     pub tns_channels: u64,
-    /// Of those, channel-pair channels with `common_window = 0` and
-    /// `tns_on_lr = 0`, whose filters are not applied (as in FFmpeg).
-    pub tns_unapplied: u64,
+    /// Of those, channel-pair channels with `common_window = 0`.
+    pub tns_independent_channels: u64,
+    /// Of those, channels whose pair signals `tns_on_lr = 0`.
+    pub tns_independent_not_on_lr: u64,
     /// Channel pairs with mid/side stereo (`ms_mask_present` 1 or 2).
     pub ms_frames: u64,
     /// Channel pairs with complex prediction (`ms_mask_present` 3).
     pub prediction_frames: u64,
+    /// Complex prediction with `delta_code_time = 1`.
+    pub delta_time_frames: u64,
     /// Complex prediction with `complex_coef = 1`.
     pub complex_coef_frames: u64,
+    /// Of those, frames with a nonzero imaginary coefficient in a used band.
+    pub imaginary_frames: u64,
+    /// Of those, frames coded as eight short windows.
+    pub imaginary_short_frames: u64,
     /// Complex prediction with `use_prev_frame = 1`.
     pub previous_frame_frames: u64,
 }
@@ -334,7 +341,9 @@ struct Channel {
     ics: IcsInfo,
     previous_sequence: WindowSequence,
     previous_shape: WindowShape,
-    previous_groups: usize,
+    /// A coded LONG_START decoded as STOP_START_SEQUENCE: it follows an
+    /// EIGHT_SHORT, LONG_START or STOP_START block.
+    stop_start: bool,
     arith: usac_arith::State,
     spectrum: [f32; N],
     scalefactors: [i16; MAX_BANDS],
@@ -371,12 +380,13 @@ impl Channel {
             },
             previous_sequence: WindowSequence::OnlyLong,
             previous_shape: WindowShape::Sine,
-            previous_groups: 1,
+            stop_start: false,
             arith: usac_arith::State::default(),
             spectrum: [0.0; N],
             scalefactors: [0; MAX_BANDS],
-            // libxaac ixheaacd_create.c seeds a CPE's channels 0x3039 and
-            // 0x10932 and an SCE 0x3039; FFmpeg's `if (!ch)` leaves ch0 at 0.
+            // ISO/IEC 23003-3 reference decoder (decoder_usac.c) and libxaac
+            // seed an element's first channel 0x3039 and a CPE's second
+            // 0x10932; FFmpeg's `if (!ch)` leaves the first at 0.
             noise_seed: if channel == 1 { 0x10932 } else { 0x3039 },
             tns: Tns::default(),
             filterbank: Filterbank::new(),
@@ -388,12 +398,15 @@ impl Channel {
     fn remember_window(&mut self) {
         self.previous_sequence = self.ics.window_sequence;
         self.previous_shape = self.ics.window_shape;
-        self.previous_groups = self.ics.num_window_groups as usize;
     }
 
     fn read_ics(&mut self, bits: &mut BitReader<'_>, rate_index: u8) -> Result<()> {
         self.remember_window();
         self.ics.window_sequence = WindowSequence::from_bits(bits.read_u32(2)? as u8);
+        // A coded STOP_START is LONG_START after a short-overlap right half
+        // (the reference's usacMapWindowSequences).
+        self.stop_start = self.ics.window_sequence == WindowSequence::LongStart
+            && matches!(self.previous_sequence, WindowSequence::EightShort | WindowSequence::LongStart);
         self.ics.window_shape = WindowShape::from_bit(bits.read_bit()?);
         self.ics.max_sfb = bits.read_u32(if self.ics.window_sequence.is_eight_short() { 4 } else { 6 })? as u8;
         self.ics.scale_factor_grouping = if self.ics.window_sequence.is_eight_short() { Some(bits.read_u32(7)? as u8) } else { None };
@@ -436,15 +449,18 @@ impl Channel {
         Ok(())
     }
 
-    fn scale(&mut self, rate_index: u8, noise_level: usize, noise_offset: i16) -> Result<()> {
+    fn scale(&mut self, rate_index: u8, noise_fill: Option<(usize, i16)>) -> Result<()> {
         let swb = offsets(&self.ics, rate_index)?;
         let noise_start = if self.ics.window_sequence.is_eight_short() { 20 } else { 160 };
+        let (noise_level, noise_offset) = noise_fill.unwrap_or((0, 0));
         let noise = NOISE_LEVELS[noise_level];
         let mut base = 0;
         for (g, &group_length) in self.ics.window_group_length.iter().enumerate() {
             for band in 0..self.ics.max_sfb as usize {
                 let scale_index = g * self.ics.max_sfb as usize + band;
-                if noise_level != 0 && swb[band] as usize >= noise_start {
+                // A zero noise level still advances the random sequence.
+                // Only the configuration flag disables noise filling.
+                if noise_fill.is_some() && swb[band] as usize >= noise_start {
                     let mut all_zero = true;
                     for w in 0..group_length as usize {
                         for k in swb[band] as usize..swb[band + 1] as usize {
@@ -473,7 +489,7 @@ impl Channel {
 
     fn synthesize(&mut self) -> Result<()> {
         for (dst, &src) in self.transform.iter_mut().zip(&self.spectrum) { *dst = src as f64; }
-        self.pcm = self.filterbank.synthesize(&self.transform, &self.ics).map_err(codec_error)?;
+        self.pcm = self.filterbank.synthesize_usac(&self.transform, &self.ics, self.stop_start).map_err(codec_error)?;
         Ok(())
     }
 }
@@ -509,9 +525,9 @@ impl Core {
         for (ch, channel) in self.channels.iter_mut().enumerate() {
             if channel_count == 1 { tns_present[ch] = bits.read_bit()?; }
             let gain = bits.read_u32(8)?;
-            let (noise_level, noise_offset) = if noise_fill {
-                (bits.read_u32(3)? as usize, bits.read_u32(5)? as i16 - 16)
-            } else { (0, 0) };
+            let noise = if noise_fill {
+                Some((bits.read_u32(3)? as usize, bits.read_u32(5)? as i16 - 16))
+            } else { None };
             if !self.stereo.common { channel.read_ics(bits, rate_index)?; }
             channel.scalefactors(bits, gain)?;
             if tns_present[ch] { channel.tns.parse(bits, &channel.ics)?; }
@@ -523,15 +539,17 @@ impl Core {
                 channel.arith.spectrum(bits, reset && w == 0, len, spectrum)?;
             }
             if bits.read_bit()? { return Err(Error::unsupported("AAC USAC: FAC transition from an LPD core")); }
-            channel.scale(rate_index, noise_level, noise_offset)?;
+            channel.scale(rate_index, noise)?;
             stats.short_window_channels += u64::from(channel.ics.window_sequence.is_eight_short());
-            stats.noise_filled_channels += u64::from(noise_level != 0);
+            stats.noise_filled_channels += u64::from(noise.is_some_and(|(level, _)| level != 0));
         }
         for ch in 0..channel_count {
             let tns = if self.stereo.common_tns { &self.channels[0].tns } else { &self.channels[ch].tns };
             if (tns_present[ch] || self.stereo.common_tns) && tns.active() {
                 stats.tns_channels += 1;
-                stats.tns_unapplied += u64::from(channel_count == 2 && !self.stereo.common && !self.stereo.tns_on_lr);
+                let independent = channel_count == 2 && !self.stereo.common;
+                stats.tns_independent_channels += u64::from(independent);
+                stats.tns_independent_not_on_lr += u64::from(independent && !self.stereo.tns_on_lr);
             }
         }
         if channel_count == 2 && self.stereo.common {
@@ -539,21 +557,33 @@ impl Core {
                 1 | 2 => stats.ms_frames += 1,
                 3 => {
                     stats.prediction_frames += 1;
+                    stats.delta_time_frames += u64::from(self.stereo.delta_time);
                     stats.complex_coef_frames += u64::from(self.stereo.complex_coef);
+                    let count = self.channels[0].ics.num_window_groups as usize * self.stereo.max_sfb;
+                    let imaginary = self.stereo.complex_coef
+                        && self.stereo.used[..count].iter().zip(&self.stereo.alpha_im[..count]).any(|(&used, &im)| used && im != 0);
+                    stats.imaginary_frames += u64::from(imaginary);
+                    stats.imaginary_short_frames += u64::from(imaginary && self.channels[0].ics.window_sequence.is_eight_short());
                     stats.previous_frame_frames += u64::from(self.stereo.use_previous);
                 }
                 _ => {}
             }
         }
-        if self.channels.len() == 2 && self.stereo.common {
+        if channel_count == 2 {
+            // The reference orders TNS and stereo processing by tns_on_lr
+            // alone: with independent windows there is no stereo stage, but
+            // tns_on_lr = 0 still applies TNS (FFmpeg 2da55bf skips it).
             if !self.stereo.tns_on_lr { self.apply_tns(rate_index)?; }
             self.stereo.apply(&mut self.channels, rate_index)?;
+            if self.stereo.mode != 3 {
+                self.stereo.alpha_prev_re.fill(0);
+                self.stereo.alpha_prev_im.fill(0);
+            }
+            if self.stereo.tns_on_lr { self.apply_tns(rate_index)?; }
+            self.stereo.save(&self.channels);
+        } else {
+            self.apply_tns(rate_index)?;
         }
-        if channel_count == 2 {
-            self.stereo.prev_re.copy_from_slice(&self.stereo.re);
-            self.stereo.prev_im.copy_from_slice(&self.stereo.im);
-        }
-        if self.channels.len() == 1 || self.stereo.tns_on_lr { self.apply_tns(rate_index)?; }
         for channel in &mut self.channels { channel.synthesize()?; }
         Ok(())
     }
@@ -570,40 +600,54 @@ impl Core {
     }
 }
 
+/// Scalefactor bands of one window group (`max_sfb` is at most six bits).
+const MAX_SFB: usize = 64;
+
+/// StereoCoreToolInfo() state of a channel pair: mid/side and complex
+/// prediction (ISO/IEC 23003-3), following the ISO reference decoder
+/// (`usac_cplx_pred.c`, `decode_chan_ele.c`).
 struct Stereo {
     common: bool,
     common_tns: bool,
     tns_on_lr: bool,
+    /// `ms_mask_present`; 0 for independent windows.
     mode: u32,
+    /// `max_sfb_ste`.
     max_sfb: usize,
+    /// `ms_used` / `cplx_pred_used` per `group * max_sfb + sfb`.
     used: [bool; MAX_BANDS],
+    /// `pred_dir`: the transmitted downmix is the side signal.
     direction: bool,
     complex_coef: bool,
     use_previous: bool,
-    re: [f32; MAX_BANDS],
-    im: [f32; MAX_BANDS],
-    prev_re: [f32; MAX_BANDS],
-    prev_im: [f32; MAX_BANDS],
-    downmix_im: [f32; N],
+    delta_time: bool,
+    /// `alpha_q_re` / `alpha_q_im` (units of 0.1) per `group * max_sfb + sfb`.
+    alpha_re: [i32; MAX_BANDS],
+    alpha_im: [i32; MAX_BANDS],
+    /// `alpha_q_*_prev`: the last parsed group's coefficients per band, the
+    /// `delta_code_time` predictor; cleared by any other stereo mode.
+    alpha_prev_re: [i32; MAX_SFB],
+    alpha_prev_im: [i32; MAX_SFB],
+    /// `coefSave`: each channel's final spectrum in its frame's last window,
+    /// from which the next frame derives the previous downmix.
+    saved: [[f32; N]; 2],
 }
 
 impl Default for Stereo {
     fn default() -> Self {
         Self { common: false, common_tns: false, tns_on_lr: false, mode: 0, max_sfb: 0,
-            used: [false; MAX_BANDS], direction: false, complex_coef: false, use_previous: false,
-            re: [0.0; MAX_BANDS], im: [0.0; MAX_BANDS], prev_re: [0.0; MAX_BANDS],
-            prev_im: [0.0; MAX_BANDS], downmix_im: [0.0; N] }
+            used: [false; MAX_BANDS], direction: false, complex_coef: false, use_previous: false, delta_time: false,
+            alpha_re: [0; MAX_BANDS], alpha_im: [0; MAX_BANDS], alpha_prev_re: [0; MAX_SFB],
+            alpha_prev_im: [0; MAX_SFB], saved: [[0.0; N]; 2] }
     }
 }
 
 impl Stereo {
     fn parse(&mut self, bits: &mut BitReader<'_>, channels: &mut [Channel], independent: bool, rate_index: u8, tns_present: &mut [bool; 2]) -> Result<()> {
-        self.re.fill(0.0);
-        self.im.fill(0.0);
         self.used.fill(false);
+        self.mode = 0;
         let tns_active = bits.read_bit()?;
         self.common = bits.read_bit()?;
-        if !self.common || independent { self.prev_re.fill(0.0); self.prev_im.fill(0.0); }
         if self.common {
             let (first, rest) = channels.split_at_mut(1);
             let left = &mut first[0];
@@ -614,21 +658,21 @@ impl Stereo {
             right.ics.window_shape = left.ics.window_shape;
             right.ics.max_sfb = left.ics.max_sfb;
             right.ics.scale_factor_grouping = left.ics.scale_factor_grouping;
+            // The reference maps the shared sequence with the first channel's
+            // history.
+            right.stop_start = left.stop_start;
             if !bits.read_bit()? {
                 right.ics.max_sfb = bits.read_u32(if right.ics.window_sequence.is_eight_short() { 4 } else { 6 })? as u8;
             }
             right.setup_ics(rate_index)?;
-            if [left, right].iter().any(|ch| ch.ics.window_sequence.is_eight_short() != ch.previous_sequence.is_eight_short()) {
-                self.prev_re.fill(0.0);
-                self.prev_im.fill(0.0);
-            }
-            self.max_sfb = channels[0].ics.max_sfb.max(channels[1].ics.max_sfb) as usize;
+            self.max_sfb = left.ics.max_sfb.max(right.ics.max_sfb) as usize;
+            let groups = left.ics.num_window_groups as usize;
+            let count = groups * self.max_sfb;
             self.mode = bits.read_u32(2)?;
-            let count = channels[0].ics.num_window_groups as usize * self.max_sfb;
             match self.mode {
                 1 => for used in &mut self.used[..count] { *used = bits.read_bit()?; },
                 2 => self.used[..count].fill(true),
-                3 => self.parse_prediction(bits, &channels[0], independent)?,
+                3 => self.parse_prediction(bits, groups, independent)?,
                 _ => {}
             }
         }
@@ -649,44 +693,51 @@ impl Stereo {
         Ok(())
     }
 
-    fn parse_prediction(&mut self, bits: &mut BitReader<'_>, left: &Channel, independent: bool) -> Result<()> {
-        let groups = left.ics.num_window_groups as usize;
-        if bits.read_bit()? { self.used[..groups * self.max_sfb].fill(true); } else {
+    /// cplx_pred_data(): coefficients are integer DPCM, predicted from the
+    /// lower band or, with `delta_code_time`, from the same band of the
+    /// last parsed group.
+    fn parse_prediction(&mut self, bits: &mut BitReader<'_>, groups: usize, independent: bool) -> Result<()> {
+        let max_sfb = self.max_sfb;
+        if bits.read_bit()? {
+            self.used[..groups * max_sfb].fill(true);
+        } else {
             for g in 0..groups {
-                for sfb in (0..self.max_sfb).step_by(2) {
+                for sfb in (0..max_sfb).step_by(2) {
                     let used = bits.read_bit()?;
-                    self.used[g * self.max_sfb + sfb] = used;
-                    if sfb + 1 < self.max_sfb { self.used[g * self.max_sfb + sfb + 1] = used; }
+                    self.used[g * max_sfb + sfb] = used;
+                    if sfb + 1 < max_sfb { self.used[g * max_sfb + sfb + 1] = used; }
                 }
             }
         }
         self.direction = bits.read_bit()?;
-        let complex = bits.read_bit()?;
-        self.complex_coef = complex;
-        self.use_previous = complex && !independent && bits.read_bit()?;
-        let delta_time = !independent && bits.read_bit()?;
+        self.complex_coef = bits.read_bit()?;
+        self.use_previous = self.complex_coef && !independent && bits.read_bit()?;
+        self.delta_time = !independent && bits.read_bit()?;
+        let delta = |bits: &mut BitReader<'_>| hcod_sf_decode(bits).map(i32::from).map_err(codec_error);
         for g in 0..groups {
-            for sfb in (0..self.max_sfb).step_by(2) {
-                let index = g * self.max_sfb + sfb;
-                let (mut re, mut im) = if delta_time {
-                    if g != 0 { (self.re[index - self.max_sfb], self.im[index - self.max_sfb]) }
-                    else {
-                        let previous_group = if left.ics.window_sequence.is_eight_short() && left.previous_sequence.is_eight_short() { left.previous_groups - 1 } else { 0 };
-                        let p = previous_group * self.max_sfb + sfb;
-                        (self.prev_re[p], self.prev_im[p])
-                    }
-                } else if sfb != 0 { (self.re[index - 1], self.im[index - 1]) } else { (0.0, 0.0) };
-                if self.used[index] {
-                    re += -(hcod_sf_decode(bits).map_err(codec_error)? as f32) * 0.1;
-                    if complex { im += -(hcod_sf_decode(bits).map_err(codec_error)? as f32) * 0.1; }
-                    self.re[index] = re;
-                    self.im[index] = im;
+            for sfb in (0..max_sfb).step_by(2) {
+                let index = g * max_sfb + sfb;
+                let (last_re, last_im) = if self.delta_time {
+                    (self.alpha_prev_re[sfb], self.alpha_prev_im[sfb])
+                } else if sfb > 0 {
+                    (self.alpha_re[index - 1], self.alpha_im[index - 1])
+                } else { (0, 0) };
+                let (re, im) = if self.used[index] {
+                    let re = last_re.saturating_sub(delta(bits)?);
+                    let im = if self.complex_coef { last_im.saturating_sub(delta(bits)?) } else { 0 };
+                    (re, im)
+                } else { (0, 0) };
+                self.alpha_re[index] = re;
+                self.alpha_im[index] = im;
+                if sfb + 1 < max_sfb {
+                    self.alpha_re[index + 1] = re;
+                    self.alpha_im[index + 1] = im;
                 }
-                if sfb + 1 < self.max_sfb {
-                    self.re[index + 1] = self.re[index];
-                    self.im[index + 1] = self.im[index];
-                }
+                self.alpha_prev_re[sfb] = re;
+                self.alpha_prev_im[sfb] = im;
             }
+            self.alpha_prev_re[max_sfb..].fill(0);
+            self.alpha_prev_im[max_sfb..].fill(0);
         }
         Ok(())
     }
@@ -697,81 +748,122 @@ impl Stereo {
         let left = &mut first[0];
         let right = &mut rest[0];
         let swb = offsets(&left.ics, rate_index)?;
-        if self.mode == 3 {
-            let mut current = [0.0f32; N];
-            let mut previous = [0.0f32; N];
-            let sign = if self.direction { -1.0 } else { 1.0 };
-            let mut base = 0;
-            for (g, &length) in left.ics.window_group_length.iter().enumerate() {
-                for sfb in 0..self.max_sfb {
-                    for w in 0..length as usize {
-                        for k in swb[sfb] as usize..swb[sfb + 1] as usize {
-                            let index = base + w * 128 + k;
-                            // Match aacdec_usac.c's downmix_prev, which uses
-                            // this frame's coefficients before prediction.
-                            let downmix = (0.5f64 * (left.spectrum[index] + sign * right.spectrum[index]) as f64) as f32;
-                            previous[index] = downmix;
-                            current[index] = if self.used[g * self.max_sfb + sfb] { downmix } else { left.spectrum[index] };
-                        }
-                    }
-                }
-                base += length as usize * 128;
-            }
-            let window = match left.ics.window_sequence { WindowSequence::LongStart => 1, WindowSequence::LongStop => 2, _ => 0 };
-            let shape = match (left.ics.window_shape, left.previous_shape) {
-                (WindowShape::Sine, WindowShape::Sine) => 0,
-                (WindowShape::Kbd, WindowShape::Kbd) => 1,
-                (WindowShape::Sine, WindowShape::Kbd) => 2,
-                (WindowShape::Kbd, WindowShape::Sine) => 3,
-            };
-            // As in FFmpeg, the MDST estimate accumulates across frames.
-            interpolate_imag(&mut self.downmix_im, &current, &MDST_FILTERS[window][shape], 1.0);
-            if self.use_previous {
-                let window = usize::from(left.ics.window_sequence == WindowSequence::LongStop);
-                interpolate_imag(&mut self.downmix_im, &previous, &MDST_FILTERS[window][left.previous_shape as usize], -1.0);
+        let windows = left.ics.num_windows as usize;
+        let bins = N / windows;
+        let mut group = [0usize; 8];
+        let mut w = 0;
+        for (g, &length) in left.ics.window_group_length.iter().enumerate() {
+            for _ in 0..length {
+                *group.get_mut(w).ok_or_else(|| Error::invalid("AAC USAC: window grouping exceeds eight windows"))? = g;
+                w += 1;
             }
         }
-        let mut base = 0;
-        for (g, &length) in left.ics.window_group_length.iter().enumerate() {
+        if self.mode != 3 {
+            for (w, &g) in group[..windows].iter().enumerate() {
+                for sfb in 0..self.max_sfb {
+                    if !self.used[g * self.max_sfb + sfb] { continue; }
+                    for i in w * bins + swb[sfb] as usize..w * bins + swb[sfb + 1] as usize {
+                        let (a, b) = (left.spectrum[i], right.spectrum[i]);
+                        left.spectrum[i] = a + b;
+                        right.spectrum[i] = a - b;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let mut downmix_im = [0.0f32; N];
+        if self.complex_coef {
+            // The real downmix is the transmitted first channel in used
+            // bands, otherwise it is formed from the decoded L/R pair.
+            let sign = if self.direction { -1.0f32 } else { 1.0 };
+            let mut downmix = [0.0f32; N];
+            for (w, &g) in group[..windows].iter().enumerate() {
+                let window = w * bins..(w + 1) * bins;
+                for ((d, &l), &r) in downmix[window.clone()].iter_mut().zip(&left.spectrum[window.clone()]).zip(&right.spectrum[window]) {
+                    *d = 0.5 * (l + sign * r);
+                }
+                for sfb in 0..self.max_sfb {
+                    if self.used[g * self.max_sfb + sfb] {
+                        let band = w * bins + swb[sfb] as usize..w * bins + swb[sfb + 1] as usize;
+                        downmix[band.clone()].copy_from_slice(&left.spectrum[band]);
+                    }
+                }
+            }
+            // MDST is recomputed per window, with optional previous-frame
+            // history and unconditional history between short windows.
+            let (kind, previous_kind) = match left.ics.window_sequence {
+                WindowSequence::OnlyLong | WindowSequence::EightShort => (0, 0),
+                WindowSequence::LongStart if left.stop_start => (3, 1),
+                WindowSequence::LongStart => (1, 0),
+                WindowSequence::LongStop => (2, 1),
+            };
+            let shape = left.ics.window_shape as usize;
+            let mut previous_shape = left.previous_shape as usize;
+            let mut previous_frame = [0.0f32; N];
+            if self.use_previous {
+                let offset = N - bins;
+                for (k, p) in previous_frame[..bins].iter_mut().enumerate() {
+                    *p = 0.5 * (self.saved[0][offset + k] + sign * self.saved[1][offset + k]);
+                }
+            }
+            for w in 0..windows {
+                let current = &downmix[w * bins..(w + 1) * bins];
+                let previous = if w == 0 { self.use_previous.then_some(&previous_frame[..bins]) } else { Some(&downmix[(w - 1) * bins..w * bins]) };
+                let estimate = &mut downmix_im[w * bins..(w + 1) * bins];
+                filter_and_add(current, &MDST_CURRENT[kind][previous_shape][shape], estimate, 1.0);
+                if let Some(previous) = previous {
+                    filter_and_add(previous, &MDST_PREVIOUS[previous_kind][previous_shape], estimate, -1.0);
+                }
+                previous_shape = shape;
+            }
+        }
+        for (w, &g) in group[..windows].iter().enumerate() {
             for sfb in 0..self.max_sfb {
                 let band = g * self.max_sfb + sfb;
                 if !self.used[band] { continue; }
-                for w in 0..length as usize {
-                    for k in swb[sfb] as usize..swb[sfb + 1] as usize {
-                        let index = base + w * 128 + k;
-                        let a = left.spectrum[index];
-                        let b = right.spectrum[index];
-                        if self.mode == 3 {
-                            let predicted = b - self.re[band] * a - self.im[band] * self.downmix_im[index];
-                            left.spectrum[index] = a + predicted;
-                            right.spectrum[index] = if self.direction { predicted - a } else { a - predicted };
-                        } else {
-                            left.spectrum[index] = a + b;
-                            right.spectrum[index] = a - b;
-                        }
+                let alpha_re = self.alpha_re[band] as f32 * 0.1;
+                let alpha_im = if self.complex_coef { self.alpha_im[band] as f32 * 0.1 } else { 0.0 };
+                for i in w * bins + swb[sfb] as usize..w * bins + swb[sfb + 1] as usize {
+                    let (l, r) = (left.spectrum[i], right.spectrum[i]);
+                    let residual = r - alpha_re * l - alpha_im * downmix_im[i];
+                    if self.direction {
+                        right.spectrum[i] = residual - l;
+                        left.spectrum[i] = residual + l;
+                    } else {
+                        right.spectrum[i] = l - residual;
+                        left.spectrum[i] = l + residual;
                     }
                 }
             }
-            base += length as usize * 128;
         }
         Ok(())
     }
+
+    /// usac_cplx_save_prev(): keep each channel's final spectrum in the
+    /// frame's last window, laid out by the last channel's window as in the
+    /// reference (for independent windows the two may differ).
+    fn save(&mut self, channels: &[Channel]) {
+        let bins = if channels[channels.len() - 1].ics.window_sequence.is_eight_short() { N / 8 } else { N };
+        for (saved, channel) in self.saved.iter_mut().zip(channels) {
+            saved[N - bins..].copy_from_slice(&channel.spectrum[N - bins..]);
+        }
+    }
 }
 
-/// Seven-tap MDCT-to-MDST interpolation with the reference's reflected
-/// endpoint samples. Even taps can be negated for previous-frame prediction.
-fn interpolate_imag(im: &mut [f32; N], re: &[f32; N], filter: &[f32; 7], even: f32) {
-    for i in 0..N {
-        let mut value = 0.0;
+/// The reference's filterAndAdd(): seven-tap MDCT-to-MDST estimation over
+/// one window with reflected endpoints, added to `estimate`. Even bins are
+/// scaled by `even`, odd bins by 1.
+fn filter_and_add(input: &[f32], filter: &[f32; 7], estimate: &mut [f32], even: f32) {
+    let n = input.len() as isize;
+    for (i, out) in estimate.iter_mut().enumerate() {
+        let mut value = 0.0f32;
         for tap in 0..7 {
             let position = i as isize + tap as isize - 3;
-            let index = if position < 0 { (-position - 1) as usize }
-                else if position >= N as isize { (2 * N as isize - 1 - position) as usize }
-                else { position as usize };
-            let term = filter[6 - tap] * re[index];
-            if tap == 0 { value = term; } else { value += term; }
+            let index = if position < 0 { -position - 1 } else if position >= n { 2 * n - 1 - position } else { position };
+            let term = filter[6 - tap] * input[index as usize];
+            value = if tap == 0 { term } else { value + term };
         }
-        im[i] += value * if i % 2 == 0 { even } else { 1.0 };
+        *out += value * if i % 2 == 0 { even } else { 1.0 };
     }
 }
 

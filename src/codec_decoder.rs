@@ -112,7 +112,7 @@ pub const WAVE_FORMAT_MPEG_ADTS_AAC: u16 = 0x1601;
 ///   (ISO/IEC 14496-14 §3.1.2 / §5.6: a sample is one AU, no ADTS
 ///   header). USAC (AOT 42) uses [`crate::usac_config::UsacConfig`]
 ///   and the 1024-line mono/stereo FD core. Its optional `target_level`
-///   codec option selects loudness normalization (-63..=0 dBFS, with
+///   codec option selects loudness normalization (-70..=0 dBFS, with
 ///   0 disabling normalization). Other AAC profiles also accept a packet
 ///   that is nevertheless a complete ADTS frame as ADTS.
 /// * **In-band configuration** — ADTS frames or a LOAS

@@ -13,20 +13,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   noise filling, grouped short windows, MS/complex stereo prediction and
   USAC's four-bit long-window TNS orders. AudioPreRoll primes fresh, reset
   or reconfigured decoders and applies embedded configuration changes; it
-  is skipped during continuous decoding (ISO/IEC 23003-3 7.18.3.3). Noise
-  filling seeds the first channel 0x3039 as libxaac does (FFmpeg 2da55bf
-  leaves it 0). FATE xhe_target_level matches libxaac 2fbadd5 at 112 dB but
-  FFmpeg 2da55bf, which never primes, only near 20 dB (unresolved). Optional
-  `target_level` (-70..=0 dBFS, FFmpeg's range)
-  applies program/anchor loudness for the unprocessed layout; extension
-  payloads are length-bounded. This is an LGPL-2.1-or-later port of FFmpeg
-  `aacdec_usac.c` / `aacdec_ac.c` and their tables at 2da55bf.
-  LPD/ACELP, FAC transitions, eSBR/MPS212, time-warped MDCT, LFE elements
-  and other layouts are explicit unsupported errors. Complex prediction
-  with `complex_coef = 1` and channel-pair TNS with `common_window = 0`
-  and `tns_on_lr = 0` mirror FFmpeg but are unverified: no available
-  vector exercises them. MP4 presentation trimming still requires packet
-  side data from the container, not a codec latency adjustment.
+  is skipped during continuous decoding (ISO/IEC 23003-3 7.18.3.3).
+  Noise filling uses ISO/libxaac channel seeds and advances the PRNG even
+  at zero noise level. Complex prediction uses per-band integer alpha
+  history, recomputed MDST and saved previous-frame spectra with distinct
+  current/previous filters. Independent-window TNS is applied for either
+  `tns_on_lr` value; STOP_START uses short overlap on both sides.
+  Sixteen unmodified ISO conformance vectors measure 108.53–123.22 dB per
+  channel against ISO PCM and 98.43–108.39 dB against full raw libxaac PCM.
+  A separate independent-TNS equivalence fixture matches at 106.11/104.10
+  dB. FATE xhe_target_level uses the ratified native libxaac reference,
+  with 112.04–112.19 dB over every raw sample at target -24; FFmpeg
+  2da55bf's missing priming/wrong first-channel seed make it unsuitable
+  as the oracle for that file. All other FFmpeg floors are unchanged.
+  Optional `target_level` (-70..=0 dBFS) applies program/anchor loudness
+  for the unprocessed layout; extension payloads are length-bounded.
+  The original LGPL-2.1-or-later FFmpeg port is corrected against
+  independent reference semantics and PCM. LPD/ACELP, FAC transitions,
+  eSBR/MPS212, time-warped MDCT, LFE elements and other layouts remain
+  unsupported. MP4 presentation trimming still requires container
+  metadata, not a codec latency adjustment.
 - The crate forbids `unsafe` code.
 - ER AAC ELD (AOT 39) decoding: `ELDSpecificConfig` parsing (low-delay
   SBR and the resilience tools are rejected, as FFmpeg does), the ELD
