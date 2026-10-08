@@ -15,6 +15,14 @@ The PearTube runtime decoder emits interleaved F32. Its MDCT/IMDCT uses
 cached mixed-radix FFT plans for all supported frame families, including
 ELD and LTP analysis; synthesis windows and transform scratch are reused.
 
+AAC channel pairs without joint-stereo tools keep independent window
+sequences, grouping and band counts. PNS and Main prediction use each
+channel's own geometry; M/S and intensity still require matching geometry.
+The independent-window regression exercises long/short transitions and
+overlap without dropping either channel's output. The FFmpeg-generated
+30-second LC stereo and 5.1 performance inputs decode every access unit,
+at 138.27 and 138.56 dB against FFmpeg 2da55bf's C path.
+
 USAC (AOT 42) accepts raw access units with `UsacConfig` in extradata:
 mono/stereo SCE/CPE 1024-line FD with arithmetic spectra, noise filling,
 M/S and complex stereo prediction, and TNS. AudioPreRoll, valid only as

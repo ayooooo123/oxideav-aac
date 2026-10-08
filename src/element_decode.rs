@@ -86,7 +86,7 @@ use crate::filterbank::Filterbank;
 use crate::eld_filterbank::EldFilterbank;
 use crate::ics_body::IcsBody;
 use crate::ics_info::IcsInfo;
-use crate::intensity_stereo::{apply_intensity_stereo, IntensityPairSpectra};
+use crate::intensity_stereo::{apply_intensity_stereo, is_intensity, IntensityPairSpectra};
 use crate::ltp::LtpState;
 use crate::ms_stereo::{apply_ms_stereo, ChannelPairSpectra, MsMaskPresent};
 use crate::pns::{apply_pns, gen_rand_vector, PnsChannel};
@@ -776,13 +776,16 @@ impl ElementDecoder {
         left_coupling: &[CouplingApply<'_>],
         right_coupling: &[CouplingApply<'_>],
     ) -> Result<(Vec<f64>, Vec<f64>)> {
-        // The §4.6.8 joint-stereo tools de-matrix the two channels
-        // band-for-band, so they require a shared window geometry. The
-        // shared-info CPE form guarantees this; reject a mismatch the
-        // non-shared form might present.
-        if left.ics_info.window_sequence != right.ics_info.window_sequence
-            || left.ics_info.num_window_groups != right.ics_info.num_window_groups
-            || left.ics_info.window_group_length != right.ics_info.window_group_length
+        // Independent CPE channels may switch windows and band counts
+        // separately. Only tools that combine both spectra need shared
+        // geometry; each channel's PNS and prediction use its own ICS.
+        let intensity = right.body.section_data.sfb_cb.iter().flatten()
+            .any(|&cb| is_intensity(cb) != 0);
+        let mid_side = joint.ms_mask_present != MsMaskPresent::AllZeros;
+        if (mid_side || intensity)
+            && (left.ics_info.window_sequence != right.ics_info.window_sequence
+                || left.ics_info.num_window_groups != right.ics_info.num_window_groups
+                || left.ics_info.window_group_length != right.ics_info.window_group_length)
         {
             return Err(Error::ElementDecodeInvalid);
         }
@@ -802,7 +805,9 @@ impl ElementDecoder {
         // tools — so an intensity band on the right copies the left
         // channel's noise. M/S skips noise bands.
         let left_nrg = noise_nrg_table(&left_abs, &left.body.section_data.sfb_cb, max_sfb)?;
-        let right_nrg = noise_nrg_table(&right_abs, &right.body.section_data.sfb_cb, max_sfb)?;
+        let right_nrg = noise_nrg_table(
+            &right_abs, &right.body.section_data.sfb_cb, right.ics_info.max_sfb as usize,
+        )?;
         {
             let state = &mut self.pns_state.lock().unwrap_or_else(|e| e.into_inner());
             for (spec, ch, nrg) in [
@@ -826,7 +831,7 @@ impl ElementDecoder {
         } else {
             &[]
         };
-        {
+        if mid_side {
             let mut pair = ChannelPairSpectra {
                 left: &mut left_spec,
                 right: &mut right_spec,
@@ -852,15 +857,15 @@ impl ElementDecoder {
             let bank0 = banks[0]            .get_or_insert_with(|| PredictorBank::new(fs_index).expect("predictor bank"));
             bank0.apply_long(&mut left_spec, geom, geom.predictor_data.as_ref(), fs_index)?;
             let bank1 = banks[1]            .get_or_insert_with(|| PredictorBank::new(fs_index).expect("predictor bank"));
-            bank1.apply_long(&mut right_spec, geom, geom.predictor_data.as_ref(), fs_index)?;
+            bank1.apply_long(&mut right_spec, right.ics_info, right.ics_info.predictor_data.as_ref(), fs_index)?;
         }
 
         // §4.6.8.2 intensity stereo: right derived from left on
         // intensity bands. invert_intensity reads the per-band M/S mask
         // only when ms_mask_present == 01 (Mask).
-        let right_is_pos = is_pos_table(&right_abs, &right.body.section_data.sfb_cb, max_sfb)?;
         let is_mask = joint.ms_mask_present == MsMaskPresent::Mask;
-        {
+        if intensity {
+            let right_is_pos = is_pos_table(&right_abs, &right.body.section_data.sfb_cb, max_sfb)?;
             let mut pair = IntensityPairSpectra {
                 left: &left_spec,
                 right: &mut right_spec,
@@ -1305,32 +1310,55 @@ mod tests {
     }
 
     #[test]
-    fn decode_cpe_rejects_window_sequence_mismatch() {
-        let left_body = make_body(4, 2, &[0, 0, 0, 0]);
-        let mut right_body = make_body(4, 2, &[0, 0, 0, 0]);
-        // Give the right channel a different window sequence.
-        let mut right_ics = right_body.ics_info.clone().unwrap();
-        right_ics.window_sequence = WindowSequence::LongStop;
-        right_body.ics_info = Some(right_ics.clone());
+    fn independent_cpe_windows_preserve_each_channels_pcm_and_overlap() {
+        let left_body = make_body(4, 2, &[0; 4]);
         let left_ics = left_body.ics_info.clone().unwrap();
-        let left_spec = make_spectral(1);
-        let right_spec = make_spectral(1);
-        let left = ChannelInput {
-            body: &left_body,
-            ics_info: &left_ics,
-            spectral: &left_spec,
-        };
-        let right = ChannelInput {
-            body: &right_body,
-            ics_info: &right_ics,
-            spectral: &right_spec,
-        };
-        let joint = CpeJointStereo::default();
-        let mut dec = ElementDecoder::new();
-        assert!(matches!(
-            dec.decode_cpe(&left, &right, &joint, 2, 4),
-            Err(Error::ElementDecodeInvalid)
-        ));
+        let left_spec = make_spectral(3);
+        let left = ChannelInput { body: &left_body, ics_info: &left_ics, spectral: &left_spec };
+        let mut pair = ElementDecoder::new();
+        let mut mono_left = ElementDecoder::new();
+        let mut mono_right = ElementDecoder::new();
+        for sequence in [
+            WindowSequence::OnlyLong,
+            WindowSequence::LongStart,
+            WindowSequence::EightShort,
+            WindowSequence::EightShort,
+            WindowSequence::LongStop,
+            WindowSequence::OnlyLong,
+        ] {
+            // Unequal band counts must remain independent even when both
+            // channels use long windows.
+            let mut right_body = make_body(3, 2, &[0; 3]);
+            let mut right_ics = right_body.ics_info.clone().unwrap();
+            right_ics.window_sequence = sequence;
+            let right_spec = if sequence == WindowSequence::EightShort {
+                right_ics.num_windows = 8;
+                right_ics.num_window_groups = 8;
+                right_ics.window_group_length = vec![1; 8];
+                right_ics.scale_factor_grouping = Some(0);
+                right_ics.num_swb = crate::ics_info::NUM_SWB_SHORT_WINDOW[4];
+                right_body.section_data.sections = vec![right_body.section_data.sections[0].clone(); 8];
+                right_body.section_data.sfb_cb = vec![right_body.section_data.sfb_cb[0].clone(); 8];
+                right_body.scale_factor_data.entries = vec![right_body.scale_factor_data.entries[0].clone(); 8];
+                SpectralData { x_quant: vec![vec![2; 128]; 8] }
+            } else {
+                make_spectral(2)
+            };
+            right_body.ics_info = Some(right_ics.clone());
+            let right = ChannelInput { body: &right_body, ics_info: &right_ics, spectral: &right_spec };
+            let expected_left = mono_left.decode_sce(&left, 2, 4).unwrap();
+            let expected_right = mono_right.decode_sce(&right, 2, 4).unwrap();
+            let (actual_left, actual_right) = pair.decode_cpe(&left, &right, &CpeJointStereo::default(), 2, 4).unwrap();
+            assert_eq!(actual_left, expected_left, "left at {sequence:?}");
+            assert_eq!(actual_right, expected_right, "right at {sequence:?}");
+            if sequence == WindowSequence::EightShort {
+                let joint = CpeJointStereo { ms_mask_present: MsMaskPresent::AllOnes, ms_used: vec![] };
+                assert!(matches!(
+                    ElementDecoder::new().decode_cpe(&left, &right, &joint, 2, 4),
+                    Err(Error::ElementDecodeInvalid)
+                ));
+            }
+        }
     }
 
     #[test]
