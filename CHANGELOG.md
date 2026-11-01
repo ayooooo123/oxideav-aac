@@ -6,6 +6,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Clamp delta-coded parametric-stereo IID/ICC indices to their valid
+  ranges, allowing decoding to resume when seeking into a stream.
+
 ### Added
 
 - USAC (AOT 42) mono/stereo 1024-line FD decoding behind the AAC

@@ -26,7 +26,7 @@
 //! relative to the same band of envelope `e-1`, envelope 0 relative to
 //! the previous frame's last envelope). [`PsData::resolve`] applies
 //! the accumulation against a caller-threaded [`PsIndexState`] and
-//! range-checks the result against the Table 8.24 / 8.27 index ranges
+//! clamps the result to the Table 8.24 / 8.27 index ranges
 //! (IPD/OPD indices accumulate modulo 8 on the Table 8.31 phase
 //! ladder, so they cannot leave their range). `num_env == 0` signals
 //! that the previous parameters are held (§8.5.2 / Table 8.50–8.52);
