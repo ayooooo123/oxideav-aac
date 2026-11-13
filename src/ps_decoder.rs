@@ -112,7 +112,7 @@ struct PsTables {
     phi_fract: [[[f64; 2]; 50]; 2],
 }
 
-static TABLES: LazyLock<PsTables> = LazyLock::new(PsTables::new);
+static TABLES: LazyLock<Box<PsTables>> = LazyLock::new(|| Box::new(PsTables::new()));
 
 fn make_filters_from_proto(filter: &mut [HybridFilter], proto: &[f32; 7]) {
     let bands = filter.len();
