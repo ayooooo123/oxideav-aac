@@ -59,11 +59,11 @@
 
 use crate::ics_info::IcsInfo;
 use crate::ics_info::WindowSequence;
+use crate::swb_offset::{FrameFamily, long_window_offsets_family, short_window_offsets_family};
 #[cfg(test)]
 use crate::swb_offset::{long_window_offsets, short_window_offsets};
-use crate::swb_offset::{long_window_offsets_family, short_window_offsets_family, FrameFamily};
 use crate::tns_coef::{tns_ar_filter, tns_decode_coef_to_lpc, tns_ma_filter};
-use crate::tns_data::{num_windows, TnsData};
+use crate::tns_data::{TnsData, num_windows};
 use crate::tns_max::{clamp_tns_band_family, clamp_tns_order};
 use crate::{Error, Result};
 
@@ -184,6 +184,29 @@ pub fn tns_analysis_frame(
         spec,
         tns,
         FrameFamily::Lc1024,
+        window_sequence,
+        max_sfb,
+        aot,
+        fs_index,
+        TnsFilterKind::Analysis,
+    )
+}
+
+/// [`tns_analysis_frame`] under an explicit §4.5.1.1 frame family
+/// (the encoder's 960-line path).
+pub(crate) fn tns_analysis_frame_family(
+    spec: &mut [f64],
+    tns: &TnsData,
+    family: FrameFamily,
+    window_sequence: WindowSequence,
+    max_sfb: u8,
+    aot: u8,
+    fs_index: u8,
+) -> Result<()> {
+    tns_frame_filter(
+        spec,
+        tns,
+        family,
         window_sequence,
         max_sfb,
         aot,
@@ -333,7 +356,7 @@ fn tns_frame_filter(
 mod tests {
     use super::*;
     use crate::tns_data::{TnsFilter, TnsWindow};
-    use crate::tns_max::{tns_max_bands, tns_max_order, AOT_AAC_LC, AOT_AAC_MAIN};
+    use crate::tns_max::{AOT_AAC_LC, AOT_AAC_MAIN, tns_max_bands, tns_max_order};
 
     /// 48 kHz — long-window table has 49 SWBs (sentinel 1024), short
     /// has 14 (sentinel 128).

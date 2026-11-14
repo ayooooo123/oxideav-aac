@@ -430,6 +430,65 @@ impl IcsBody {
         Ok(body)
     }
 
+    /// Parse an ER AAC ELD `individual_channel_stream()` (§4.6.20)
+    /// without the resilience tools: `global_gain`; for a single
+    /// channel its ELD `ics_info()` (`max_sfb`, 6 bits, returned in
+    /// [`IcsBody::ics_info`]), which a channel pair transmits once,
+    /// before both channels (`shared`); `section_data()`,
+    /// `scale_factor_data()`, `tns_data_present` and `tns_data()`. ELD
+    /// has no pulse or gain-control data; `spectral_data()` follows.
+    pub fn parse_eld(
+        reader: &mut BitReader<'_>,
+        family: FrameFamily,
+        sampling_frequency_index: u8,
+        shared: Option<&IcsInfo>,
+    ) -> Result<Self> {
+        let start = reader.bit_position();
+        let global_gain = read_u8(reader, GLOBAL_GAIN_BITS)?;
+        let own = match shared {
+            Some(_) => None,
+            None => Some(IcsInfo::eld(
+                family,
+                read_u8(reader, 6)?,
+                sampling_frequency_index,
+            )?),
+        };
+        let ics_info = shared.or(own.as_ref()).ok_or(Error::ElementDecodeInvalid)?;
+        let section_data = SectionData::parse(
+            reader,
+            ics_info.window_sequence,
+            ics_info.num_window_groups,
+            ics_info.max_sfb,
+        )?;
+        let scale_factor_data = ScaleFactorData::parse(reader, &section_data.sfb_cb)?;
+        let tns_data_present = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
+        let tns_data = if tns_data_present {
+            Some(TnsData::parse_family(
+                reader,
+                ics_info.family,
+                ics_info.window_sequence,
+            )?)
+        } else {
+            None
+        };
+        let spectral_data_bit_offset = reader.bit_position() - start;
+        Ok(IcsBody {
+            global_gain,
+            ics_info: own,
+            section_data,
+            scale_factor_data,
+            pulse_data_present: false,
+            pulse_data: None,
+            tns_data_present,
+            tns_data,
+            gain_control_data_present: false,
+            gain_control_data: None,
+            spectral_data_bit_offset,
+            er_scale_factor_data: None,
+            reordered_spectral_lengths: None,
+        })
+    }
+
     /// Parse an error-resilient Table 4.50 body whose `ics_info()` was
     /// already consumed by the surrounding shared-info CPE form.
     ///
@@ -495,7 +554,16 @@ impl IcsBody {
             (ScaleFactorData::parse(reader, &section_data.sfb_cb)?, None)
         };
 
-        let tools = parse_tools(reader, ics_info, audio_object_type, start)?;
+        // §4.5.2.4.2: the ER payload stores each ICS's data elements
+        // by error sensitivity category (Table 4.95 "channel dependent
+        // information … dependency structure according to category
+        // numbers"; Table 4.148 assignment), the logical order kept
+        // inside each category instance. `tns_data()` is category 3,
+        // while `tns_data_present`, `gain_control_data_present` and
+        // the two HCR length fields are category 1 — so on the ER
+        // wire the TNS record follows the whole category-1 run and
+        // directly precedes the category-4 spectral payload.
+        let mut tools = parse_tools_deferred_tns(reader, ics_info, audio_object_type)?;
 
         // Table 4.50 ER spectral branch: when
         // aacSpectralDataResilienceFlag is set, the body carries the
@@ -507,6 +575,17 @@ impl IcsBody {
         } else {
             None
         };
+
+        // Category 3: the TNS record, at the literal Table 4.155
+        // widths (`window_sequence` keyed — 2 / 6 / 5 on every long
+        // window, LD included).
+        if tools.tns_data_present {
+            tools.tns_data = Some(TnsData::parse_family(
+                reader,
+                ics_info.family,
+                ics_info.window_sequence,
+            )?);
+        }
 
         let spectral_data_bit_offset = reader.bit_position() - start;
 
@@ -701,6 +780,153 @@ impl IcsBody {
         self.write_tools(writer, ics_info, audio_object_type)
     }
 
+    /// Write an **error-resilient** Table 4.50 body with inline
+    /// `ics_info()` — the bit-exact inverse of
+    /// [`IcsBody::parse_er_family`] (the family rides in
+    /// `ics_info.family`).
+    ///
+    /// Emits the resilience branches selected by `resilience`
+    /// (5-bit-`sect_cb` `section_data()`, the RVLC
+    /// [`Self::er_scale_factor_data`], the HCR length fields from
+    /// [`Self::reordered_spectral_lengths`]) and stores the data
+    /// elements in §4.5.2.4.2 error-sensitivity-category order: the
+    /// category-3 `tns_data()` follows the whole category-1 run
+    /// (after `gain_control_data_present` and the HCR length fields).
+    /// The trailing spectral payload is the caller's responsibility.
+    pub fn write_er(
+        &self,
+        writer: &mut BitWriter,
+        audio_object_type: u8,
+        sampling_frequency_index: u8,
+        resilience: AacResilienceFlags,
+    ) -> Result<()> {
+        let ics_info = self.ics_info.as_ref().ok_or(Error::IcsInfoEncodeInvalid)?;
+        writer.write_u32(u32::from(self.global_gain), GLOBAL_GAIN_BITS);
+        ics_info.write(writer, audio_object_type, sampling_frequency_index, false)?;
+        self.write_er_tail(writer, ics_info, audio_object_type, resilience)
+    }
+
+    /// [`IcsBody::write_er`] for a body whose `ics_info()` was
+    /// emitted by the surrounding shared-info CPE — the inverse of
+    /// [`IcsBody::parse_with_ics_info_er`].
+    pub fn write_with_ics_info_er(
+        &self,
+        writer: &mut BitWriter,
+        ics_info: &IcsInfo,
+        audio_object_type: u8,
+        resilience: AacResilienceFlags,
+    ) -> Result<()> {
+        writer.write_u32(u32::from(self.global_gain), GLOBAL_GAIN_BITS);
+        self.write_er_tail(writer, ics_info, audio_object_type, resilience)
+    }
+
+    fn write_er_tail(
+        &self,
+        writer: &mut BitWriter,
+        ics_info: &IcsInfo,
+        audio_object_type: u8,
+        resilience: AacResilienceFlags,
+    ) -> Result<()> {
+        if resilience.section_data {
+            self.section_data
+                .write_er(writer, ics_info.window_sequence, ics_info.max_sfb)?;
+        } else {
+            self.section_data
+                .write(writer, ics_info.window_sequence, ics_info.max_sfb)?;
+        }
+        if resilience.scalefactor_data {
+            let er = self
+                .er_scale_factor_data
+                .as_ref()
+                .ok_or(Error::ElementDecodeInvalid)?;
+            er.write(writer, &self.section_data.sfb_cb, ics_info.window_sequence)?;
+        } else {
+            self.scale_factor_data
+                .write(writer, &self.section_data.sfb_cb)?;
+        }
+        // Category 1: the three tool flags with the pulse and
+        // gain-control bodies in place, then the HCR length fields.
+        writer.write_bit(self.pulse_data_present);
+        if self.pulse_data_present {
+            if ics_info.window_sequence == WindowSequence::EightShort {
+                return Err(Error::PulseDataEncodeInvalid);
+            }
+            let pd = self
+                .pulse_data
+                .as_ref()
+                .ok_or(Error::PulseDataEncodeInvalid)?;
+            pd.write(writer)?;
+        } else if self.pulse_data.is_some() {
+            return Err(Error::PulseDataEncodeInvalid);
+        }
+        writer.write_bit(self.tns_data_present);
+        if !self.tns_data_present && self.tns_data.is_some() {
+            return Err(Error::TnsDataEncodeInvalid);
+        }
+        writer.write_bit(self.gain_control_data_present);
+        if self.gain_control_data_present {
+            if audio_object_type != AOT_AAC_SSR {
+                return Err(Error::GainControlDataEncodeInvalid);
+            }
+            let gc = self
+                .gain_control_data
+                .as_ref()
+                .ok_or(Error::GainControlDataEncodeInvalid)?;
+            gc.write(writer, ics_info.window_sequence)?;
+        } else if self.gain_control_data.is_some() {
+            return Err(Error::GainControlDataEncodeInvalid);
+        }
+        if resilience.spectral_data {
+            let (len_reordered, len_longest) = self
+                .reordered_spectral_lengths
+                .ok_or(Error::ElementDecodeInvalid)?;
+            writer.write_u32(u32::from(len_reordered), 14);
+            writer.write_u32(u32::from(len_longest), 6);
+        }
+        // Category 3: the TNS record.
+        if self.tns_data_present {
+            let td = self.tns_data.as_ref().ok_or(Error::TnsDataEncodeInvalid)?;
+            td.write_family(writer, ics_info.family, ics_info.window_sequence)?;
+        }
+        Ok(())
+    }
+
+    /// Write an ER AAC ELD `individual_channel_stream()` without the
+    /// resilience tools — the inverse of [`IcsBody::parse_eld`]:
+    /// `global_gain`, the ELD `ics_info()` (`max_sfb`, 6 bits) unless
+    /// the surrounding channel pair transmitted it (`shared`),
+    /// `section_data()`, `scale_factor_data()`, `tns_data_present`
+    /// and `tns_data()`. ELD has no pulse or gain-control data; the
+    /// trailing `spectral_data()` is the caller's responsibility.
+    pub fn write_eld(
+        &self,
+        writer: &mut BitWriter,
+        ics_info: &IcsInfo,
+        shared: bool,
+    ) -> Result<()> {
+        if self.pulse_data_present || self.gain_control_data_present {
+            return Err(Error::IcsInfoEncodeInvalid);
+        }
+        writer.write_u32(u32::from(self.global_gain), GLOBAL_GAIN_BITS);
+        if !shared {
+            writer.write_u32(u32::from(ics_info.max_sfb), 6);
+        }
+        self.section_data
+            .write(writer, ics_info.window_sequence, ics_info.max_sfb)?;
+        self.scale_factor_data
+            .write(writer, &self.section_data.sfb_cb)?;
+        writer.write_bit(self.tns_data_present);
+        if self.tns_data_present {
+            self.tns_data
+                .as_ref()
+                .ok_or(Error::TnsDataEncodeInvalid)?
+                .write_family(writer, ics_info.family, ics_info.window_sequence)?;
+        } else if self.tns_data.is_some() {
+            return Err(Error::TnsDataEncodeInvalid);
+        }
+        Ok(())
+    }
+
     fn write_tools(
         &self,
         writer: &mut BitWriter,
@@ -726,9 +952,7 @@ impl IcsBody {
             return Err(Error::PulseDataEncodeInvalid);
         }
 
-        // tns_data_present + body (family-aware widths — the LD
-        // families emit the reduced 1 / 4 / 3-bit column, mirroring
-        // the parse side).
+        // tns_data_present + body (non-ER syntax order).
         writer.write_bit(self.tns_data_present);
         if self.tns_data_present {
             let td = self.tns_data.as_ref().ok_or(Error::TnsDataEncodeInvalid)?;
@@ -770,6 +994,45 @@ struct ToolDispatch {
     gain_control_data_present: bool,
     gain_control_data: Option<GainControlData>,
     spectral_data_bit_offset: u64,
+}
+
+/// ER form of [`parse_tools`]: the category-1 flags and the pulse /
+/// gain-control bodies in place, the category-3 `tns_data()` body
+/// left for the caller to read after the rest of the category-1 run
+/// (§4.5.2.4.2). The returned `tns_data` is always `None`.
+fn parse_tools_deferred_tns(
+    reader: &mut BitReader<'_>,
+    ics_info: &IcsInfo,
+    audio_object_type: u8,
+) -> Result<ToolDispatch> {
+    // ER AAC ELD (AOT 39) has neither the pulse tool nor the
+    // gain-control flag (FFmpeg `ff_aac_decode_ics`, `eld_syntax`).
+    let eld = audio_object_type == 39;
+    let pulse_data_present = !eld && reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
+    let pulse_data = if pulse_data_present {
+        if ics_info.window_sequence == WindowSequence::EightShort {
+            return Err(Error::PulseDataEncodeInvalid);
+        }
+        Some(PulseData::parse(reader)?)
+    } else {
+        None
+    };
+    let tns_data_present = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
+    let gain_control_data_present = !eld && reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
+    let gain_control_data = if gain_control_data_present {
+        Some(GainControlData::parse(reader, ics_info.window_sequence)?)
+    } else {
+        None
+    };
+    Ok(ToolDispatch {
+        pulse_data_present,
+        pulse_data,
+        tns_data_present,
+        tns_data: None,
+        gain_control_data_present,
+        gain_control_data,
+        spectral_data_bit_offset: 0,
+    })
 }
 
 /// Helper: walk the pulse / tns / gain_control dispatch trio after
@@ -845,8 +1108,7 @@ fn parse_tools(
             )?);
         }
         if present {
-            gain_control_data =
-                Some(GainControlData::parse(reader, ics_info.window_sequence)?);
+            gain_control_data = Some(GainControlData::parse(reader, ics_info.window_sequence)?);
         }
         present
     };

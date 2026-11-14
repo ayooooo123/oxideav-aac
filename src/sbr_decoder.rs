@@ -28,15 +28,15 @@
 //! Figure 4.47 of the staged spec. No part of this implementation is
 //! derived from any external decoder.
 
-use crate::ps_decoder::{PsDecoder, PS_X_SLOTS};
-use crate::sbr_dequant::{dequant_coupled, dequant_single, DequantizedSbr};
+use crate::ps_decoder::{PS_X_SLOTS, PsDecoder};
+use crate::sbr_dequant::{DequantizedSbr, dequant_coupled, dequant_single};
 use crate::sbr_element::EXTENSION_ID_PS;
-use crate::sbr_env_adjust::{adjust, EnvAdjustState, EnvParams};
+use crate::sbr_env_adjust::{EnvAdjustState, EnvParams, adjust};
 use crate::sbr_extension::SbrExtensionData;
-use crate::sbr_freq_bands::{k0 as derive_k0, k2 as derive_k2, master_table, HiLoTables};
+use crate::sbr_freq_bands::{HiLoTables, k0 as derive_k0, k2 as derive_k2, master_table};
 use crate::sbr_header::SbrHeader;
 use crate::sbr_hf_gen::{
-    build_patches, chirp_factors, generate_hf, reflection_coefficient, Patches, T_HF_ADJ, T_HF_GEN,
+    Patches, T_HF_ADJ, T_HF_GEN, build_patches, chirp_factors, generate_hf, reflection_coefficient,
 };
 use crate::sbr_limiter::limiter_table;
 use crate::sbr_lp::{aliasing_degree, deg_patched};
@@ -707,7 +707,11 @@ impl SbrDecoder {
             // are skipped (FFmpeg applies PS only when `m4ac.ps == 1`).
             if n_ch == 1 && self.ps_signaled {
                 let ps = self.ps.get_or_insert_with(|| PsState::new(&ch.synthesis));
-                let payload = ext.element.extension.as_ref().filter(|e| e.id == EXTENSION_ID_PS);
+                let payload = ext
+                    .element
+                    .extension
+                    .as_ref()
+                    .filter(|e| e.id == EXTENSION_ID_PS);
                 if let Some(payload) = payload {
                     if self.low_power {
                         // §4.6.18.8: the real-valued tool cannot host
@@ -1196,8 +1200,10 @@ mod tests {
             "core tone amplitude LP {a_lp} vs HQ {a_hq}"
         );
         for (block_hq, block_lp) in out_hq
-            .chunks_exact(1024)
-            .zip(out_lp.chunks_exact(1024))
+            .as_chunks::<1024>()
+            .0
+            .iter()
+            .zip(out_lp.as_chunks::<1024>().0.iter())
             .skip(4)
         {
             let e_h: f64 = block_hq.iter().map(|v| v * v).sum();

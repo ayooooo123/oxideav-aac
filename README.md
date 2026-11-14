@@ -115,15 +115,14 @@ fetch recipe are in `docs/audio/aac/iso-14496-26-conformance.md` — the
 ISO-copyright bitstreams are never committed). Measured state:
 
 * **ER AAC LD** — 15 vectors across 22.05/24/32/44.1/48 kHz at both
-  frame lengths: **47 003 / 47 004 access units decode** (the single
-  residual is `er_ad1103_22_ep0` AU 367, which the staged corpus
-  screen records as failing under every width hypothesis). PCM: the
-  LD-512 `er_ad1000*` family is reference-exact at err/sig ≈ 4.4e-5;
-  the LD-480 `er_ad1103np*` family lands at ≈ 1.3e-4 outside its
-  TNS/PNS access units (PNS noise phase is generator-defined; the
-  deployed LD TNS record is a still-untraced extra-spec wire — see
-  "Not yet supported"). The 32 kHz members pin the §4.5.4
-  Tables 4.144/4.145 band tables end to end.
+  frame lengths: **47 003 / 47 004 access units decode** under the
+  pre-r483 TNS reading (the residual is `er_ad1103_22_ep0` AU 367).
+  PCM: the LD-512 `er_ad1000*` family is reference-exact at err/sig ≈
+  4.4e-5; the LD-480 `er_ad1103np*` family landed at ≈ 1.3e-4 outside
+  its TNS/PNS access units. The r483 TNS rewire (below) unmasks the
+  TNS-bearing AUs in the harness; the corpus re-run is pending (the
+  corpus is not on the r483 machine). The 32 kHz members pin the
+  §4.5.4 Tables 4.144/4.145 band tables end to end.
 * **CCE** — the twelve `am05_*` vectors (AAC Main + one
   `coupling_channel_element()` in every access unit): **1 370 / 1 370
   AUs decode**, and all six `am05_48` output channels match their
@@ -136,6 +135,21 @@ ISO-copyright bitstreams are never committed). Measured state:
   verify** during a full decode, including the §4.5.2.8.1 pre-header
   prefix (upsampling-only state) and the whole-payload coverage
   region (`bs_fill_bits` included).
+
+### Runtime decoder output shape
+
+`Decoder::output_params()` answers the sample rate / channel count of
+the frame most recently returned (resolved from the first decoded
+frame before any is returned); a later shape change — a spliced ADTS
+stream switching rate or channel configuration, SBR appearing under
+implicit signalling — is announced by exactly one
+`Frame::StreamParams` event right before its first frame, with
+`output_params_generation()` bumped. A new block configuration
+restarts the per-stream state, so an HE-AAC segment's SBR / PS latch
+does not leak into the segments after it (`tests/stream_params_concat.rs`;
+on a black-box-encoded six-segment splice — AAC-LC 44.1 kHz stereo,
+48 kHz mono, HE-AAC 32 kHz, AAC-LC 44.1 kHz, HE-AAC v2 44.1 kHz, 48 kHz
+mono — four events for the four real changes).
 
 ### Bitstream parsing
 
@@ -445,6 +459,26 @@ carry the default 1024-line family):
   chain; 960 PCM samples per channel per frame. Verified **bit-exact
   against a black-box decoder binary** on writer-assembled streams,
   and staged with mutation coverage as `aac-lc-960-writer-loas`.
+- **960-line AAC-LC encoder core** — `StreamEncoder::set_frame_family(
+  FrameFamily::Lc960)` runs the whole analysis / quantization chain
+  (block switching on the 120-sample short grid at
+  `(N_l − N_s)/4 + j·N_s/2 = 420 + 120·j`, grouping, M/S, TNS on the
+  960-family tables, PNS / intensity / pulse, every channel layout)
+  over the `N = 1920 / 240` transform pair and emits bare access units
+  (`encode_access_unit` / `encode_all_access_units`) configured by
+  `audio_specific_config()` (`frameLengthFlag = 1`; ADTS cannot carry
+  the family, so the ADTS entry points refuse it). The registry
+  encoder selects it from a `frameLengthFlag` extradata ASC
+  (960-sample packets). Measured on the equal-rate harness metric
+  (per-QMF-band NMR under the 10 dB / 12 dB-per-band spreading
+  masker), 48 kHz stereo at 64 / 96 / 128 kbps: tonal mix
+  −0.09 / −0.07 / −0.12 dB, dense burst train +0.11 / +0.11 /
+  +0.09 dB, isolated attacks (7 short runs per 2 s on both families)
+  −0.06 / +0.13 / −1.34 dB against the 1024-line path at the same
+  rate; a black-box decoder binary (`ffmpeg -f loas`) reads the
+  LOAS-wrapped streams without diagnostics **within 1 LSB** of this
+  crate's decode (`tests/encoder_960.rs`). The 1024-line output is
+  byte-identical to the pre-refactor encoder.
 - **ER AAC LD at 512/480 lines** (AOT 23, §4.6.17) — Tables
   4.142–4.147 (with the §4.5.1.1 nearest-defined-table rule for the
   rates those tables omit), long-only frames (a non-`ONLY_LONG`
@@ -461,18 +495,26 @@ carry the default 1024-line family):
   other binary decodes 480-line streams on the wrong 512-line
   frequency grid — probed and documented in the fixture notes).
   Staged fixtures: `aac-ld-512-writer-loas`, `aac-ld-480-writer-loas`.
-- **LD TNS wire — RESOLVED against the conformance corpus**: the
-  divergence between the literal Table 4.54 / Table 4.155 field
-  widths and the deployed LD TNS wire was settled by the ISO/IEC
-  14496-26 screen recorded in `docs/audio/aac/er-ld-tns-divergence.md`
-  §0 — the normative LD wire transmits `n_filt` in **1 bit** (the
-  reduced Table 4.155 column; the literal 2-bit keying hard-fails 792
-  of the corpus's 2 017 TNS-bearing AUs). The LD families read the
-  1 / 4 / 3 column via `TnsData::parse_family` / `write_family`;
-  because the corpus never transmits a `length` / `order` field
-  (`n_filt == 0` throughout, so 4 / 3 vs 6 / 5 is undetermined), the
-  §0.6 configurability recommendation is kept via the explicit-width
-  `TnsData::parse_widths` / `write_widths` entry points.
+- **ER `tns_data()` placement — §4.5.2.4.2 category order.** The ER
+  payload stores each channel stream by error sensitivity category
+  (Table 4.95, Table 4.148): `tns_data()` is category 3, so it follows
+  the stream's whole category-1 run — `gain_control_data_present` and
+  the HCR length fields included — and directly precedes the spectral
+  payload, at the literal Table 4.155 widths (2 / 6 / 5 on every long
+  window, LD included). `IcsBody::parse_er*` read it there and
+  `IcsBody::write_er` / `write_with_ics_info_er` emit it there, for
+  every ER AOT (17 / 19 / 23). Black-box check: ER AAC LD 512 streams
+  from two independent black-box encoders (`fdkaac -p 23`,
+  `afconvert -d aacl`; 22.05–48 kHz, mono and stereo, 9 streams,
+  ~2 250 access units, 360+ of them TNS-bearing with up to two
+  filters, `length` up to 29, `order` up to 7) decode **within 1 LSB
+  of the `afconvert` decode on every access unit** (err/sig ≈ 5e-6),
+  where the earlier syntax-order 1 / 4 / 3 reading reached err/sig
+  1.5–2.8 on the TNS-bearing frames and failed 5 AUs outright; the
+  crate's own LD-512 and LD-480 writer streams with two-filter,
+  order-9 TNS decode bit-exact / within 1 LSB through `afconvert`
+  too. (That earlier reading had consumed the always-zero
+  `gain_control_data_present` bit as a 1-bit `n_filt`.)
 - **SBR over the 960-line core** — §4.6.18.2.6 `numTimeSlots = 15`
   ("16 for a 1024 AAC frame and 15 for a 960 AAC frame"): the SBR
   decoder (`SbrDecoder::new_slots`) and the Annex 8.A PS chain
@@ -493,7 +535,34 @@ carry the default 1024-line family):
   in shape (one common scale). An SBR payload on an LD stream is
   still rejected before its body is parsed
   (`Error::SbrUnsupportedFrameFamily`) — the §4.6.19 LD SBR tool
-  belongs to ELD (out of scope).
+  belongs to ELD and is not implemented (ELD decodes without it).
+
+### ER AAC ELD (AOT 39) and the LD / ELD encoders
+
+- **ELD decode** (`decode_er_raw_data_block` with AOT 39): the
+  Table 4.180 `ELDSpecificConfig` (`AudioSpecificConfig::eld`), the
+  Table 4.75–4.79 untagged ELD channel elements, and the §4.6.20.2
+  low-delay synthesis — the phase-`(-N/2 + 1)/2` inverse transform
+  extended to `4N`, the Table 4.A.15 / 4.A.16 window, four-block
+  overlap-add — for 512 and 480 lines. Streams without the resilience
+  tools or low-delay SBR; `afconvert` AAC-ELD streams (16–48 kHz,
+  1 / 2 / 6 channels) decode within 1 LSB of the `afconvert` decode.
+- **LD / ELD encoders**: `StreamEncoder::new_ld` (AOT 23) and
+  `new_eld` (AOT 39), 512 / 480 lines, bare `er_raw_data_block()`
+  access units with their `AudioSpecificConfig`
+  (`asc_writer::er_ld_asc`). LD writes its channel streams in the
+  §4.5.2.4.2 category order; ELD analyses with the inverse of the
+  §4.6.20.2 synthesis (the decoder reconstructs the input `N/2`
+  samples late). TNS, PNS and intensity stereo stay off. `afconvert`
+  decodes both encoders' MP4-carried streams (22.05–48 kHz, 1 / 2
+  channels, both frame lengths) within 1 LSB of this crate's decode.
+- Every encoder takes float input (`encode_frame_f64` /
+  `encode_access_unit_f64`), emits bare access units on request
+  (`set_raw`), and retargets its bitrate mid-stream (`set_bitrate`).
+- **Transforms**: the MDCT / IMDCT run as a DCT-IV on an `N/4`-point
+  FFT (Bluestein's chirp-z for the 960 / 480 families), `O(N log N)`:
+  on one core, 48 kHz stereo AAC-LC encodes at ~320x and decodes at
+  ~200x real time, 5.1 at ~117x / ~72x.
 
 ### Scalable AAC (AOT 6) / ER AAC scalable (AOT 20) — §4.4.2.2 / §4.5.2.2
 
@@ -1064,8 +1133,9 @@ the EP section below).
   per-band scalefactors follow a masking-spread rule (band target
   magnitude `42·(peak_b/peak_frame)^½`, sub-step bands culled to
   `ZERO_HCB`) with the DPCM ±60 track threaded across window groups;
-  a bidirectional rate loop (±4 scalefactor ladder + ±1..3 fine pass)
-  fits each frame to the bitrate-derived byte budget; codebooks and
+  a rate search (from the previous frame's scalefactor offset,
+  galloping then bisecting to the least offset that fits) fits each
+  frame to the bitrate-derived byte budget; codebooks and
   sections come from a **measured-bit-cost dynamic program** (every
   candidate same-class run priced at its `section_data()` header
   overhead plus the cheapest Table 4.95 book, actual codeword +
@@ -1358,21 +1428,13 @@ component still open (see below):
   MPS212, time-warped MDCT, LFE elements and other layouts are rejected with
   errors, as is AudioPreRoll anywhere but the first element or inside a
   pre-roll AU. AudioPreRoll's applyCrossfade is ignored.
-- **The deployed ER AAC LD `tns_data()` filter record.** The
-  ISO/IEC 14496-26 LD conformance bitstreams transmit an
-  extra-spec TNS record: the corpus-resolved 1-bit-`n_filt` reading
-  (`docs/audio/aac/er-ld-tns-divergence.md` §0, implemented here)
-  reconciles the *structure* — every AU parses to its boundary — but
-  the reference waveforms show the record carries a real
-  variable-length filter (per-AU record lengths ≈ 19–61 bits, in
-  3-bit increments) whose layout matches no Table 4.54/4.155
-  reading (a grammar search over length 4/6 × order 3/5 × 1–2
-  filters × optional direction/compress fields, decoded *and*
-  applied, reconciles none of it). TNS-bearing LD AUs (~6 % of the
-  `er_ad1103*` family) therefore decode with wrong PCM until a
-  behavioural trace of the deployed record lands; the conformance
-  harness masks them (and bounds the LTP-setup vectors coarsely,
-  since LD LTP history includes those AUs).
+- **ER RVLC category order.** §4.5.2.4.2 also moves the category-2
+  `rvlc_cod_sf` / `rvlc_esc_sf` codewords of an RVLC
+  `scale_factor_data()` behind the stream's category-1 run (with the
+  9-bit first-noise `dpcm_noise_nrg` staying in category 1); the RVLC
+  branch is still read in syntax order. No black-box encoder available
+  here emits RVLC, so that rewire waits for an oracle (the ISO/IEC
+  14496-26 `er_*` RVLC vectors).
 - Encoder-side tool remainders — the end-to-end AAC-LC encoder (see
   `encoder` below) covers block switching with §4.5.2.3.4 short-frame
   grouping, M/S on both frame shapes, the scalefactor/quantizer rate

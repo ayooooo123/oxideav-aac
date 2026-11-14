@@ -8,7 +8,7 @@
 
 use oxideav_aac::adts::AdtsHeader;
 use oxideav_aac::decode::StreamDecoder;
-use oxideav_aac::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
+use oxideav_aac::encoder::{EncoderConfig, FRAME_LEN, StreamEncoder};
 
 /// Per-frame pulse records of a mono SCE ADTS stream: `Some(pd)`
 /// when the frame's channel body carries `pulse_data()`.
@@ -74,12 +74,7 @@ fn pulse_prone_signal(n: usize) -> Vec<i16> {
 #[test]
 fn pulse_bearing_stream_roundtrips_and_parses() {
     let pcm = pulse_prone_signal(16 * FRAME_LEN);
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 48_000,
-        channels: 1,
-        bitrate: 96_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(48_000, 1, 96_000)).unwrap();
     let stream = enc.encode_all(&pcm).unwrap();
 
     // At least one frame must have chosen the measured pulse

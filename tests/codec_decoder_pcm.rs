@@ -26,7 +26,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use oxideav_aac::adts::{AdtsHeader, ADTS_HEADER_BYTES_NO_CRC};
+use oxideav_aac::adts::{ADTS_HEADER_BYTES_NO_CRC, AdtsHeader};
 use oxideav_aac::codec_decoder::make_decoder;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, SampleFormat, TimeBase};
 
@@ -46,8 +46,10 @@ fn read_wav_s16(path: &PathBuf) -> Option<Vec<f32>> {
             let end = (body_start + sz).min(d.len());
             return Some(
                 d[body_start..end]
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect(),
             );
         }
@@ -110,8 +112,8 @@ fn decode_via_trait(name: &str) -> Option<Vec<f32>> {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
                     assert_eq!(a.data.len(), 1, "{name}: interleaved single plane");
-                    for c in a.data[0].chunks_exact(4) {
-                        pcm.push(f32::from_le_bytes(c.try_into().unwrap()));
+                    for c in a.data[0].as_chunks::<4>().0 {
+                        pcm.push(f32::from_le_bytes(*c));
                     }
                 }
                 Ok(other) => panic!("{name}: expected Audio, got {other:?}"),
@@ -274,7 +276,10 @@ fn he_aac_sbr_decodes_through_trait() {
         "{name}: PCM length {} not a whole number of stereo SBR frames",
         pcm.len()
     );
-    assert!(pcm.iter().any(|&s| s != 0.0), "{name}: all-silent SBR decode");
+    assert!(
+        pcm.iter().any(|&s| s != 0.0),
+        "{name}: all-silent SBR decode"
+    );
     // The trait path must match the raw StreamDecoder byte-for-byte.
     let bytes = std::fs::read(
         PathBuf::from("../../docs/audio/aac/fixtures")

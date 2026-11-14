@@ -12,6 +12,7 @@
 //! past the 192-bit protection window) must leave the CRC check
 //! satisfied.
 
+use oxideav_aac::Error;
 use oxideav_aac::adts::AdtsHeader;
 use oxideav_aac::adts_crc::{
     adts_header_crc, adts_rdb_crc, adts_single_crc, collect_block_regions, protect_adts_stream,
@@ -19,12 +20,11 @@ use oxideav_aac::adts_crc::{
 use oxideav_aac::decode::StreamDecoder;
 use oxideav_aac::encoder::{EncoderConfig, StreamEncoder};
 use oxideav_aac::ics_body::IcsBody;
-use oxideav_aac::ics_info::{IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW};
+use oxideav_aac::ics_info::{IcsInfo, NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape};
 use oxideav_aac::raw_data_block::{FrameAssembler, IdSynEle};
 use oxideav_aac::scale_factor_data::{ScaleFactorData, ScaleFactorEntry};
 use oxideav_aac::section_data::{Section, SectionData};
 use oxideav_aac::spectral_data::SpectralData;
-use oxideav_aac::Error;
 use oxideav_core::bits::{BitReader, BitWriter};
 
 const AOT_LC: u8 = 2;
@@ -37,12 +37,7 @@ fn tone_pcm(samples: usize) -> Vec<i16> {
 }
 
 fn encode_tone(frames: usize) -> Vec<u8> {
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44100,
-        channels: 1,
-        bitrate: 96_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(44100, 1, 96_000)).unwrap();
     enc.encode_all(&tone_pcm(1024 * frames)).unwrap()
 }
 
@@ -296,12 +291,7 @@ fn cpe_second_ics_corruption_is_rejected_end_to_end() {
             (6000.0 * (0.017 * n + 0.4 * ch).sin()) as i16
         })
         .collect();
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44100,
-        channels: 2,
-        bitrate: 128_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(44100, 2, 128_000)).unwrap();
     let plain = enc.encode_all(&pcm).unwrap();
     let protected = protect_adts_stream(&plain).unwrap();
 

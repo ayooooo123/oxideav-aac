@@ -18,7 +18,12 @@ pub(super) struct State {
 
 impl Default for State {
     fn default() -> Self {
-        Self { last: [0; 513], last_len: 0, cur: [0; 4], previous: 0 }
+        Self {
+            last: [0; 513],
+            last_len: 0,
+            cur: [0; 4],
+            previous: 0,
+        }
     }
 }
 
@@ -75,8 +80,10 @@ impl State {
         coef: &mut [f32],
     ) -> Result<()> {
         let n = coef.len();
-        if !matches!(n, 128 | 1024) || len > n || len % 2 != 0 {
-            return Err(Error::invalid("AAC USAC: invalid arithmetic spectrum length"));
+        if !matches!(n, 128 | 1024) || len > n || !len.is_multiple_of(2) {
+            return Err(Error::invalid(
+                "AAC USAC: invalid arithmetic spectrum length",
+            ));
         }
         self.map(reset, n);
         coef.fill(0.0);
@@ -86,8 +93,15 @@ impl State {
         }
 
         let start = reader.bit_position();
-        let mut look = Lookahead { bits: *reader, padding: 0 };
-        let mut arith = Arithmetic { low: 0, high: 65535, value: look.get(16)? };
+        let mut look = Lookahead {
+            bits: *reader,
+            padding: 0,
+        };
+        let mut arith = Arithmetic {
+            low: 0,
+            high: 65535,
+            value: look.get(16)?,
+        };
         let mut i = 0;
         while i < len / 2 {
             let context = self.context(i);
@@ -100,7 +114,9 @@ impl State {
                 }
                 level += 1;
                 if level > 23 {
-                    return Err(Error::invalid("AAC USAC: arithmetic escape exceeds 23 bits"));
+                    return Err(Error::invalid(
+                        "AAC USAC: arithmetic escape exceeds 23 bits",
+                    ));
                 }
             };
             if symbol == 0 && level != 0 {
@@ -109,7 +125,13 @@ impl State {
             let mut a = symbol as u32 & 3;
             let mut b = symbol as u32 >> 2;
             for _ in 0..level {
-                let table = if a == 0 { 1 } else if b == 0 { 0 } else { 2 };
+                let table = if a == 0 {
+                    1
+                } else if b == 0 {
+                    0
+                } else {
+                    2
+                };
                 let r = arith.decode(&mut look, &LSB_CDFS[table])? as u32;
                 a = (a << 1) | (r & 1);
                 b = (b << 1) | (r >> 1);
@@ -123,7 +145,10 @@ impl State {
         // The range coder reads fourteen lookahead bits belonging to the
         // following syntax. Advance the real reader only through its code.
         let consumed = look.bits.bit_position() + look.padding as u64 - start - 14;
-        reader.skip(u32::try_from(consumed).map_err(|_| Error::invalid("AAC USAC: arithmetic length overflow"))?)?;
+        reader.skip(
+            u32::try_from(consumed)
+                .map_err(|_| Error::invalid("AAC USAC: arithmetic length overflow"))?,
+        )?;
         self.finish(i, n);
         for value in &mut coef[..len] {
             if *value != 0.0 && !reader.read_bit()? {
@@ -214,7 +239,11 @@ mod tests {
 
     #[test]
     fn probability_tables_are_bounded_and_monotone() {
-        for cdf in MSB_CDFS.iter().map(|v| &v[..]).chain(LSB_CDFS.iter().map(|v| &v[..])) {
+        for cdf in MSB_CDFS
+            .iter()
+            .map(|v| &v[..])
+            .chain(LSB_CDFS.iter().map(|v| &v[..]))
+        {
             assert_eq!(cdf.last(), Some(&0));
             assert!(cdf[0] < 16384);
             assert!(cdf.windows(2).all(|w| w[0] > w[1]));
@@ -231,11 +260,17 @@ mod tests {
     fn context_maps_between_long_and_short_windows() {
         let mut state = State::default();
         state.map(true, 1024);
-        for i in 0..512 { state.last[i] = (i % 16) as u8; }
+        for i in 0..512 {
+            state.last[i] = (i % 16) as u8;
+        }
         state.map(false, 128);
-        for i in 0..64 { assert_eq!(state.last[i], (i * 8 % 16) as u8); }
+        for i in 0..64 {
+            assert_eq!(state.last[i], (i * 8 % 16) as u8);
+        }
         state.map(false, 1024);
-        for i in 0..512 { assert_eq!(state.last[i], (i / 8 * 8 % 16) as u8); }
+        for i in 0..512 {
+            assert_eq!(state.last[i], (i / 8 * 8 % 16) as u8);
+        }
         state.finish(4, 1024);
         assert!(state.last[4..512].iter().all(|&v| v == 1));
         assert_eq!(state.last[512], 0);
@@ -247,10 +282,24 @@ mod tests {
     fn malformed_lengths_and_truncated_codes_are_errors() {
         let mut state = State::default();
         let mut out = [0.0; 128];
-        assert!(state.spectrum(&mut BitReader::new(&[]), true, 2, &mut out).is_err());
-        assert!(state.spectrum(&mut BitReader::new(&[0; 8]), true, 129, &mut out).is_err());
-        assert!(state.spectrum(&mut BitReader::new(&[0; 8]), true, 3, &mut out).is_err());
-        state.spectrum(&mut BitReader::new(&[]), true, 0, &mut out).unwrap();
+        assert!(
+            state
+                .spectrum(&mut BitReader::new(&[]), true, 2, &mut out)
+                .is_err()
+        );
+        assert!(
+            state
+                .spectrum(&mut BitReader::new(&[0; 8]), true, 129, &mut out)
+                .is_err()
+        );
+        assert!(
+            state
+                .spectrum(&mut BitReader::new(&[0; 8]), true, 3, &mut out)
+                .is_err()
+        );
+        state
+            .spectrum(&mut BitReader::new(&[]), true, 0, &mut out)
+            .unwrap();
         assert_eq!(out, [0.0; 128]);
     }
 }

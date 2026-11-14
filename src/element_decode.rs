@@ -82,16 +82,16 @@
 use crate::cce::CouplingChannelElement;
 use crate::decoded_spectrum::quant_to_spec;
 use crate::dequant::rescale_spectrum;
-use crate::filterbank::Filterbank;
 use crate::eld_filterbank::EldFilterbank;
+use crate::filterbank::Filterbank;
 use crate::ics_body::IcsBody;
 use crate::ics_info::IcsInfo;
-use crate::intensity_stereo::{apply_intensity_stereo, is_intensity, IntensityPairSpectra};
+use crate::intensity_stereo::{IntensityPairSpectra, apply_intensity_stereo, is_intensity};
 use crate::ltp::LtpState;
-use crate::ms_stereo::{apply_ms_stereo, ChannelPairSpectra, MsMaskPresent};
-use crate::pns::{apply_pns, gen_rand_vector, PnsChannel};
+use crate::ms_stereo::{ChannelPairSpectra, MsMaskPresent, apply_ms_stereo};
+use crate::pns::{PnsChannel, apply_pns, gen_rand_vector};
 use crate::predictor::PredictorBank;
-use crate::scale_factor_data::{accumulate, AbsoluteScaleFactorEntry, AbsoluteScaleFactors};
+use crate::scale_factor_data::{AbsoluteScaleFactorEntry, AbsoluteScaleFactors, accumulate};
 use crate::section_data::ZERO_HCB;
 use crate::spectral_data::SpectralData;
 use crate::ssr::SsrChannelDecoder;
@@ -156,10 +156,10 @@ where
             // Every non-ZERO_HCB band consumes exactly one wire record,
             // in lock-step with the accumulate() walk.
             let entry = rec.next().ok_or(Error::ElementDecodeInvalid)?;
-            if sfb < max_sfb {
-                if let Some(v) = pick(entry) {
-                    row[sfb] = v;
-                }
+            if sfb < max_sfb
+                && let Some(v) = pick(entry)
+            {
+                row[sfb] = v;
             }
         }
         out.push(row);
@@ -210,12 +210,7 @@ fn reconstruct_pre_pair(
     let x_quant: SpectralData = if let Some(pd) = &ch.body.pulse_data {
         let mut patched = ch.spectral.clone();
         let group0 = patched.x_quant.first_mut().ok_or(Error::DequantInvalid)?;
-        apply_pulse_data_family(
-            group0,
-            ch.ics_info.family,
-            fs_index,
-            pd,
-        )?;
+        apply_pulse_data_family(group0, ch.ics_info.family, fs_index, pd)?;
         patched
     } else {
         ch.spectral.clone()
@@ -336,9 +331,7 @@ fn finish_channel(
         // ER AAC ELD: the low-delay filterbank (no LTP in ELD).
         let eld_fb = match eld {
             Some(eld_fb) => eld_fb,
-            slot @ None => {
-                slot.insert(Box::new(EldFilterbank::new(ics_info.family.frame_len())?))
-            }
+            slot @ None => slot.insert(Box::new(EldFilterbank::new(ics_info.family.frame_len())?)),
         };
         eld_fb.synthesize(spec)?
     } else {
@@ -500,6 +493,12 @@ impl CceDecoder {
         }
     }
 
+    /// [`Filterbank::set_sine_before_first_block`] on this coupling
+    /// channel's independently switched filterbank.
+    pub fn set_sine_before_first_block(&mut self, enabled: bool) {
+        self.fb.set_sine_before_first_block(enabled);
+    }
+
     /// Decode the CCE's embedded `single_channel_element()` to the
     /// §4.6.8.3.3 `cc_spectrum[]` (and, for an independently switched
     /// CCE, on to the time domain through this slot's persistent
@@ -593,6 +592,9 @@ impl Default for CpeJointStereo {
 /// on PNS-heavy streams (FATE `al18_44`).
 pub type SharedPnsState = std::sync::Arc<std::sync::Mutex<u32>>;
 
+/// FFmpeg's PNS generator seed (`aacdec.c`).
+const PNS_SEED: u32 = 0x1f2e_3d4c;
+
 #[derive(Debug, Clone)]
 pub struct ElementDecoder {
     /// Per-channel filterbanks. `[0]` for the SCE / LFE or the CPE's
@@ -621,6 +623,11 @@ pub struct ElementDecoder {
     /// §4.6.13.3 default generator state, advanced across every noise
     /// band of every frame so the noise is reproducible per decode run.
     pns_state: SharedPnsState,
+    /// The per-channel generators [`Self::set_shared_pns_seed`] draws
+    /// from instead of `pns_state`, both started from the common seed.
+    channel_pns: [u32; 2],
+    /// [`Self::set_shared_pns_seed`].
+    shared_pns_seed: bool,
 }
 
 impl Default for ElementDecoder {
@@ -655,6 +662,16 @@ impl ElementDecoder {
             ssr_decoders: [None, None],
             eld_filterbanks: [None, None],
             pns_state: pns,
+            channel_pns: [PNS_SEED; 2],
+            shared_pns_seed: false,
+        }
+    }
+
+    /// [`Filterbank::set_sine_before_first_block`] on both channel
+    /// filterbanks (on by default; set before the first block).
+    pub fn set_sine_before_first_block(&mut self, enabled: bool) {
+        for fb in &mut self.filterbanks {
+            fb.set_sine_before_first_block(enabled);
         }
     }
 
@@ -669,7 +686,20 @@ impl ElementDecoder {
             ssr_decoders: [None, None],
             eld_filterbanks: [None, None],
             pns_state: SharedPnsState::new(std::sync::Mutex::new(seed)),
+            channel_pns: [seed; 2],
+            shared_pns_seed: false,
         }
+    }
+
+    /// Draw each channel's PNS noise from its own generator, both
+    /// started from the same seed (off by default). Bands that are
+    /// noise in both channels of a pair then carry identical noise
+    /// until the channels' noise histories diverge, as Apple's decoder
+    /// renders them. The default draws every band from the one
+    /// stream-wide generator, so independent noise bands decode
+    /// decorrelated (FFmpeg's process).
+    pub fn set_shared_pns_seed(&mut self, shared: bool) {
+        self.shared_pns_seed = shared;
     }
 
     /// Decode one single-channel element (SCE) or LFE channel to PCM.
@@ -697,12 +727,34 @@ impl ElementDecoder {
         fs_index: u8,
         coupling: &[CouplingApply<'_>],
     ) -> Result<Vec<f64>> {
+        self.decode_channel(0, ch, aot, fs_index, coupling)
+    }
+
+    /// One channel through PNS, LTP, TNS and the filterbank of slot
+    /// `slot`, with no pair tools: an SCE, or a CPE channel without
+    /// `common_window`.
+    fn decode_channel(
+        &mut self,
+        slot: usize,
+        ch: &ChannelInput<'_>,
+        aot: u8,
+        fs_index: u8,
+        coupling: &[CouplingApply<'_>],
+    ) -> Result<Vec<f64>> {
         let (mut spec, abs) = reconstruct_pre_pair(ch, fs_index)?;
         let max_sfb = ch.ics_info.max_sfb as usize;
 
         // §4.6.13 PNS on the single channel (no pair correlation).
         let noise_nrg = noise_nrg_table(&abs, &ch.body.section_data.sfb_cb, max_sfb)?;
-        let state = &mut self.pns_state.lock().unwrap_or_else(|e| e.into_inner());
+        // The stream-wide generator by default (FFmpeg's process); the
+        // channel's own generator with set_shared_pns_seed.
+        let mut stream_state;
+        let state = if self.shared_pns_seed {
+            &mut self.channel_pns[slot]
+        } else {
+            stream_state = self.pns_state.lock().unwrap_or_else(|e| e.into_inner());
+            &mut *stream_state
+        };
         let mut pns_chan = PnsChannel {
             spec: &mut spec,
             sfb_cb: &ch.body.section_data.sfb_cb,
@@ -720,11 +772,11 @@ impl ElementDecoder {
             ltp,
             aot,
             fs_index,
-            &mut self.filterbanks[0],
-            &mut self.ltp_states[0],
-            &mut self.predictor_banks[0],
-            &mut self.ssr_decoders[0],
-            &mut self.eld_filterbanks[0],
+            &mut self.filterbanks[slot],
+            &mut self.ltp_states[slot],
+            &mut self.predictor_banks[slot],
+            &mut self.ssr_decoders[slot],
+            &mut self.eld_filterbanks[slot],
             coupling,
             true,
         )
@@ -779,7 +831,12 @@ impl ElementDecoder {
         // Independent CPE channels may switch windows and band counts
         // separately. Only tools that combine both spectra need shared
         // geometry; each channel's PNS and prediction use its own ICS.
-        let intensity = right.body.section_data.sfb_cb.iter().flatten()
+        let intensity = right
+            .body
+            .section_data
+            .sfb_cb
+            .iter()
+            .flatten()
             .any(|&cb| is_intensity(cb) != 0);
         let mid_side = joint.ms_mask_present != MsMaskPresent::AllZeros;
         if (mid_side || intensity)
@@ -806,20 +863,36 @@ impl ElementDecoder {
         // channel's noise. M/S skips noise bands.
         let left_nrg = noise_nrg_table(&left_abs, &left.body.section_data.sfb_cb, max_sfb)?;
         let right_nrg = noise_nrg_table(
-            &right_abs, &right.body.section_data.sfb_cb, right.ics_info.max_sfb as usize,
+            &right_abs,
+            &right.body.section_data.sfb_cb,
+            right.ics_info.max_sfb as usize,
         )?;
         {
-            let state = &mut self.pns_state.lock().unwrap_or_else(|e| e.into_inner());
-            for (spec, ch, nrg) in [
+            // With set_shared_pns_seed each channel draws from its own
+            // generator instead of the stream-wide one.
+            let shared_seed = self.shared_pns_seed;
+            let channel_pns = &mut self.channel_pns;
+            let stream_state = &mut self.pns_state.lock().unwrap_or_else(|e| e.into_inner());
+            for (slot, (spec, ch, nrg)) in [
                 (&mut left_spec, left, &left_nrg),
                 (&mut right_spec, right, &right_nrg),
-            ] {
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let state: &mut u32 = if shared_seed {
+                    &mut channel_pns[slot]
+                } else {
+                    stream_state
+                };
                 let mut chan = PnsChannel {
                     spec,
                     sfb_cb: &ch.body.section_data.sfb_cb,
                     noise_nrg: nrg,
                 };
-                apply_pns(&mut chan, ch.ics_info, fs_index, |out| gen_rand_vector(out, state))?;
+                apply_pns(&mut chan, ch.ics_info, fs_index, |out| {
+                    gen_rand_vector(out, state)
+                })?;
             }
         }
 
@@ -854,10 +927,17 @@ impl ElementDecoder {
         // for later predicted frames.
         if aot == 1 {
             let banks = &mut self.predictor_banks;
-            let bank0 = banks[0]            .get_or_insert_with(|| PredictorBank::new(fs_index).expect("predictor bank"));
+            let bank0 = banks[0]
+                .get_or_insert_with(|| PredictorBank::new(fs_index).expect("predictor bank"));
             bank0.apply_long(&mut left_spec, geom, geom.predictor_data.as_ref(), fs_index)?;
-            let bank1 = banks[1]            .get_or_insert_with(|| PredictorBank::new(fs_index).expect("predictor bank"));
-            bank1.apply_long(&mut right_spec, right.ics_info, right.ics_info.predictor_data.as_ref(), fs_index)?;
+            let bank1 = banks[1]
+                .get_or_insert_with(|| PredictorBank::new(fs_index).expect("predictor bank"));
+            bank1.apply_long(
+                &mut right_spec,
+                right.ics_info,
+                right.ics_info.predictor_data.as_ref(),
+                fs_index,
+            )?;
         }
 
         // §4.6.8.2 intensity stereo: right derived from left on
@@ -964,7 +1044,7 @@ mod tests {
     use super::*;
     use crate::ics_info::{WindowSequence, WindowShape};
     use crate::scale_factor_data::{ScaleFactorData, ScaleFactorEntry};
-    use crate::section_data::{Section, SectionData, INTENSITY_HCB, NOISE_HCB};
+    use crate::section_data::{INTENSITY_HCB, NOISE_HCB, Section, SectionData};
 
     // ---- band-indexed track expansion ----
 
@@ -1314,7 +1394,11 @@ mod tests {
         let left_body = make_body(4, 2, &[0; 4]);
         let left_ics = left_body.ics_info.clone().unwrap();
         let left_spec = make_spectral(3);
-        let left = ChannelInput { body: &left_body, ics_info: &left_ics, spectral: &left_spec };
+        let left = ChannelInput {
+            body: &left_body,
+            ics_info: &left_ics,
+            spectral: &left_spec,
+        };
         let mut pair = ElementDecoder::new();
         let mut mono_left = ElementDecoder::new();
         let mut mono_right = ElementDecoder::new();
@@ -1337,22 +1421,35 @@ mod tests {
                 right_ics.window_group_length = vec![1; 8];
                 right_ics.scale_factor_grouping = Some(0);
                 right_ics.num_swb = crate::ics_info::NUM_SWB_SHORT_WINDOW[4];
-                right_body.section_data.sections = vec![right_body.section_data.sections[0].clone(); 8];
+                right_body.section_data.sections =
+                    vec![right_body.section_data.sections[0].clone(); 8];
                 right_body.section_data.sfb_cb = vec![right_body.section_data.sfb_cb[0].clone(); 8];
-                right_body.scale_factor_data.entries = vec![right_body.scale_factor_data.entries[0].clone(); 8];
-                SpectralData { x_quant: vec![vec![2; 128]; 8] }
+                right_body.scale_factor_data.entries =
+                    vec![right_body.scale_factor_data.entries[0].clone(); 8];
+                SpectralData {
+                    x_quant: vec![vec![2; 128]; 8],
+                }
             } else {
                 make_spectral(2)
             };
             right_body.ics_info = Some(right_ics.clone());
-            let right = ChannelInput { body: &right_body, ics_info: &right_ics, spectral: &right_spec };
+            let right = ChannelInput {
+                body: &right_body,
+                ics_info: &right_ics,
+                spectral: &right_spec,
+            };
             let expected_left = mono_left.decode_sce(&left, 2, 4).unwrap();
             let expected_right = mono_right.decode_sce(&right, 2, 4).unwrap();
-            let (actual_left, actual_right) = pair.decode_cpe(&left, &right, &CpeJointStereo::default(), 2, 4).unwrap();
+            let (actual_left, actual_right) = pair
+                .decode_cpe(&left, &right, &CpeJointStereo::default(), 2, 4)
+                .unwrap();
             assert_eq!(actual_left, expected_left, "left at {sequence:?}");
             assert_eq!(actual_right, expected_right, "right at {sequence:?}");
             if sequence == WindowSequence::EightShort {
-                let joint = CpeJointStereo { ms_mask_present: MsMaskPresent::AllOnes, ms_used: vec![] };
+                let joint = CpeJointStereo {
+                    ms_mask_present: MsMaskPresent::AllOnes,
+                    ms_used: vec![],
+                };
                 assert!(matches!(
                     ElementDecoder::new().decode_cpe(&left, &right, &joint, 2, 4),
                     Err(Error::ElementDecodeInvalid)

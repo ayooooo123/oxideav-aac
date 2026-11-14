@@ -39,13 +39,16 @@
 use std::borrow::Cow;
 use std::sync::OnceLock;
 
+use crate::Error;
 use crate::ics_info::{IcsInfo, WindowSequence, WindowShape};
 use crate::mdct::CACHED_LENGTHS;
-use crate::swb_offset::{FrameFamily, LONG_WINDOW_LEN, SHORT_WINDOW_LEN};
-use crate::Error;
+#[cfg(test)]
+use crate::swb_offset::LONG_WINDOW_LEN;
+use crate::swb_offset::{FrameFamily, SHORT_WINDOW_LEN};
 
 /// `N` for a long-sequence transform (§4.6.11.3.1): 2 ×
 /// [`LONG_WINDOW_LEN`].
+#[cfg(test)]
 const LONG_TRANSFORM_LEN: usize = 2 * LONG_WINDOW_LEN as usize; // 2048
 /// `N` for a single short-sequence transform: 2 ×
 /// [`SHORT_WINDOW_LEN`].
@@ -54,6 +57,7 @@ const SHORT_TRANSFORM_LEN: usize = 2 * SHORT_WINDOW_LEN as usize; // 256
 /// sequence.
 const NUM_SHORT_WINDOWS: usize = 8;
 /// `N_l` — the long transform length, used as the frame's PCM stride.
+#[cfg(test)]
 const N_L: usize = LONG_TRANSFORM_LEN; // 2048
 /// `N_s` — the short transform length.
 const N_S: usize = SHORT_TRANSFORM_LEN; // 256
@@ -61,6 +65,46 @@ const N_S: usize = SHORT_TRANSFORM_LEN; // 256
 /// Result of [`Filterbank::synthesize`]: one frame of
 /// `LONG_WINDOW_LEN` (1024) PCM-domain samples for a single channel.
 type Result<T> = core::result::Result<T, Error>;
+
+/// The defining §4.6.11.3.1 inverse-MDCT sum, `O(N²)`: the test oracle
+/// for [`imdct`].
+#[cfg(test)]
+pub(crate) fn imdct_direct(spec: &[f64], n_transform: usize) -> Vec<f64> {
+    let half = n_transform / 2;
+    debug_assert_eq!(spec.len(), half);
+    let n0 = (half + 1) as f64 / 2.0;
+    let scale = 2.0 / n_transform as f64;
+    let phase_step = 2.0 * core::f64::consts::PI / n_transform as f64;
+    let mut out = vec![0.0f64; n_transform];
+    for (n, slot) in out.iter_mut().enumerate() {
+        let np = n as f64 + n0;
+        let mut acc = 0.0f64;
+        for (k, &c) in spec.iter().enumerate() {
+            acc += c * (phase_step * np * (k as f64 + 0.5)).cos();
+        }
+        *slot = scale * acc;
+    }
+    out
+}
+
+/// The defining forward-MDCT sum, `O(N²)`: the test oracle for
+/// [`forward_mdct`].
+#[cfg(test)]
+pub(crate) fn forward_mdct_direct(time: &[f64], n_transform: usize) -> Vec<f64> {
+    let half = n_transform / 2;
+    debug_assert_eq!(time.len(), n_transform);
+    let n0 = (half + 1) as f64 / 2.0;
+    let step = 2.0 * core::f64::consts::PI / n_transform as f64;
+    (0..half)
+        .map(|k| {
+            2.0 * time
+                .iter()
+                .enumerate()
+                .map(|(n, &t)| t * (step * (n as f64 + n0) * (k as f64 + 0.5)).cos())
+                .sum::<f64>()
+        })
+        .collect()
+}
 
 /// §4.6.11.3.1 — inverse MDCT for a length-`n_transform` window.
 ///
@@ -144,23 +188,7 @@ pub(crate) fn long_only_window_family(
     w
 }
 
-/// §4.6.11.3.2 — assemble the length-2048 window for any of the
-/// three long-transform sequences. The window is shared between the
-/// decoder's synthesis and the encoder's analysis (the §4.6.11
-/// filterbank is its own
-/// transpose up to the TDAC fold, so the same window applies on both
-/// sides). Returns [`Error::FilterbankInvalid`] for
-/// `EIGHT_SHORT_SEQUENCE` — use [`short_window_j`] per short window
-/// instead.
-pub(crate) fn long_sequence_window(
-    sequence: WindowSequence,
-    left_shape: WindowShape,
-    right_shape: WindowShape,
-) -> Result<Vec<f64>> {
-    long_sequence_window_n(N_L, N_S, sequence, left_shape, right_shape)
-}
-
-/// §4.6.11.3.2 — the [`long_sequence_window`] construction generalized
+/// §4.6.11.3.2 — the long-transform sequence window construction, generalized
 /// to an arbitrary `(n_l, n_s)` transform family. The SSR gain-control
 /// filterbank (§4.6.12.1) runs the same window geometry at
 /// `(512, 64)` — one quarter of the standard family — per band.
@@ -210,14 +238,6 @@ pub(crate) fn short_window_n(
     }
     w
 }
-
-/// §4.6.11.3.2 c) — offset of short window 0 inside the 2048-sample
-/// frame window region: `(N_l − N_s)/4 = 448`.
-pub(crate) const SHORT_SEQ_START: usize = (N_L - N_S) / 4;
-
-/// §4.6.11.3.2 c) — hop between successive short windows:
-/// `N_s/2 = 128`.
-pub(crate) const SHORT_SEQ_HOP: usize = N_S / 2;
 
 /// Modified Bessel function of the first kind, order 0, via its power
 /// series `I0(x) = Σ_k ((x/2)^k / k!)^2` (§4.6.11.3.2). The series
@@ -404,7 +424,11 @@ static HALF_WINDOWS: [OnceLock<Vec<f64>>; 3 * CACHED_LENGTHS.len()] =
 /// The left half-window for `shape` at `n_transform` under `style`
 /// ([`compute_half_window`]), from the process-wide cache for the
 /// codec's transform lengths.
-fn half_window_style(n_transform: usize, shape: WindowShape, style: WindowStyle) -> Cow<'static, [f64]> {
+fn half_window_style(
+    n_transform: usize,
+    shape: WindowShape,
+    style: WindowStyle,
+) -> Cow<'static, [f64]> {
     let kind = match (shape, style) {
         (WindowShape::Sine, _) => 0,
         (WindowShape::Kbd, WindowStyle::Standard) => 1,
@@ -461,10 +485,18 @@ pub struct Filterbank {
     /// windowed signal (§4.6.11.3.3). `family.frame_len()` long.
     overlap: Vec<f64>,
     /// `window_shape` of the previous block, governing the left-half
-    /// window shape of the next block. Starts as [`WindowShape::Sine`]:
-    /// the block before the first one is taken to be sine-windowed, as
-    /// FFmpeg's zero-initialised `use_kb_window` history does.
+    /// window shape of the next block. [`None`] before the first block.
     prev_shape: Option<WindowShape>,
+    /// The shape assumed for the (absent) block before the first.
+    /// [`WindowShape::Sine`] by default — the block before the first
+    /// one is taken to be sine-windowed, as FFmpeg's zero-initialised
+    /// `use_kb_window` history does; [`None`] selects the §4.6.11.3.2
+    /// first-block rule ([`Self::set_sine_before_first_block`]).
+    first_left_shape: Option<WindowShape>,
+    /// The ER AAC ELD low-delay filterbank (§4.6.20) in place of the
+    /// MDCT one: `overlap` then holds the windowed contributions of
+    /// the three previous blocks to the next `3N` output samples.
+    low_delay: bool,
     /// This frame's windowed time signal `z[i][0 .. N]`
     /// (`family.long_transform_len()` long), reused across frames.
     z: Vec<f64>,
@@ -491,9 +523,37 @@ impl Filterbank {
         Filterbank {
             family,
             overlap: vec![0.0f64; family.frame_len()],
-            prev_shape: Some(WindowShape::Sine),
+            prev_shape: None,
+            first_left_shape: Some(WindowShape::Sine),
+            low_delay: false,
             z: vec![0.0f64; family.long_transform_len()],
         }
+    }
+
+    /// Treat the stream as if a sine-shaped block preceded the first
+    /// (on by default, as Apple's and FFmpeg's decoders do — black
+    /// box). Disabled, the first block's left half takes its own
+    /// `window_shape`, the literal §4.6.11.3.2 rule, which differs on a
+    /// stream whose first block is KBD-shaped. Only the first block is
+    /// affected; set before it.
+    pub fn set_sine_before_first_block(&mut self, enabled: bool) {
+        self.first_left_shape = enabled.then_some(WindowShape::Sine);
+    }
+
+    /// A fresh ER AAC ELD low-delay filterbank (§4.6.20) for the
+    /// 512- or 480-line family.
+    pub fn new_low_delay(family: FrameFamily) -> Result<Self> {
+        if !family.is_ld() {
+            return Err(Error::FilterbankInvalid);
+        }
+        Ok(Filterbank {
+            family,
+            overlap: vec![0.0f64; 3 * family.frame_len()],
+            prev_shape: None,
+            first_left_shape: None,
+            low_delay: true,
+            z: Vec::new(),
+        })
     }
 
     /// The [`FrameFamily`] this filterbank was constructed for.
@@ -519,14 +579,16 @@ impl Filterbank {
 
     /// §4.6.11.3.2 — the previous block's `window_shape`, which governs
     /// the left-half shape of the *next* block's analysis/synthesis
-    /// window ([`WindowShape::Sine`] before the first frame).
+    /// window. Before the first frame it is [`WindowShape::Sine`], or
+    /// [`None`] (the first block uses its own shape for both halves)
+    /// once [`Self::set_sine_before_first_block`] is disabled.
     ///
     /// The §4.6.7.4.1 LTP analysis MDCT must window `x_est` with the
     /// same composite long window the filterbank uses for this frame, so
     /// the element driver reads the previous shape here before
     /// synthesizing.
     pub fn prev_shape(&self) -> Option<WindowShape> {
-        self.prev_shape
+        self.prev_shape.or(self.first_left_shape)
     }
 
     /// §4.6.11 — synthesize one frame of `LONG_WINDOW_LEN` (1024) PCM
@@ -555,12 +617,27 @@ impl Filterbank {
     /// `STOP_START` block, which USAC decodes as `STOP_START_SEQUENCE`
     /// (ISO/IEC 23003-3; the reference decoder's `usacMapWindowSequences`):
     /// short overlap on both sides.
-    pub(crate) fn synthesize_usac(&mut self, spec: &[f64], ics_info: &IcsInfo, stop_start: bool) -> Result<Vec<f64>> {
+    pub(crate) fn synthesize_usac(
+        &mut self,
+        spec: &[f64],
+        ics_info: &IcsInfo,
+        stop_start: bool,
+    ) -> Result<Vec<f64>> {
         if ics_info.family != self.family {
             return Err(Error::FilterbankInvalid);
         }
-        let left_shape = self.prev_shape.unwrap_or(ics_info.window_shape);
-        windowed_signal(self.family, spec, ics_info, left_shape, stop_start, &mut self.z)?;
+        if self.low_delay {
+            return self.synthesize_low_delay(spec);
+        }
+        let left_shape = self.prev_shape().unwrap_or(ics_info.window_shape);
+        windowed_signal(
+            self.family,
+            spec,
+            ics_info,
+            left_shape,
+            stop_start,
+            &mut self.z,
+        )?;
 
         // §4.6.11.3.3 overlap-add: out[n] = z[i][n] + z[i-1][n + N/2].
         let half = self.family.frame_len();
@@ -579,12 +656,55 @@ impl Filterbank {
         Ok(out)
     }
 
+    /// §4.6.20 — the ELD low-delay synthesis of one `N`-line block:
+    /// the inverse transform with phase `n0 = (-N/2 + 1)/2` and scale
+    /// `-2/N` (the MDCT transform's output delayed by `3N/4`), extended
+    /// to `4N` samples by `y[n + 2N] = -y[n]`, windowed by the `4N`
+    /// low-delay window, and overlap-added with the three previous
+    /// blocks: `out[n] = z[i][n] + z[i-1][n + N] + z[i-2][n + 2N] +
+    /// z[i-3][n + 3N]`.
+    fn synthesize_low_delay(&mut self, spec: &[f64]) -> Result<Vec<f64>> {
+        let n = self.family.frame_len();
+        if spec.len() != n {
+            return Err(Error::FilterbankInvalid);
+        }
+        let window: &[f64] = match self.family {
+            FrameFamily::Ld512 => &crate::eld_window::LD_WINDOW_512,
+            _ => &crate::eld_window::LD_WINDOW_480,
+        };
+        let x = imdct(spec, 2 * n);
+        let shift = 3 * n / 4;
+        let y = |m: usize| -> f64 {
+            let base = m % (2 * n);
+            let value = if base < shift {
+                x[base + 2 * n - shift]
+            } else {
+                -x[base - shift]
+            };
+            if m < 2 * n { value } else { -value }
+        };
+        // z[m] for m < window.len(); the window is zero beyond.
+        let z: Vec<f64> = window.iter().enumerate().map(|(m, &w)| w * y(m)).collect();
+        let out: Vec<f64> = (0..n).map(|m| z[m] + self.overlap[m]).collect();
+        let mut next = vec![0.0f64; 3 * n];
+        for (k, slot) in next.iter_mut().enumerate() {
+            let carried = if k + n < 3 * n {
+                self.overlap[k + n]
+            } else {
+                0.0
+            };
+            *slot = carried + z.get(k + n).copied().unwrap_or(0.0);
+        }
+        self.overlap = next;
+        Ok(out)
+    }
+
     /// [`windowed_signal`] for this filterbank's state, as a fresh
     /// vector.
     #[cfg(test)]
     fn windowed_signal(&self, spec: &[f64], ics_info: &IcsInfo) -> Result<Vec<f64>> {
         let mut z = vec![0.0f64; self.family.long_transform_len()];
-        let left_shape = self.prev_shape.unwrap_or(ics_info.window_shape);
+        let left_shape = self.prev_shape().unwrap_or(ics_info.window_shape);
         windowed_signal(self.family, spec, ics_info, left_shape, false, &mut z)?;
         Ok(z)
     }
@@ -635,7 +755,7 @@ fn windowed_signal(
         WindowSequence::LongStart => LongKind::Start,
         WindowSequence::LongStop => LongKind::Stop,
         WindowSequence::EightShort => {
-            return short_windowed(family, spec, left_shape, right_shape, z)
+            return short_windowed(family, spec, left_shape, right_shape, z);
         }
     };
     long_windowed(family, spec, left_shape, right_shape, kind, z)
@@ -781,7 +901,10 @@ fn apply_long_window(
         LongKind::Start | LongKind::StopStart => {
             let b = (3 * n_l - n_s) / 4 - half_l;
             let short_right = half_window_style(n_s, right_shape, style);
-            for (v, &w) in tail[b..b + n_s / 2].iter_mut().zip(short_right.iter().rev()) {
+            for (v, &w) in tail[b..b + n_s / 2]
+                .iter_mut()
+                .zip(short_right.iter().rev())
+            {
                 *v *= w;
             }
             tail[b + n_s / 2..].fill(0.0);
@@ -1412,6 +1535,47 @@ mod tests {
         assert!(w[448] < w[575]);
     }
 
+    /// A fresh filterbank and one primed with a silent block of
+    /// `primer` shape synthesize the same `KBD` block.
+    fn first_kbd_block_matches_primed(fresh: &mut Filterbank, primer: WindowShape) {
+        let spec: Vec<f64> = (0..1024)
+            .map(|k| if k % 37 == 3 { 1000.0 } else { 0.0 })
+            .collect();
+        let kbd = long_info(WindowShape::Kbd, WindowSequence::OnlyLong);
+        let first = fresh.synthesize(&spec, &kbd).unwrap();
+        let mut primed = Filterbank::new();
+        primed
+            .synthesize(
+                &vec![0.0; spec.len()],
+                &long_info(primer, WindowSequence::OnlyLong),
+            )
+            .unwrap();
+        let after = primed.synthesize(&spec, &kbd).unwrap();
+        assert_eq!(first, after);
+    }
+
+    #[test]
+    fn first_frame_uses_own_shape_for_left_half_when_opted_out() {
+        // §4.6.11.3.2: with the sine default disabled the first block's
+        // halves share its own shape, so a fresh filterbank synthesizes
+        // a KBD block as one that first ran a silent KBD block does.
+        let mut fresh = Filterbank::new();
+        fresh.set_sine_before_first_block(false);
+        assert_eq!(fresh.prev_shape(), None);
+        first_kbd_block_matches_primed(&mut fresh, WindowShape::Kbd);
+    }
+
+    #[test]
+    fn first_block_follows_a_sine_shaped_block_by_default() {
+        // By default the first block's left half is the sine window's:
+        // a fresh filterbank synthesizes a KBD block exactly as one that
+        // first ran a silent sine-shaped block does, and LTP analysis
+        // sees the same previous shape.
+        let mut fresh = Filterbank::new();
+        assert_eq!(fresh.prev_shape(), Some(WindowShape::Sine));
+        first_kbd_block_matches_primed(&mut fresh, WindowShape::Sine);
+    }
+
     #[test]
     fn first_frame_uses_sine_for_left_half() {
         // The block before the first one counts as sine-windowed
@@ -1422,7 +1586,10 @@ mod tests {
         let mut spec = vec![0.0; LONG_WINDOW_LEN as usize];
         spec[3] = 1.0;
         let kbd_first = fb
-            .windowed_signal(&spec, &long_info(WindowShape::Kbd, WindowSequence::OnlyLong))
+            .windowed_signal(
+                &spec,
+                &long_info(WindowShape::Kbd, WindowSequence::OnlyLong),
+            )
             .unwrap();
         let x = imdct(&spec, 2 * LONG_WINDOW_LEN as usize);
         let sine = fb
@@ -1541,8 +1708,8 @@ mod tests {
             let std = Filterbank::new()
                 .long_window(WindowShape::Sine, WindowShape::Sine, kind)
                 .unwrap();
-            let gen = build_long_window_n(2048, 256, WindowShape::Sine, WindowShape::Sine, kind);
-            assert_eq!(std, gen);
+            let r#gen = build_long_window_n(2048, 256, WindowShape::Sine, WindowShape::Sine, kind);
+            assert_eq!(std, r#gen);
         }
         // SSR LONG_START at (512, 64): 1.0 plateau over [256, 368),
         // short descent over [368, 400), zero over [400, 512).
@@ -1595,6 +1762,101 @@ mod tests {
                     n + 256
                 );
             }
+        }
+    }
+
+    /// The ELD low-delay synthesis: one block's coefficients reach the
+    /// output over four blocks (the window's 4N span, its last N/4
+    /// zero), and the overlap state carries the three later blocks.
+    #[test]
+    fn low_delay_block_spans_four_frames() {
+        for family in [
+            crate::swb_offset::FrameFamily::Ld512,
+            crate::swb_offset::FrameFamily::Ld480,
+        ] {
+            let n = family.frame_len();
+            let mut fb = Filterbank::new_low_delay(family).unwrap();
+            let mut info = long_info(WindowShape::Sine, WindowSequence::OnlyLong);
+            info.family = family;
+            let mut spec = vec![0.0f64; n];
+            spec[7] = 1000.0;
+            let silent = vec![0.0f64; n];
+            let mut frames = vec![fb.synthesize(&spec, &info).unwrap()];
+            for _ in 0..4 {
+                frames.push(fb.synthesize(&silent, &info).unwrap());
+            }
+            let energy = |f: &[f64]| f.iter().map(|v| v * v).sum::<f64>();
+            for f in &frames[..4] {
+                assert!(energy(f) > 1e-6, "every block of the window carries signal");
+            }
+            assert!(
+                frames[3][3 * n / 4..].iter().all(|&v| v == 0.0),
+                "the window's last N/4 are zero"
+            );
+            assert_eq!(energy(&frames[4]), 0.0, "nothing beyond four blocks");
+        }
+        assert!(Filterbank::new_low_delay(crate::swb_offset::FrameFamily::Lc1024).is_err());
+    }
+}
+#[cfg(test)]
+mod fast_transform_tests {
+    //! The FFT-based transforms against the direct §4.6.11.3.1 sums they
+    //! replace, at every transform length the crate uses: the long and
+    //! short windows of the 1024 and 960 frame families, the LD 480
+    //! family, and the SSR filterbank's two lengths. The 960 and 480
+    //! lengths are not powers of two and exercise the Bluestein path.
+    use super::{forward_mdct, forward_mdct_direct, imdct, imdct_direct};
+
+    const LENGTHS: [usize; 8] = [64, 120, 240, 256, 512, 960, 1920, 2048];
+
+    /// Deterministic pseudo-random samples in [-1, 1) (a 64-bit LCG).
+    fn noise(len: usize, seed: u64) -> Vec<f64> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn assert_close(got: &[f64], want: &[f64], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        let scale = want.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+        let worst = got
+            .iter()
+            .zip(want)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            worst <= 1e-9 * scale,
+            "{what}: worst difference {worst:e} against a full scale of {scale:e}"
+        );
+    }
+
+    #[test]
+    fn forward_mdct_matches_the_direct_sum() {
+        for (i, &n) in LENGTHS.iter().enumerate() {
+            let time = noise(n, 11 + i as u64);
+            assert_close(
+                &forward_mdct(&time, n),
+                &forward_mdct_direct(&time, n),
+                &format!("forward MDCT N = {n}"),
+            );
+        }
+    }
+
+    #[test]
+    fn imdct_matches_the_direct_sum() {
+        for (i, &n) in LENGTHS.iter().enumerate() {
+            let spec = noise(n / 2, 97 + i as u64);
+            assert_close(
+                &imdct(&spec, n),
+                &imdct_direct(&spec, n),
+                &format!("IMDCT N = {n}"),
+            );
         }
     }
 }

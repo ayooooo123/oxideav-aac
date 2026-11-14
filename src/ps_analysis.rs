@@ -31,7 +31,7 @@
 //! All truth from ISO/IEC 14496-3:2009 subpart 8 (Annexes 8.A / 8.C)
 //! staged under `docs/audio/aac/`.
 
-use crate::ps_hybrid::{HybridConfig, PsHybrid, LOOKAHEAD, NUM_QMF_SLOTS};
+use crate::ps_hybrid::{HybridConfig, LOOKAHEAD, NUM_QMF_SLOTS, PsHybrid};
 use crate::sbr_qmf::Complex;
 use crate::{Error, Result};
 
@@ -199,6 +199,7 @@ impl PsAnalysis {
 /// The Annex 8.C.6.2 excitations of one stereo band over one
 /// parameter region.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct BandStats {
     /// `e_l(b)` — left excitation.
     pub el: f64,

@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use oxideav_aac::decode::StreamDecoder;
-use oxideav_aac::he_aac_encoder::{HeAacConfig, HeAacEncoder, HE_FRAME_LEN};
-use oxideav_aac::ps_analysis::{band_stats, hybrid_config_for, BandStats, PsAnalysis};
+use oxideav_aac::he_aac_encoder::{HE_FRAME_LEN, HeAacConfig, HeAacEncoder};
+use oxideav_aac::ps_analysis::{BandStats, PsAnalysis, band_stats, hybrid_config_for};
 use oxideav_aac::ps_encoder::{Election, PsBands, PsEncoderConfig};
 use oxideav_aac::ps_hybrid::{LOOKAHEAD, NUM_QMF_SLOTS};
 use oxideav_aac::sbr_qmf::{Complex, EncoderAnalysisQmf};
@@ -200,11 +200,15 @@ fn round_trip(pcm: &[i16], cfg: HeAacConfig) -> (HeAacEncoder, RoundTrip) {
         out.extend(f.pcm.iter().map(|&s| (s * 32768.0) as i16));
     }
     let sum_in: Vec<f64> = pcm
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| f64::from(c[0]) + f64::from(c[1]))
         .collect();
     let sum_out: Vec<f64> = out
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| f64::from(c[0]) + f64::from(c[1]))
         .collect();
     let lag = best_lag(&sum_in, &sum_out, 3 * HE_FRAME_LEN);
@@ -273,15 +277,12 @@ fn configuration_matrix_keeps_the_image() {
     let pcm = synthetic_stereo(1.2, 48_000);
     for bands in [PsBands::Ten, PsBands::Twenty, PsBands::ThirtyFour] {
         for (fine, phase) in [(false, false), (true, true)] {
-            let cfg = HeAacConfig {
-                ps: PsEncoderConfig {
-                    bands,
-                    fine_iid: fine.into(),
-                    phase: phase.into(),
-                    ..PsEncoderConfig::default()
-                },
-                ..HeAacConfig::new_v2(48_000, 40_000)
-            };
+            let cfg = HeAacConfig::new_v2(48_000, 40_000).with_ps(
+                PsEncoderConfig::default()
+                    .with_bands(bands)
+                    .with_fine_iid(fine.into())
+                    .with_phase(phase.into()),
+            );
             let (_enc, rt) = round_trip(&pcm, cfg);
             let n = rt.aligned.len().min(pcm.len());
             let n_pars = bands.count();
@@ -290,7 +291,10 @@ fn configuration_matrix_keeps_the_image() {
             let e = cue_error(&a, &b, phase);
             eprintln!(
                 "{bands:?} fine={fine} phase={phase}: IID err {:.2} dB (worst {:.2}), ICC err {:.3}, {} bytes",
-                e.iid_mean_db, e.iid_worst_db, e.icc_mean, rt.stream.len()
+                e.iid_mean_db,
+                e.iid_worst_db,
+                e.icc_mean,
+                rt.stream.len()
             );
             assert!(
                 e.iid_mean_db < 3.0,
@@ -342,7 +346,10 @@ fn cue_switch_is_time_aligned_with_the_audio() {
         .expect("switch seen");
     let expect = switch / 64;
     let delta = first_right as i64 - expect as i64;
-    eprintln!("switch at slot {expect}, decoded right-dominant from slot {first_right} (Δ {delta} slots, lag {})", rt.lag);
+    eprintln!(
+        "switch at slot {expect}, decoded right-dominant from slot {first_right} (Δ {delta} slots, lag {})",
+        rt.lag
+    );
     assert!(delta.abs() <= 6, "cue switch misaligned by {delta} slots");
     // Before the switch the image is hard left, after it hard right
     // (long-term, away from the transition).
@@ -386,10 +393,15 @@ fn loas_wrapped_he_aac_v2_decodes_as_stereo() {
         let mut dec = oxideav_aac::latm::LoasDecoder::new();
         let frames = dec.decode_all(&loas).expect("LOAS decode");
         assert!(!frames.is_empty());
-        assert!(frames
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.sample_rate == 44_100 && f.channels == 2)
+        );
+        let latm_pcm: Vec<i16> = frames
             .iter()
-            .all(|f| f.sample_rate == 44_100 && f.channels == 2));
-        let latm_pcm: Vec<i16> = frames.iter().flat_map(|f| f.pcm.iter().map(|&s| (s * 32768.0) as i16)).collect();
+            .flat_map(|f| f.pcm.iter().map(|&s| (s * 32768.0) as i16))
+            .collect();
         assert_eq!(latm_pcm, adts_pcm, "hierarchical={hierarchical}");
     }
 }
@@ -421,7 +433,9 @@ fn read_wav(path: &PathBuf) -> Option<(Vec<i16>, usize, u32)> {
         if cid == b"data" {
             let end = (body + sz).min(d.len());
             let pcm = d[body..end]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
             return Some((pcm, channels.max(1), rate));
@@ -482,12 +496,10 @@ fn reference_binary_decodes_our_he_aac_v2_as_stereo() {
             "v2_48k_34fine_phase",
             48_000,
             48_000,
-            PsEncoderConfig {
-                bands: PsBands::ThirtyFour,
-                fine_iid: Election::On,
-                phase: Election::On,
-                ..PsEncoderConfig::default()
-            },
+            PsEncoderConfig::default()
+                .with_bands(PsBands::ThirtyFour)
+                .with_fine_iid(Election::On)
+                .with_phase(Election::On),
             false,
         ),
         // The delayed pair under the default `Auto` elections: the
@@ -505,10 +517,7 @@ fn reference_binary_decodes_our_he_aac_v2_as_stereo() {
         } else {
             synthetic_stereo(1.5, fs_out)
         };
-        let cfg = HeAacConfig {
-            ps,
-            ..HeAacConfig::new_v2(fs_out, bitrate)
-        };
+        let cfg = HeAacConfig::new_v2(fs_out, bitrate).with_ps(ps);
         let (enc, rt) = round_trip(&pcm, cfg);
         if delayed {
             assert!(
@@ -582,11 +591,15 @@ fn reference_binary_decodes_our_he_aac_v2_as_stereo() {
             // the coherent phase bands against this crate's decode
             // (both aligned to the source).
             let sum_in: Vec<f64> = pcm
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| f64::from(c[0]) + f64::from(c[1]))
                 .collect();
             let sum_ref: Vec<f64> = ref_pcm
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| f64::from(c[0]) + f64::from(c[1]))
                 .collect();
             let lag = best_lag(&sum_in, &sum_ref, 3 * HE_FRAME_LEN);
@@ -679,13 +692,8 @@ fn phase_layer_reproduces_the_inter_channel_phase() {
     let src = cues_of(&pcm, 20);
     let mut errors = Vec::new();
     for phase in [Election::Off, Election::On, Election::Auto] {
-        let cfg = HeAacConfig {
-            ps: PsEncoderConfig {
-                phase,
-                ..PsEncoderConfig::default()
-            },
-            ..HeAacConfig::new_v2(fs, 40_000)
-        };
+        let cfg =
+            HeAacConfig::new_v2(fs, 40_000).with_ps(PsEncoderConfig::default().with_phase(phase));
         let (enc, rt) = round_trip(&pcm, cfg);
         assert_eq!(
             enc.ps().unwrap().phase_on(),

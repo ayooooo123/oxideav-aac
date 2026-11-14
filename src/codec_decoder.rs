@@ -82,10 +82,10 @@ use oxideav_core::{
     Confidence, Decoder, Error, Frame, Packet, ProbeContext, Result, SampleFormat,
 };
 
-use crate::adts::{AdtsHeader, ADTS_HEADER_BYTES_NO_CRC};
+use crate::adts::{ADTS_HEADER_BYTES_NO_CRC, AdtsHeader};
 use crate::asc::AudioSpecificConfig;
 use crate::decode::{DecodedFrame, StreamDecoder};
-use crate::latm::{LoasDecoder, AUDIO_SYNC_STREAM_SYNCWORD};
+use crate::latm::{AUDIO_SYNC_STREAM_SYNCWORD, LoasDecoder};
 
 /// Codec id under which [`register_codecs`] installs this decoder.
 pub const CODEC_ID_STR: &str = "aac";
@@ -213,6 +213,14 @@ pub fn asc_output_geometry(asc: &AudioSpecificConfig, sbr_downsampled: bool) -> 
 ///   front.
 /// * `eof` — set by [`Decoder::flush`]; once `pending` drains and `eof`
 ///   is set, `receive_frame` returns [`Error::Eof`].
+///
+/// Output shape: [`Decoder::output_params`] answers the
+/// `(sample_rate, channels)` of the frame most recently returned (the
+/// first decoded frame's before any is returned). A later frame of a
+/// different shape — a concatenated stream switching sampling rate or
+/// channel configuration, SBR appearing under implicit signalling — is
+/// preceded by exactly one [`Frame::StreamParams`] event, with
+/// [`Decoder::output_params_generation`] bumped when it is returned.
 pub struct AacDecoder {
     codec_id: CodecId,
     output: CodecParameters,
@@ -227,8 +235,17 @@ pub struct AacDecoder {
     /// syncword). `None` until the first packet picks one; once set, every
     /// later packet is routed the same way.
     transport: Option<Transport>,
-    pending: VecDeque<AudioFrame>,
+    /// Decoded frames with their `(sample_rate, channels)` shape.
+    pending: VecDeque<(AudioFrame, (u32, u16))>,
     eof: bool,
+    /// Shape of the last frame `receive_frame` returned (kept across
+    /// [`Decoder::reset`]: the event rule is relative to it).
+    returned_shape: Option<(u32, u16)>,
+    /// The advertised output was refined from a decoded frame before
+    /// any frame was returned.
+    shape_resolved: bool,
+    /// [`Decoder::output_params_generation`].
+    generation: u64,
     /// The out-of-band `AudioSpecificConfig` from `params.extradata`
     /// (`None` without extradata; `Some(Err)` when the extradata did
     /// not parse — reported only if the packets carry no in-band
@@ -287,6 +304,9 @@ impl AacDecoder {
             transport: None,
             pending: VecDeque::new(),
             eof: false,
+            returned_shape: None,
+            shape_resolved: false,
+            generation: 0,
             asc: None,
             param_hint: (None, None),
             scalable: None,
@@ -327,6 +347,11 @@ impl AacDecoder {
         &self.output
     }
 
+    fn set_output_shape(&mut self, (rate, channels): (u32, u16)) {
+        self.output.sample_rate = Some(rate);
+        self.output.channels = Some(channels);
+    }
+
     /// Convert one [`DecodedFrame`]'s interleaved `f32` PCM to an
     /// interleaved-F32 [`AudioFrame`] (single plane, little-endian).
     fn decoded_to_audio(decoded: &DecodedFrame, pts: Option<i64>) -> AudioFrame {
@@ -350,9 +375,16 @@ impl AacDecoder {
     /// params; a fill-only frame (`channels == 0`) produces no audio.
     fn queue_decoded(&mut self, decoded: &DecodedFrame, pts: Option<i64>) -> bool {
         if decoded.channels > 0 {
-            self.output.sample_rate = Some(decoded.sample_rate);
-            self.output.channels = Some(decoded.channels as u16);
-            self.pending.push_back(Self::decoded_to_audio(decoded, pts));
+            let shape = (decoded.sample_rate, decoded.channels as u16);
+            // Up to the first returned frame the answer may be refined
+            // from what the stream actually carries (no event); later
+            // shapes are announced at receive time.
+            if self.returned_shape.is_none() && !self.shape_resolved {
+                self.set_output_shape(shape);
+                self.shape_resolved = true;
+            }
+            self.pending
+                .push_back((Self::decoded_to_audio(decoded, pts), shape));
             self.emitted_audio = true;
             true
         } else {
@@ -399,7 +431,7 @@ impl AacDecoder {
             None => {
                 return Err(Error::invalid(
                     "oxideav-aac: raw access unit without config",
-                ))
+                ));
             }
         };
         let decoded = if asc.aot == 6 || asc.aot == 20 {
@@ -449,7 +481,7 @@ impl AacDecoder {
                     return Err(Error::invalid(format!(
                         "oxideav-aac: bare access units without AudioSpecificConfig and \
                          {channels} channels (no Table 1.19 default layout)"
-                    )))
+                    )));
                 }
             };
             if !crate::adts::ADTS_SAMPLE_RATES_HZ.contains(&rate) {
@@ -558,7 +590,21 @@ impl Decoder for AacDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if let Some(audio) = self.pending.pop_front() {
+        if let Some(&(_, shape)) = self.pending.front() {
+            if let Some(prev) = self.returned_shape
+                && prev != shape
+            {
+                // One event per change, immediately before the first
+                // frame of the new shape; the answer and the counter
+                // move with it.
+                self.set_output_shape(shape);
+                self.generation = self.generation.wrapping_add(1);
+                self.returned_shape = Some(shape);
+                return Ok(Frame::StreamParams(Box::new(self.output.clone())));
+            }
+            self.set_output_shape(shape);
+            self.returned_shape = Some(shape);
+            let (audio, _) = self.pending.pop_front().expect("front checked");
             return Ok(Frame::Audio(audio));
         }
         if self.eof {
@@ -586,7 +632,16 @@ impl Decoder for AacDecoder {
         self.scalable = None;
         self.pending.clear();
         self.eof = false;
+        self.shape_resolved = false;
         Ok(())
+    }
+
+    fn output_params(&self) -> Option<CodecParameters> {
+        Some(self.output.clone())
+    }
+
+    fn output_params_generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -849,8 +904,8 @@ mod tests {
         dec.send_packet(&pkt).expect("send_packet");
         let mut trait_pcm: Vec<f32> = Vec::new();
         while let Ok(Frame::Audio(a)) = dec.receive_frame() {
-            for c in a.data[0].chunks_exact(4) {
-                trait_pcm.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            for c in a.data[0].as_chunks::<4>().0 {
+                trait_pcm.push(f32::from_le_bytes(*c));
             }
         }
         assert_eq!(trait_pcm, ref_pcm, "LOAS trait diverged from LoasDecoder");
@@ -953,8 +1008,8 @@ mod tests {
         for pkt in &packets {
             dec.send_packet(pkt).expect("send_packet");
             while let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for c in a.data[0].chunks_exact(4) {
-                    trait_pcm.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                for c in a.data[0].as_chunks::<4>().0 {
+                    trait_pcm.push(f32::from_le_bytes(*c));
                 }
             }
         }

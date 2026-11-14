@@ -10,8 +10,51 @@
 //! the `4N − N/4`-tap window read from sample `N/4` on, as the reference
 //! decoder does.
 
-use crate::eld_window::{ELD_WINDOW_480, ELD_WINDOW_512};
+use std::sync::OnceLock;
+
+use crate::eld_window::{LD_WINDOW_480, LD_WINDOW_512};
 use crate::{Error, Result};
+
+/// The taps where FFmpeg's `ff_aac_eld_window_512` (`aactab.c`, commit
+/// 2da55bf) differs from the Table 4.A.15 print, by one unit in the
+/// eighth decimal.
+const FFMPEG_TAPS_512: [(usize, f32); 8] = [
+    (922, 0.11254464),
+    (950, 0.06932666),
+    (1002, 0.01539397),
+    (1215, 0.00552065),
+    (1224, 0.00520417),
+    (1287, -0.00199910),
+    (1733, 0.00033632),
+    (1854, -0.00135577),
+];
+
+/// The same for `ff_aac_eld_window_480` against Table 4.A.16.
+const FFMPEG_TAPS_480: [(usize, f32); 5] = [
+    (1186, 0.00128830),
+    (1247, -0.00795059),
+    (1444, -0.00004771),
+    (1511, 0.00028079),
+    (1539, 0.00001999),
+];
+
+/// FFmpeg's ELD synthesis window for an `n`-line frame: the table's
+/// taps in single precision, as FFmpeg holds them.
+fn ffmpeg_window(n: usize) -> &'static [f64] {
+    static WINDOWS: [OnceLock<Vec<f64>>; 2] = [OnceLock::new(), OnceLock::new()];
+    let (slot, table, taps): (_, &[f64], &[(usize, f32)]) = if n == 480 {
+        (&WINDOWS[0], &LD_WINDOW_480, &FFMPEG_TAPS_480)
+    } else {
+        (&WINDOWS[1], &LD_WINDOW_512, &FFMPEG_TAPS_512)
+    };
+    slot.get_or_init(|| {
+        let mut window: Vec<f64> = table.iter().map(|&w| f64::from(w as f32)).collect();
+        for &(k, w) in taps {
+            window[k] = f64::from(w);
+        }
+        window
+    })
+}
 
 /// One channel's ELD synthesis state: the three previous half-length
 /// IMDCT outputs the four-frame overlap reads.
@@ -50,12 +93,8 @@ impl EldFilterbank {
             return Err(Error::FilterbankInvalid);
         }
         let (n2, n4) = (n / 2, n / 4);
-        let window: &[f32] = if n == 480 {
-            &ELD_WINDOW_480
-        } else {
-            &ELD_WINDOW_512
-        };
-        let w = |k: usize| f64::from(window[k]);
+        let window = ffmpeg_window(n);
+        let w = |k: usize| window[k];
 
         // Reorder and negate the lines so a standard IMDCT computes the
         // ELD inverse transform.
@@ -131,7 +170,11 @@ mod tests {
         spec[7] = 1000.0;
         let mut energies = Vec::new();
         for frame in 0..6 {
-            let input = if frame == 0 { spec.clone() } else { vec![0.0; 512] };
+            let input = if frame == 0 {
+                spec.clone()
+            } else {
+                vec![0.0; 512]
+            };
             let out = fb.synthesize(&input).unwrap();
             energies.push(out.iter().map(|v| v * v).sum::<f64>());
         }

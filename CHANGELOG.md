@@ -8,11 +8,143 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- ER channel streams (AOTs 17 / 19 / 23) read `tns_data()` at its
+  §4.5.2.4.2 error-sensitivity-category position — after the stream's
+  category-1 run (`gain_control_data_present` and the HCR length fields
+  included), directly before the spectral payload — at the literal
+  Table 4.155 widths (2 / 6 / 5 on long windows, LD included). The
+  previous syntax-order 1 / 4 / 3 LD reading consumed the always-zero
+  `gain_control_data_present` bit as `n_filt` and mis-decoded every
+  TNS-bearing ER AAC LD frame: black-box LD-512 streams now decode
+  within 1 LSB of a reference decoder binary on every access unit
+  (err/sig 1.5–2.8 on TNS frames and 5 failed AUs before).
+  `tns_data::field_widths_family` now returns the literal widths for
+  every family. #29 (ropoctl) reached the same placement and widths
+  independently, validated on black-box LD streams up to 8 channels.
+- `set_float_pcm_capture` stayed enabled only until the first
+  configuration change of a stream (a splice restarted the decoder and
+  switched capture off); the view is now cleared and capture kept.
+- `pulse_data()` on a 960-line or ER AAC LD long frame was applied
+  through the 1024-line band table and rejected (the frame failed to
+  decode); the §4.6.3.3 fix-up now uses the frame's own family table.
+- The encoders answer a `Frame::StreamParams` input with
+  `Error::Unsupported` (they cannot re-configure mid-stream).
+- A change of `(audioObjectType, samplingFrequencyIndex,
+  channelConfiguration)` between blocks (a spliced / concatenated ADTS
+  stream) restarts the `StreamDecoder`'s per-stream state; before, an
+  HE-AAC segment's SBR (and PS) latch kept upsampling every later
+  segment (a 44.1 kHz AAC-LC segment came out at 88.2 kHz, a 48 kHz mono
+  one at 96 kHz stereo).
 - Clamp delta-coded parametric-stereo IID/ICC indices to their valid
   ranges, allowing decoding to resume when seeking into a stream.
 
+### Changed
+
+- API hygiene (breaking): the configuration records `EncoderConfig`,
+  `HeAacConfig`, `SbrEncoderConfig` and `PsEncoderConfig` are
+  `#[non_exhaustive]` — build them with `EncoderConfig::new`,
+  `HeAacConfig::new` / `new_v2`, `SbrEncoderConfig::new`,
+  `PsEncoderConfig::default()` and the new per-field `with_*`
+  builders. The report / parse records `DecodedFrame`,
+  `AudioSpecificConfig`, `GaSpecificConfig`, `GaExtensionBody`,
+  `EldSpecificConfig`, `LdSbrConfig`, `SbrFrame`, `SbrChannelReport`,
+  `PsFrame`, `BandStats` and the enums `Error`, `FrameFamily`,
+  `ExtensionType`, `ExtensionPayload`, `ExtensionPayloadOrSbr`,
+  `PsBands`, `Election` are `#[non_exhaustive]` too. `FrameFamily` is
+  re-exported at the crate root; encoder tuning constants and helpers
+  (`he_aac_encoder::FIR_*` / `QMF_PAIR_DELAY` / `PS_*` /
+  `CROSSOVER_HZ_PER_BPS`, `sbr_encoder::RATE` / `T_HF_*` /
+  `SBR_ENC_COLS` / `pick_*_freq` / `quantise_*`, `ps_encoder::
+  quantise_*` / `*_ELECT_*`, `encoder::IS_CORR_MIN` / `PNS_CORR_MIN`)
+  are `#[doc(hidden)]`.
+- Every full-range channel element of a frame judges its bands' masking
+  spread against the frame's loudest coefficient, the way the two
+  channels of a pair already judged theirs against the pair's peak,
+  instead of against its own peak. Judged each against its own, six
+  channels got equal precision whatever their level, and a film mix's
+  one loud speaker paid for the room tone on the other four. On a
+  5.1 film excerpt at 6 x 96 kbit/s the center goes from 33 dB SNR to
+  54 (a reference encoder reads 42 at the same rate) while the room
+  tone channels go from 30 to 26-28 dB (the reference reads 27-29).
+  The LFE keeps its own anchor (#34, pmarreck).
+- `forward_mdct` / `imdct` run in `O(N log N)` through a DCT-IV on an
+  `N/4`-point FFT (Bluestein's chirp-z for the 960 / 480 families)
+  instead of the direct `O(N²)` sums, which had every encode and decode
+  spending its time in `cos`. Measured on 4 s of 48 kHz audio: stereo
+  AAC-LC encode 1.7x → 320x real time and decode 1.8x → 207x, 5.1
+  encode / decode 0.57x → 117x / 72x, with stereo LC / LD / ELD output
+  byte- and PCM-identical. The direct sums stay as the test oracle
+  (#34, pmarreck).
+- The rate loop prices a band's bits per spectrum book from the
+  codeword-length tables (`spectral_data::tuple_bits`) instead of
+  writing it into a scratch writer, and searches each frame's
+  scalefactor offset from the previous frame's (gallop + bisect)
+  instead of a ladder from zero; same streams, fewer passes
+  (`StreamEncoder::rate_passes`) (#34, pmarreck).
+- edition 2024, MSRV 1.95.
+- Fork behaviour kept across the upstream merge, where both sides
+  changed decoding: the decoder still emits float PCM
+  (`DecodedFrame::pcm` is `Vec<f32>`, the registry frames are F32) with
+  `last_pcm_f64` as the double-precision view; the sine-shaped block
+  before the first (`set_sine_before_first_block`) stays on by default
+  and can now be switched off; PNS noise still comes from one
+  stream-wide generator, `set_shared_pns_seed` selecting per-channel
+  generators; ER AAC ELD still decodes through the fork's element walk
+  and `eld_filterbank` (FFmpeg's window taps over the Table 4.A.15 /
+  4.A.16 arrays), `Filterbank::new_low_delay` serving the ELD encoder;
+  and `imdct` / `forward_mdct` still run on the cached `mdct` plans,
+  upstream's direct sums kept as their test oracle. FATE AAC decodes
+  are byte-identical to the pre-merge fork.
+
 ### Added
 
+- `StreamEncoder::set_frame_family(FrameFamily::Lc960)`: the 960-line
+  AAC-LC encoder core (`frameLengthFlag = 1`; `N = 1920 / 240`, the
+  bracketed Table 4.129–4.141 band columns, block switching on the
+  120-sample grid), with the access-unit entry points
+  `encode_access_unit` / `finish_access_unit` /
+  `encode_all_access_units`, `audio_specific_config`, `frame_len` and
+  `frame_family`. The registry encoder selects it from a
+  `frameLengthFlag` extradata ASC and emits 960-sample bare access
+  units. At equal rate its per-band NMR tracks the 1024-line path
+  within ±0.15 dB on tonal and burst material, and a black-box decoder
+  reads it within 1 LSB of this crate's decode. The 1024-line output is
+  unchanged byte for byte.
+- `encoder_tns::detect_and_apply_tns_family`.
+- ER AAC ELD decoding (AOT 39) without low-delay SBR or the resilience
+  tools: the `ELDSpecificConfig` parse (`AudioSpecificConfig::eld`), the
+  Table 4.75–4.79 ELD channel syntax (`IcsBody::parse_eld`,
+  `IcsInfo::eld`), and the §4.6.20.2 low-delay synthesis
+  (`Filterbank::new_low_delay`, the 4N window of Tables 4.A.15 /
+  4.A.16) for 512 and 480 lines (#31, ropoctl). Black-box: AAC-ELD
+  streams from `afconvert` (16–48 kHz, 1 / 2 / 6 channels) decode within
+  1 LSB of the `afconvert` decode.
+- Encoder float input and bare access units: `StreamEncoder::
+  encode_frame_f64` / `encode_access_unit_f64` and
+  `HeAacEncoder::encode_frame_f64` (PCM normalised to ±1.0, no 16-bit
+  rounding; the HE-AAC core is fed planar f64); `set_raw` (the frame
+  entry points emit bare access units — no PCE in the block, no ADTS
+  header out of the budget — as the access-unit entry points now do)
+  and `set_bitrate` on both encoders (#32, ropoctl).
+- `StreamEncoder::new_ld`: an ER AAC LD (AOT 23) encoder, 512 / 480
+  lines, no block switching, `er_raw_data_block()` access units with
+  their `AudioSpecificConfig` (`asc_writer::er_ld_asc`) (#32, ropoctl);
+  `StreamEncoder::new_eld`: an ER AAC ELD (AOT 39) encoder without
+  low-delay SBR — the inverse of the §4.6.20.2 low-delay synthesis and
+  the ELD channel syntax (`IcsBody::write_eld`) (#33, ropoctl). Black
+  box: `afconvert` decodes both encoders' MP4-carried streams (512 and
+  480 lines, 22.05–48 kHz, 1 / 2 channels) within 1 LSB of this crate's
+  decode.
+- The runtime decoder implements `Decoder::output_params` /
+  `output_params_generation` and emits one `Frame::StreamParams` event
+  immediately before the first frame of each new output shape (sample
+  rate / channel count: a concatenated stream, SBR appearing under
+  implicit signalling), never for the first shape; the rule holds while
+  draining after `flush` and after `reset`, relative to the last frame
+  returned.
+- `IcsBody::write_er` / `write_with_ics_info_er`: the ER channel-stream
+  writers (resilience branches + category-ordered TNS), inverse of
+  `parse_er_family` / `parse_with_ics_info_er`.
 - USAC (AOT 42) mono/stereo 1024-line FD decoding behind the AAC
   registry: bounded `UsacConfig`, context-adaptive arithmetic spectra,
   noise filling, grouped short windows, MS/complex stereo prediction and
@@ -56,9 +188,54 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   bare access units wrapped in a header built from the stream's ASC).
 - `asc_writer::ga_asc` / `aac_lc_asc_with_pce`; `latm::decode_access_unit`
   / `asc_frame_family` (the transport-independent ASC-driven AU decode).
+- `StreamDecoder::set_sine_before_first_block` (and the filterbank /
+  element / coupling decoders'; off by default): decode as if a
+  sine-shaped block preceded the first, as Apple's and FFmpeg's decoders
+  do (black box), instead of the §4.6.11.3.2 rule that the first block's
+  halves share its own `window_shape`. Only the first frame of a stream
+  whose first block is KBD-shaped changes; the LTP analysis window
+  follows the same previous shape (#22, ropoctl).
+- `StreamDecoder::set_shared_pns_seed` (and the element decoder's; off
+  by default): each channel of a pair draws its PNS noise from its own
+  generator started from the common seed, so bands that are noise in
+  both channels carry identical noise until the channels' histories
+  diverge — the structure Apple's decoder renders (#23, ropoctl). The
+  default keeps one generator per pair, so independent noise bands
+  decode decorrelated (the §4.6.13.3 default process).
+- `StreamDecoder::set_float_pcm_capture` / `last_pcm_f64` (off by
+  default): the last successfully decoded `raw_data_block()` frame's PCM
+  as interleaved f64 (full scale 1.0, the i16 output's channel order)
+  before integer rounding (#25, ropoctl). Agrees with Apple's float
+  decoder output at about 135 dB where the i16 output stops near 90 dB.
+  `decode_er_raw_data_block` fills it too and honours
+  `set_declaration_order` (#30, ropoctl).
+- `StreamDecoder::set_declaration_order` (off by default): channels in
+  the order the configuration declares its elements — a default
+  `channelConfiguration`'s element order (5.1: C, L, R, Ls, Rs, LFE), or
+  the active PCE's front / side / back / LFE lists matched by tag — as
+  Apple's decoder emits them (#26, ropoctl). A block that does not carry
+  exactly the PCE's elements fails with `ElementDecodeInvalid`; a
+  `channelConfiguration == 0` stream with no PCE keeps its element order.
+- `StreamDecoder::set_reject_coupling` (off by default): a block that
+  carries a coupling channel element fails with
+  `UnsupportedElementSkip(2)` before the element is parsed, as Apple's
+  decoder refuses such streams (#27, ropoctl). Coupling decodes as
+  before otherwise.
+- `StreamDecoder::set_core_only` (off by default): fill elements, and
+  with them SBR / PS extension payloads, are skipped, so an HE-AAC v1 /
+  v2 stream decodes as its AAC-LC core at the core rate (1024 samples
+  per channel per block), as Apple's decoder does for a stream
+  described as AAC-LC (#28, ropoctl).
 
 ### Fixed
 
+- Parametric stereo: a delta-coded IID / ICC index whose sum leaves the
+  Table 8.24–8.26 range is clamped into it instead of failing the whole
+  frame with `PsDataInvalid` (#24, ropoctl). A continuous conformant
+  stream never produces such a sum, so its decode is unchanged; a
+  decoder entering mid-stream, whose previous indices are the reset
+  values, no longer drops frames on the first time-differential
+  `ps_data()`. The spec is silent on out-of-range sums.
 - Replace the quadratic, per-sample-cosine IMDCT and LTP/encoder MDCT
   with cached, mixed-radix FFT transforms for all AAC frame sizes.
   The self-contained `mdct` module ports the pre/post rotations from
@@ -93,6 +270,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   inline PCE for `channelConfiguration = 0` layouts) in
   `output_params().extradata`, so MP4 / Matroska muxers can write
   `esds` / `CodecPrivate`.
+- Parametric stereo: the first envelope region of a stereo frame now
+  interpolates the mixing coefficients from the previous frame's last
+  slot (border n₋₁ = −1, §8.6.5.4 / §8.6.5.6.2) with the same
+  1 / (nₑ − nₑ₋₁) step as every later region. The first region used
+  n / n₀, which repeated the previous frame's coefficients at slot 0 and
+  ran the ramp one slot late (#20, ropoctl). HE-AAC v2 streams from a
+  reference encoder now agree with that encoder's own decoder at
+  90–106 dB instead of 60–63 dB.
+- A `channel_pair_element()` without `common_window` (each channel its
+  own `ics_info()`, Table 4.5 / §4.5.2.1) is decoded channel by channel,
+  as an SCE is: the window sequence, grouping and `max_sfb` may differ
+  and no M/S mask exists. Such pairs failed with `MsStereoInvalid` (a
+  smaller right `max_sfb`) or `ElementDecodeInvalid` (differing window
+  sequences); ffmpeg's and Apple's encoders emit them on stereo material
+  with a transient in one channel (#21, ropoctl).
 
 - HE-AAC v2 (parametric stereo) encoder: `ps_analysis` (Annex 8.C.6.2
   stereo hybrid analysis + band excitations on the Table 8.C.2/8.C.3

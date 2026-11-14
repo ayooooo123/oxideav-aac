@@ -24,12 +24,12 @@ use std::sync::LazyLock;
 
 use oxideav_core::bits::BitReader;
 
+use crate::Result;
 use crate::ps_huffman::{
-    ps_huff_dec, HUFF_ICC_DF, HUFF_ICC_DT, HUFF_IID_DF, HUFF_IID_DT, HUFF_IID_FINE_DF,
-    HUFF_IID_FINE_DT, HUFF_IPD_DF, HUFF_IPD_DT, HUFF_OPD_DF, HUFF_OPD_DT,
+    HUFF_ICC_DF, HUFF_ICC_DT, HUFF_IID_DF, HUFF_IID_DT, HUFF_IID_FINE_DF, HUFF_IID_FINE_DT,
+    HUFF_IPD_DF, HUFF_IPD_DT, HUFF_OPD_DF, HUFF_OPD_DT, ps_huff_dec,
 };
 use crate::sbr_qmf::Complex;
-use crate::Result;
 
 const PS_MAX_NUM_ENV: usize = 5;
 const PS_MAX_NR_IIDICC: usize = 34;
@@ -118,8 +118,8 @@ fn make_filters_from_proto(filter: &mut [HybridFilter], proto: &[f32; 7]) {
     let bands = filter.len();
     for (q, f) in filter.iter_mut().enumerate() {
         for n in 0..7 {
-            let theta = 2.0 * std::f64::consts::PI * (q as f64 + 0.5) * (n as f64 - 6.0)
-                / bands as f64;
+            let theta =
+                2.0 * std::f64::consts::PI * (q as f64 + 0.5) * (n as f64 - 6.0) / bands as f64;
             f[n][0] = (f64::from(proto[n]) * theta.cos()) as f32 as f64;
             f[n][1] = (f64::from(proto[n]) * -theta.sin()) as f32 as f64;
         }
@@ -200,14 +200,10 @@ impl PsTables {
                 }
                 let (alpha_c, alpha_s) = (alpha.cos(), alpha.sin());
                 let (gamma_c, gamma_s) = (gamma.cos(), gamma.sin());
-                hb[iid][icc][0] =
-                    (SQRT_2 * f64::from(alpha_c) * f64::from(gamma_c)) as f32 as f64;
-                hb[iid][icc][1] =
-                    (SQRT_2 * f64::from(alpha_s) * f64::from(gamma_c)) as f32 as f64;
-                hb[iid][icc][2] =
-                    (-SQRT_2 * f64::from(alpha_s) * f64::from(gamma_s)) as f32 as f64;
-                hb[iid][icc][3] =
-                    (SQRT_2 * f64::from(alpha_c) * f64::from(gamma_s)) as f32 as f64;
+                hb[iid][icc][0] = (SQRT_2 * f64::from(alpha_c) * f64::from(gamma_c)) as f32 as f64;
+                hb[iid][icc][1] = (SQRT_2 * f64::from(alpha_s) * f64::from(gamma_c)) as f32 as f64;
+                hb[iid][icc][2] = (-SQRT_2 * f64::from(alpha_s) * f64::from(gamma_s)) as f32 as f64;
+                hb[iid][icc][3] = (SQRT_2 * f64::from(alpha_c) * f64::from(gamma_s)) as f32 as f64;
             }
         }
 
@@ -632,9 +628,21 @@ impl PsDecoder {
         if self.enable_ipdopd {
             for e in 0..self.num_env {
                 let dt = br.read_bit().map_err(|_| ())?;
-                self.read_par(br, Par::Ipd, if dt { &HUFF_IPD_DT } else { &HUFF_IPD_DF }, e, dt)?;
+                self.read_par(
+                    br,
+                    Par::Ipd,
+                    if dt { &HUFF_IPD_DT } else { &HUFF_IPD_DF },
+                    e,
+                    dt,
+                )?;
                 let dt = br.read_bit().map_err(|_| ())?;
-                self.read_par(br, Par::Opd, if dt { &HUFF_OPD_DT } else { &HUFF_OPD_DF }, e, dt)?;
+                self.read_par(
+                    br,
+                    Par::Opd,
+                    if dt { &HUFF_OPD_DT } else { &HUFF_OPD_DF },
+                    e,
+                    dt,
+                )?;
             }
         }
         br.skip(1).map_err(|_| ())?; // reserved_ps
@@ -704,7 +712,9 @@ impl PsDecoder {
         top: usize,
     ) -> Result<()> {
         let is34 = usize::from(self.is34bands);
-        let top = (top + NR_BANDS[is34]).saturating_sub(64).min(NR_BANDS[is34]);
+        let top = (top + NR_BANDS[is34])
+            .saturating_sub(64)
+            .min(NR_BANDS[is34]);
         for d in &mut self.delay[top..NR_BANDS[is34]] {
             *d = [Complex::default(); PS_QMF_TIME_SLOTS + PS_MAX_DELAY];
         }
@@ -808,8 +818,8 @@ impl PsDecoder {
         // De-correlation and transient reduction.
         for k in 0..NR_ALLPASS_BANDS[s] {
             let b = usize::from(k_to_i[k]);
-            let g_decay_slope = (1.0f32 - DECAY_SLOPE * (k as i32 - DECAY_CUTOFF[s]) as f32)
-                .clamp(0.0, 1.0);
+            let g_decay_slope =
+                (1.0f32 - DECAY_SLOPE * (k as i32 - DECAY_CUTOFF[s]) as f32).clamp(0.0, 1.0);
             self.delay[k].copy_within(n_l..n_l + PS_MAX_DELAY, 0);
             self.delay[k][PS_MAX_DELAY..].copy_from_slice(&self.lbuf[k][..NUM_QMF_SLOTS]);
             for link in &mut self.ap_delay[k] {
@@ -859,11 +869,35 @@ impl PsDecoder {
         let mut ipd_mapped = [[0i8; PS_MAX_NR_IIDICC]; PS_MAX_NUM_ENV];
         let mut opd_mapped = [[0i8; PS_MAX_NR_IIDICC]; PS_MAX_NUM_ENV];
         if is34 {
-            remap34(&mut iid_mapped, &self.iid_par, self.nr_iid_par, num_env, true);
-            remap34(&mut icc_mapped, &self.icc_par, self.nr_icc_par, num_env, true);
+            remap34(
+                &mut iid_mapped,
+                &self.iid_par,
+                self.nr_iid_par,
+                num_env,
+                true,
+            );
+            remap34(
+                &mut icc_mapped,
+                &self.icc_par,
+                self.nr_icc_par,
+                num_env,
+                true,
+            );
             if self.enable_ipdopd {
-                remap34(&mut ipd_mapped, &self.ipd_par, self.nr_ipdopd_par, num_env, false);
-                remap34(&mut opd_mapped, &self.opd_par, self.nr_ipdopd_par, num_env, false);
+                remap34(
+                    &mut ipd_mapped,
+                    &self.ipd_par,
+                    self.nr_ipdopd_par,
+                    num_env,
+                    false,
+                );
+                remap34(
+                    &mut opd_mapped,
+                    &self.opd_par,
+                    self.nr_ipdopd_par,
+                    num_env,
+                    false,
+                );
             }
             if !self.is34bands_old {
                 for hm in &mut self.h {
@@ -875,11 +909,35 @@ impl PsDecoder {
                 self.opd_hist = [0; PS_MAX_NR_IIDICC];
             }
         } else {
-            remap20(&mut iid_mapped, &self.iid_par, self.nr_iid_par, num_env, true);
-            remap20(&mut icc_mapped, &self.icc_par, self.nr_icc_par, num_env, true);
+            remap20(
+                &mut iid_mapped,
+                &self.iid_par,
+                self.nr_iid_par,
+                num_env,
+                true,
+            );
+            remap20(
+                &mut icc_mapped,
+                &self.icc_par,
+                self.nr_icc_par,
+                num_env,
+                true,
+            );
             if self.enable_ipdopd {
-                remap20(&mut ipd_mapped, &self.ipd_par, self.nr_ipdopd_par, num_env, false);
-                remap20(&mut opd_mapped, &self.opd_par, self.nr_ipdopd_par, num_env, false);
+                remap20(
+                    &mut ipd_mapped,
+                    &self.ipd_par,
+                    self.nr_ipdopd_par,
+                    num_env,
+                    false,
+                );
+                remap20(
+                    &mut opd_mapped,
+                    &self.opd_par,
+                    self.nr_ipdopd_par,
+                    num_env,
+                    false,
+                );
             }
             if self.is34bands_old {
                 for hm in &mut self.h {
@@ -960,7 +1018,10 @@ impl PsDecoder {
                 if span > 0 {
                     let first = (start + 1).clamp(0, NUM_QMF_SLOTS as i32) as usize;
                     let last = (first + span as usize).min(NUM_QMF_SLOTS);
-                    let (lk, rk) = (&mut self.lbuf[k][first..last], &mut self.rbuf[k][first..last]);
+                    let (lk, rk) = (
+                        &mut self.lbuf[k][first..last],
+                        &mut self.rbuf[k][first..last],
+                    );
                     if self.enable_ipdopd {
                         stereo_interpolate_ipdopd(lk, rk, h, h_step);
                     } else {
@@ -997,7 +1058,12 @@ fn hybrid_analysis_kernel(input: &[Complex], filter: &[HybridFilter], out: &mut 
 }
 
 /// `hybrid6_cx`: split QMF band 0 into six sub-subbands (20-band mode).
-fn hybrid6_cx(input: &[Complex; 44], out: &mut [[Complex; 32]], filter: &[HybridFilter; 8], len: usize) {
+fn hybrid6_cx(
+    input: &[Complex; 44],
+    out: &mut [[Complex; 32]],
+    filter: &[HybridFilter; 8],
+    len: usize,
+) {
     for i in 0..len {
         let mut temp = [Complex::default(); 8];
         hybrid_analysis_kernel(&input[i..i + 13], filter, &mut temp);
@@ -1012,7 +1078,12 @@ fn hybrid6_cx(input: &[Complex; 44], out: &mut [[Complex; 32]], filter: &[Hybrid
 
 /// `hybrid4_8_12_cx`: split one QMF band into `filter.len()`
 /// sub-subbands (34-band mode).
-fn hybrid4_8_12_cx(input: &[Complex; 44], out: &mut [[Complex; 32]], filter: &[HybridFilter], len: usize) {
+fn hybrid4_8_12_cx(
+    input: &[Complex; 44],
+    out: &mut [[Complex; 32]],
+    filter: &[HybridFilter],
+    len: usize,
+) {
     let n = filter.len();
     for i in 0..len {
         let mut temp = [Complex::default(); 12];
@@ -1070,7 +1141,8 @@ fn hybrid_synthesis(out: &mut [[Complex; 64]; PS_X_SLOTS], input: &[[Complex; 32
     } else {
         for n in 0..len {
             let o = &mut out[n];
-            o[0] = input[0][n] + input[1][n] + input[2][n] + input[3][n] + input[4][n] + input[5][n];
+            o[0] =
+                input[0][n] + input[1][n] + input[2][n] + input[3][n] + input[4][n] + input[5][n];
             o[1] = input[6][n] + input[7][n];
             o[2] = input[8][n] + input[9][n];
             for i in 3..64 {
@@ -1160,7 +1232,11 @@ fn stereo_interpolate_ipdopd(
 }
 
 /// Table 8.46: 10 → 20 stereo bands.
-fn map_idx_10_to_20(par_mapped: &mut [i8; PS_MAX_NR_IIDICC], par: &[i8; PS_MAX_NR_IIDICC], full: bool) {
+fn map_idx_10_to_20(
+    par_mapped: &mut [i8; PS_MAX_NR_IIDICC],
+    par: &[i8; PS_MAX_NR_IIDICC],
+    full: bool,
+) {
     let top = if full {
         9
     } else {
@@ -1173,7 +1249,11 @@ fn map_idx_10_to_20(par_mapped: &mut [i8; PS_MAX_NR_IIDICC], par: &[i8; PS_MAX_N
     }
 }
 
-fn map_idx_34_to_20(par_mapped: &mut [i8; PS_MAX_NR_IIDICC], par: &[i8; PS_MAX_NR_IIDICC], full: bool) {
+fn map_idx_34_to_20(
+    par_mapped: &mut [i8; PS_MAX_NR_IIDICC],
+    par: &[i8; PS_MAX_NR_IIDICC],
+    full: bool,
+) {
     let p = |i: usize| i32::from(par[i]);
     par_mapped[0] = ((2 * p(0) + p(1)) / 3) as i8;
     par_mapped[1] = ((p(1) + 2 * p(2)) / 3) as i8;
@@ -1223,7 +1303,11 @@ fn map_val_34_to_20(par: &mut [f64; PS_MAX_NR_IIDICC]) {
     par[19] = (par[32] + par[33]) * 0.5;
 }
 
-fn map_idx_10_to_34(par_mapped: &mut [i8; PS_MAX_NR_IIDICC], par: &[i8; PS_MAX_NR_IIDICC], full: bool) {
+fn map_idx_10_to_34(
+    par_mapped: &mut [i8; PS_MAX_NR_IIDICC],
+    par: &[i8; PS_MAX_NR_IIDICC],
+    full: bool,
+) {
     if full {
         par_mapped[28..34].fill(par[9]);
         par_mapped[24..28].fill(par[8]);
@@ -1240,7 +1324,11 @@ fn map_idx_10_to_34(par_mapped: &mut [i8; PS_MAX_NR_IIDICC], par: &[i8; PS_MAX_N
     par_mapped[0..3].fill(par[0]);
 }
 
-fn map_idx_20_to_34(par_mapped: &mut [i8; PS_MAX_NR_IIDICC], par: &[i8; PS_MAX_NR_IIDICC], full: bool) {
+fn map_idx_20_to_34(
+    par_mapped: &mut [i8; PS_MAX_NR_IIDICC],
+    par: &[i8; PS_MAX_NR_IIDICC],
+    full: bool,
+) {
     if full {
         par_mapped[33] = par[19];
         par_mapped[32] = par[19];

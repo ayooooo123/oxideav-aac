@@ -31,7 +31,7 @@ fn split_energy(pcm: &[i16], fs: u32, cutoff_hz: f64) -> (f64, f64) {
             .map(|&v| f64::from(v))
             .collect();
         let mut q = EncoderAnalysisQmf::new();
-        for slot in mono.chunks_exact(64) {
+        for slot in mono.as_chunks::<64>().0 {
             for (k, v) in q.push_slot(slot).unwrap().iter().enumerate() {
                 // The two bands straddling the cutoff belong to
                 // neither side (the analysis bank overlaps its
@@ -58,10 +58,8 @@ fn decode(stream: &[u8]) -> Vec<i16> {
 
 #[test]
 fn default_bandwidth_follows_the_per_channel_rate() {
-    let cfg = |bitrate: u32, channels: u8, sample_rate: u32| EncoderConfig {
-        sample_rate,
-        channels,
-        bitrate,
+    let cfg = |bitrate: u32, channels: u8, sample_rate: u32| {
+        EncoderConfig::new(sample_rate, channels, bitrate)
     };
     assert!((cfg(64_000, 2, 44_100).default_bandwidth_hz() - 8_320.0).abs() < 1e-9);
     assert!((cfg(96_000, 2, 48_000).default_bandwidth_hz() - 12_480.0).abs() < 1e-9);
@@ -86,11 +84,7 @@ fn cull_moves_the_bits_below_the_cutoff() {
     let fs = 44_100u32;
     let n = 2 * 44_100;
     let pcm = noise_stereo(n);
-    let cfg = EncoderConfig {
-        sample_rate: fs,
-        channels: 2,
-        bitrate: 64_000,
-    };
+    let cfg = EncoderConfig::new(fs, 2, 64_000);
     let cutoff = cfg.default_bandwidth_hz();
     let (in_lo, in_hi) = split_energy(&pcm, fs, cutoff);
 
@@ -154,7 +148,12 @@ fn cull_moves_the_bits_below_the_cutoff() {
                 .collect();
             let mut qa = EncoderAnalysisQmf::new();
             let mut qb = EncoderAnalysisQmf::new();
-            for (sa, sb) in a.chunks_exact(64).zip(b.chunks_exact(64)) {
+            for (sa, sb) in a
+                .as_chunks::<64>()
+                .0
+                .iter()
+                .zip(b.as_chunks::<64>().0.iter())
+            {
                 let xa = qa.push_slot(sa).unwrap();
                 let xb = qb.push_slot(sb).unwrap();
                 for k in 1..k_cut {

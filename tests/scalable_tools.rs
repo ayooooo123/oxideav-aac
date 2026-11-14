@@ -2,12 +2,13 @@
 //! rules, the §4.6.9.5 / Table 4.158 serial TNS layout, §4.6.7.5
 //! base-layer LTP, the `EIGHT_SHORT` and 960-line geometries.
 
+use oxideav_aac::Error;
 use oxideav_aac::asc::AacResilienceFlags;
 use oxideav_aac::decode::StreamDecoder;
 use oxideav_aac::ics_body::IcsBody;
 use oxideav_aac::ics_info::{
-    derive_window_grouping_family, IcsInfo, LtpData, WindowSequence, WindowShape,
-    NUM_SWB_LONG_WINDOW,
+    IcsInfo, LtpData, NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape,
+    derive_window_grouping_family,
 };
 use oxideav_aac::ms_stereo::MsMaskPresent;
 use oxideav_aac::raw_data_block::{FrameAssembler, IdSynEle};
@@ -19,7 +20,6 @@ use oxideav_aac::section_data::{Section, SectionData};
 use oxideav_aac::spectral_data::SpectralData;
 use oxideav_aac::swb_offset::FrameFamily;
 use oxideav_aac::tns_data::{TnsData, TnsFilter, TnsWindow};
-use oxideav_aac::Error;
 use oxideav_core::bits::BitWriter;
 
 const FS_INDEX: u8 = 4; // 44.1 kHz
@@ -268,8 +268,10 @@ fn stereo_intensity_layering() {
     let mut fb_r = oxideav_aac::filterbank::Filterbank::new();
     let mut dec = ScalableDecoder::new(cfg).unwrap();
     for f in 0..2 {
-        let want_l = oxideav_aac::pcm::interleave_f32(&[fb_l.synthesize(&l_spec, &ics).unwrap()]).unwrap_or_default();
-        let want_r = oxideav_aac::pcm::interleave_f32(&[fb_r.synthesize(&r_spec, &ics).unwrap()]).unwrap_or_default();
+        let want_l = oxideav_aac::pcm::interleave_f32(&[fb_l.synthesize(&l_spec, &ics).unwrap()])
+            .unwrap_or_default();
+        let want_r = oxideav_aac::pcm::interleave_f32(&[fb_r.synthesize(&r_spec, &ics).unwrap()])
+            .unwrap_or_default();
         let got = dec
             .decode_frame(&payloads.iter().map(Vec::as_slice).collect::<Vec<_>>())
             .unwrap();
@@ -309,8 +311,10 @@ fn stereo_intensity_layering() {
     let mut fb_l2 = oxideav_aac::filterbank::Filterbank::new();
     let mut fb_r2 = oxideav_aac::filterbank::Filterbank::new();
     let mut dec2 = ScalableDecoder::new(cfg2).unwrap();
-    let want_l = oxideav_aac::pcm::interleave_f32(&[fb_l2.synthesize(&l_spec2, &ics).unwrap()]).unwrap_or_default();
-    let want_r = oxideav_aac::pcm::interleave_f32(&[fb_r2.synthesize(&r_spec2, &ics).unwrap()]).unwrap_or_default();
+    let want_l = oxideav_aac::pcm::interleave_f32(&[fb_l2.synthesize(&l_spec2, &ics).unwrap()])
+        .unwrap_or_default();
+    let want_r = oxideav_aac::pcm::interleave_f32(&[fb_r2.synthesize(&r_spec2, &ics).unwrap()])
+        .unwrap_or_default();
     let got = dec2
         .decode_frame(&payloads2.iter().map(Vec::as_slice).collect::<Vec<_>>())
         .unwrap();
@@ -558,8 +562,10 @@ fn serial_tns_layout() {
     .unwrap();
     let mut fb_l = oxideav_aac::filterbank::Filterbank::new();
     let mut fb_r = oxideav_aac::filterbank::Filterbank::new();
-    let want_l = oxideav_aac::pcm::interleave_f32(&[fb_l.synthesize(&l_spec, &ics_s).unwrap()]).unwrap_or_default();
-    let want_r = oxideav_aac::pcm::interleave_f32(&[fb_r.synthesize(&r_spec, &ics_s).unwrap()]).unwrap_or_default();
+    let want_l = oxideav_aac::pcm::interleave_f32(&[fb_l.synthesize(&l_spec, &ics_s).unwrap()])
+        .unwrap_or_default();
+    let want_r = oxideav_aac::pcm::interleave_f32(&[fb_r.synthesize(&r_spec, &ics_s).unwrap()])
+        .unwrap_or_default();
     let mut dec = ScalableDecoder::new(cfg.clone()).unwrap();
     let got = dec
         .decode_frame(&payloads.iter().map(Vec::as_slice).collect::<Vec<_>>())
@@ -617,8 +623,10 @@ fn serial_tns_layout() {
     .unwrap();
     let mut fb_l2 = oxideav_aac::filterbank::Filterbank::new();
     let mut fb_r2 = oxideav_aac::filterbank::Filterbank::new();
-    let want_l2 = oxideav_aac::pcm::interleave_f32(&[fb_l2.synthesize(&l_spec2, &ics_s).unwrap()]).unwrap_or_default();
-    let want_r2 = oxideav_aac::pcm::interleave_f32(&[fb_r2.synthesize(&r_spec2, &ics_s).unwrap()]).unwrap_or_default();
+    let want_l2 = oxideav_aac::pcm::interleave_f32(&[fb_l2.synthesize(&l_spec2, &ics_s).unwrap()])
+        .unwrap_or_default();
+    let want_r2 = oxideav_aac::pcm::interleave_f32(&[fb_r2.synthesize(&r_spec2, &ics_s).unwrap()])
+        .unwrap_or_default();
     let mut dec2 = ScalableDecoder::new(cfg).unwrap();
     let got2 = dec2
         .decode_frame(&payloads2.iter().map(Vec::as_slice).collect::<Vec<_>>())

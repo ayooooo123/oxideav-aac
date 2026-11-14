@@ -9,7 +9,7 @@
 //!   as the uninterrupted decode once the SBR state has settled.
 
 use oxideav_aac::decode::StreamDecoder;
-use oxideav_aac::he_aac_encoder::{HeAacConfig, HeAacEncoder, HE_FRAME_LEN};
+use oxideav_aac::he_aac_encoder::{HE_FRAME_LEN, HeAacConfig, HeAacEncoder};
 use oxideav_aac::latm_writer::AdtsPayloads;
 use oxideav_aac::sbr_qmf::EncoderAnalysisQmf;
 
@@ -42,10 +42,7 @@ fn material(frames: usize) -> Vec<i16> {
 #[test]
 fn damaged_streams_never_panic_the_decoder() {
     let pcm = material(12);
-    let cfg = HeAacConfig {
-        sbr_crc: true,
-        ..HeAacConfig::new(44_100, 1, 40_000)
-    };
+    let cfg = HeAacConfig::new(44_100, 1, 40_000).with_sbr_crc(true);
     let stream = HeAacEncoder::new(cfg).unwrap().encode_all(&pcm).unwrap();
     let frame_offsets: Vec<usize> = {
         let mut offs = Vec::new();
@@ -91,7 +88,7 @@ fn band_energies(pcm: &[i16]) -> [f64; 64] {
     let mut bank = EncoderAnalysisQmf::new();
     let mut e = [0.0f64; 64];
     let mono: Vec<f64> = pcm.iter().map(|&v| f64::from(v)).collect();
-    for slot in mono.chunks_exact(64) {
+    for slot in mono.as_chunks::<64>().0 {
         let cols = bank.push_slot(slot).unwrap();
         for (k, v) in cols.iter().enumerate() {
             e[k] += v.norm_sqr();
@@ -103,10 +100,7 @@ fn band_energies(pcm: &[i16]) -> [f64; 64] {
 #[test]
 fn joining_at_a_header_frame_converges_to_the_full_decode() {
     let pcm = material(24);
-    let cfg = HeAacConfig {
-        header_interval: 8,
-        ..HeAacConfig::new(44_100, 1, 40_000)
-    };
+    let cfg = HeAacConfig::new(44_100, 1, 40_000).with_header_interval(8);
     let mut enc = HeAacEncoder::new(cfg).unwrap();
     let stream = enc.encode_all(&pcm).unwrap();
     let k_x = enc.sbr().bands().k_x as usize;

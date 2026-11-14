@@ -24,14 +24,17 @@ use std::collections::VecDeque;
 use std::sync::LazyLock;
 
 use oxideav_core::bits::BitReader;
-use oxideav_core::{AudioFormat, AudioFrame, CodecId, CodecParameters, Decoder, Error, Frame, Packet, Result, SampleFormat};
+use oxideav_core::{
+    AudioFormat, AudioFrame, CodecId, CodecParameters, Decoder, Error, Frame, Packet, Result,
+    SampleFormat,
+};
 
 use crate::filterbank::Filterbank;
 use crate::ics_info::{IcsInfo, WindowSequence, WindowShape};
 use crate::scale_factor_data::hcod_sf_decode;
 use crate::swb_offset::{FrameFamily, long_window_offsets, short_window_offsets};
 use crate::usac_arith;
-use crate::usac_config::{escaped, ElementConfig, UsacConfig, EXT_AUDIO_PREROLL};
+use crate::usac_config::{EXT_AUDIO_PREROLL, ElementConfig, UsacConfig, escaped};
 use crate::usac_tables::{MDST_CURRENT, MDST_PREVIOUS, TNS_REFLECTION};
 
 const N: usize = 1024;
@@ -40,10 +43,17 @@ const MAX_BANDS: usize = 128;
 const MAX_PREROLL_BYTES: usize = 1 << 20;
 const TNS_LONG: [usize; 12] = [31, 31, 34, 40, 42, 51, 47, 47, 43, 43, 43, 40];
 const TNS_SHORT: [usize; 12] = [9, 9, 10, 14, 14, 14, 15, 15, 15, 15, 15, 15];
-static SCALE_FACTORS: LazyLock<[f32; 428]> = LazyLock::new(||
-    std::array::from_fn(|i| 2.0f64.powf((i as f64 - 200.0) * 0.25) as f32));
-static NOISE_LEVELS: LazyLock<[f32; 8]> = LazyLock::new(||
-    std::array::from_fn(|i| if i == 0 { 0.0 } else { 2.0f32.powf((i as f32 - 14.0) / 3.0) }));
+static SCALE_FACTORS: LazyLock<[f32; 428]> =
+    LazyLock::new(|| std::array::from_fn(|i| 2.0f64.powf((i as f64 - 200.0) * 0.25) as f32));
+static NOISE_LEVELS: LazyLock<[f32; 8]> = LazyLock::new(|| {
+    std::array::from_fn(|i| {
+        if i == 0 {
+            0.0
+        } else {
+            2.0f32.powf((i as f32 - 14.0) / 3.0)
+        }
+    })
+});
 
 fn codec_error(error: crate::Error) -> Error {
     Error::invalid(format!("AAC USAC: {error}"))
@@ -137,12 +147,20 @@ fn loudness_gain(target: i32, value: Option<u8>) -> f32 {
 impl UsacDecoder {
     pub(crate) fn new(params: &CodecParameters) -> Result<Self> {
         let config = UsacConfig::parse(&params.extradata)?;
-        let target_level = params.options.get("target_level")
-            .map(|v| v.parse::<i32>().map_err(|_| Error::invalid("AAC USAC: invalid target_level")))
-            .transpose()?.unwrap_or(0);
+        let target_level = params
+            .options
+            .get("target_level")
+            .map(|v| {
+                v.parse::<i32>()
+                    .map_err(|_| Error::invalid("AAC USAC: invalid target_level"))
+            })
+            .transpose()?
+            .unwrap_or(0);
         // FFmpeg's option range; 0 disables normalization.
         if !(-70..=0).contains(&target_level) {
-            return Err(Error::invalid("AAC USAC: target_level must be between -70 and 0 dBFS"));
+            return Err(Error::invalid(
+                "AAC USAC: target_level must be between -70 and 0 dBFS",
+            ));
         }
         let mut decoder = Self {
             codec_id: CodecId::new("aac"),
@@ -164,10 +182,15 @@ impl UsacDecoder {
     /// Rebuild every per-element state for `self.config`, unprimed.
     fn configure(&mut self) -> Result<()> {
         let rate_index = self.config.rate_index;
-        self.cores = self.config.elements.iter().filter_map(|element| match *element {
-            ElementConfig::Audio { channels, .. } => Some(Core::new(channels, rate_index)),
-            ElementConfig::Extension { .. } => None,
-        }).collect::<Result<_>>()?;
+        self.cores = self
+            .config
+            .elements
+            .iter()
+            .filter_map(|element| match *element {
+                ElementConfig::Audio { channels, .. } => Some(Core::new(channels, rate_index)),
+                ElementConfig::Extension { .. } => None,
+            })
+            .collect::<Result<_>>()?;
         self.payloads = vec![Vec::new(); self.config.elements.len()];
         self.gain = loudness_gain(self.target_level, self.config.loudness_method_value);
         self.primed = false;
@@ -185,13 +208,27 @@ impl UsacDecoder {
             let rate_index = self.config.rate_index;
             match self.config.elements[index].clone() {
                 ElementConfig::Audio { noise_fill, .. } => {
-                    self.cores[core_index].decode(&mut bits, independent, noise_fill, rate_index, &mut self.stats)?;
+                    self.cores[core_index].decode(
+                        &mut bits,
+                        independent,
+                        noise_fill,
+                        rate_index,
+                        &mut self.stats,
+                    )?;
                     core_index += 1;
                 }
-                ElementConfig::Extension { kind, default_length, fragmented } => {
-                    if let Some(payload) = self.extension_payload(&mut bits, index, kind, default_length, fragmented)? {
+                ElementConfig::Extension {
+                    kind,
+                    default_length,
+                    fragmented,
+                } => {
+                    if let Some(payload) =
+                        self.extension_payload(&mut bits, index, kind, default_length, fragmented)?
+                    {
                         if nested {
-                            return Err(Error::invalid("AAC USAC: AudioPreRoll inside a pre-roll access unit"));
+                            return Err(Error::invalid(
+                                "AAC USAC: AudioPreRoll inside a pre-roll access unit",
+                            ));
                         }
                         // UsacConfig admits AudioPreRoll only as element 0,
                         // in the current and any embedded configuration: a
@@ -219,14 +256,24 @@ impl UsacDecoder {
         if !bits.read_bit()? {
             return Ok(None);
         }
-        let length = if bits.read_bit()? { default_length } else {
+        let length = if bits.read_bit()? {
+            default_length
+        } else {
             let n = bits.read_u32(8)?;
-            if n == 255 { n + bits.read_u32(16)? - 2 } else { n }
+            if n == 255 {
+                n + bits.read_u32(16)? - 2
+            } else {
+                n
+            }
         };
         if length == 0 {
             return Ok(None);
         }
-        let (start, end) = if fragmented { (bits.read_bit()?, bits.read_bit()?) } else { (true, true) };
+        let (start, end) = if fragmented {
+            (bits.read_bit()?, bits.read_bit()?)
+        } else {
+            (true, true)
+        };
         if length as u64 * 8 > bits.bits_remaining() {
             return Err(Error::invalid("AAC USAC: truncated extension payload"));
         }
@@ -261,16 +308,34 @@ impl UsacDecoder {
         if config_length * 8 > bits.bits_remaining() {
             return Err(truncated());
         }
-        let config: Vec<u8> = (0..config_length).map(|_| bits.read_u32(8).map(|b| b as u8)).collect::<Result<_>>()?;
+        let config: Vec<u8> = (0..config_length)
+            .map(|_| bits.read_u32(8).map(|b| b as u8))
+            .collect::<Result<_>>()?;
         if !config.is_empty() {
             let next = UsacConfig::parse_embedded(&config)?;
-            if !matches!(next.elements.first(), Some(ElementConfig::Extension { kind: EXT_AUDIO_PREROLL, .. })) {
-                return Err(Error::invalid("AAC USAC: embedded configuration without a leading AudioPreRoll"));
+            if !matches!(
+                next.elements.first(),
+                Some(ElementConfig::Extension {
+                    kind: EXT_AUDIO_PREROLL,
+                    ..
+                })
+            ) {
+                return Err(Error::invalid(
+                    "AAC USAC: embedded configuration without a leading AudioPreRoll",
+                ));
             }
             let current = &self.config;
-            if (next.sample_rate, next.channels, next.rate_index, &next.elements)
-                != (current.sample_rate, current.channels, current.rate_index, &current.elements)
-            {
+            if (
+                next.sample_rate,
+                next.channels,
+                next.rate_index,
+                &next.elements,
+            ) != (
+                current.sample_rate,
+                current.channels,
+                current.rate_index,
+                &current.elements,
+            ) {
                 self.config = next;
                 self.configure()?;
                 self.stats.config_changes += 1;
@@ -291,7 +356,9 @@ impl UsacDecoder {
             if length * 8 > bits.bits_remaining() {
                 return Err(truncated());
             }
-            let unit: Vec<u8> = (0..length).map(|_| bits.read_u32(8).map(|b| b as u8)).collect::<Result<_>>()?;
+            let unit: Vec<u8> = (0..length)
+                .map(|_| bits.read_u32(8).map(|b| b as u8))
+                .collect::<Result<_>>()?;
             self.decode_access_unit(&unit, true)?;
             self.stats.preroll_decoded += 1;
         }
@@ -314,20 +381,34 @@ impl UsacDecoder {
                 }
             }
         }
-        Ok(AudioFrame { samples: N as u32, pts: packet.pts, data: vec![bytes] })
+        Ok(AudioFrame {
+            samples: N as u32,
+            pts: packet.pts,
+            data: vec![bytes],
+        })
     }
 }
 
 impl Decoder for UsacDecoder {
-    fn codec_id(&self) -> &CodecId { &self.codec_id }
+    fn codec_id(&self) -> &CodecId {
+        &self.codec_id
+    }
 
     fn output_audio_format(&self) -> Option<AudioFormat> {
-        Some(AudioFormat { sample_format: SampleFormat::F32, sample_rate: self.config.sample_rate, channels: self.config.channels as u16 })
+        Some(AudioFormat {
+            sample_format: SampleFormat::F32,
+            sample_rate: self.config.sample_rate,
+            channels: self.config.channels as u16,
+        })
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if self.eof { return Err(Error::other("AAC USAC: send_packet after flush")); }
-        if packet.data.is_empty() { return Ok(()); }
+        if self.eof {
+            return Err(Error::other("AAC USAC: send_packet after flush"));
+        }
+        if packet.data.is_empty() {
+            return Ok(());
+        }
         match self.decode_frame(packet) {
             Ok(frame) => {
                 self.primed = true;
@@ -348,10 +429,20 @@ impl Decoder for UsacDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        self.pending.pop_front().map(Frame::Audio).ok_or(if self.eof { Error::Eof } else { Error::NeedMore })
+        self.pending
+            .pop_front()
+            .map(Frame::Audio)
+            .ok_or(if self.eof {
+                Error::Eof
+            } else {
+                Error::NeedMore
+            })
     }
 
-    fn flush(&mut self) -> Result<()> { self.eof = true; Ok(()) }
+    fn flush(&mut self) -> Result<()> {
+        self.eof = true;
+        Ok(())
+    }
 
     fn reset(&mut self) -> Result<()> {
         self.config = self.initial.clone();
@@ -431,10 +522,21 @@ impl Channel {
         // A coded STOP_START is LONG_START after a short-overlap right half
         // (the reference's usacMapWindowSequences).
         self.stop_start = self.ics.window_sequence == WindowSequence::LongStart
-            && matches!(self.previous_sequence, WindowSequence::EightShort | WindowSequence::LongStart);
+            && matches!(
+                self.previous_sequence,
+                WindowSequence::EightShort | WindowSequence::LongStart
+            );
         self.ics.window_shape = WindowShape::from_bit(bits.read_bit()?);
-        self.ics.max_sfb = bits.read_u32(if self.ics.window_sequence.is_eight_short() { 4 } else { 6 })? as u8;
-        self.ics.scale_factor_grouping = if self.ics.window_sequence.is_eight_short() { Some(bits.read_u32(7)? as u8) } else { None };
+        self.ics.max_sfb = bits.read_u32(if self.ics.window_sequence.is_eight_short() {
+            4
+        } else {
+            6
+        })? as u8;
+        self.ics.scale_factor_grouping = if self.ics.window_sequence.is_eight_short() {
+            Some(bits.read_u32(7)? as u8)
+        } else {
+            None
+        };
         self.setup_ics(rate_index)
     }
 
@@ -442,7 +544,9 @@ impl Channel {
         let offsets = offsets(&self.ics, rate_index)?;
         self.ics.num_swb = (offsets.len() - 1) as u8;
         if self.ics.max_sfb > self.ics.num_swb {
-            return Err(Error::invalid("AAC USAC: max_sfb exceeds the window's band count"));
+            return Err(Error::invalid(
+                "AAC USAC: max_sfb exceeds the window's band count",
+            ));
         }
         self.ics.window_group_length.clear();
         self.ics.window_group_length.push(1);
@@ -453,7 +557,11 @@ impl Channel {
                 if mask & (1 << (6 - i)) == 0 {
                     self.ics.window_group_length.push(1);
                 } else {
-                    *self.ics.window_group_length.last_mut().expect("one window group") += 1;
+                    *self
+                        .ics
+                        .window_group_length
+                        .last_mut()
+                        .expect("one window group") += 1;
                 }
             }
         }
@@ -465,7 +573,9 @@ impl Channel {
         let count = self.ics.num_window_groups as usize * self.ics.max_sfb as usize;
         let mut value = global_gain as i16;
         for i in 0..count {
-            if i != 0 { value += hcod_sf_decode(bits).map_err(codec_error)? as i16; }
+            if i != 0 {
+                value += hcod_sf_decode(bits).map_err(codec_error)? as i16;
+            }
             if !(0..=255).contains(&value) {
                 return Err(Error::invalid("AAC USAC: scalefactor outside 0..255"));
             }
@@ -476,7 +586,11 @@ impl Channel {
 
     fn scale(&mut self, rate_index: u8, noise_fill: Option<(usize, i16)>) -> Result<()> {
         let swb = offsets(&self.ics, rate_index)?;
-        let noise_start = if self.ics.window_sequence.is_eight_short() { 20 } else { 160 };
+        let noise_start = if self.ics.window_sequence.is_eight_short() {
+            20
+        } else {
+            160
+        };
         let (noise_level, noise_offset) = noise_fill.unwrap_or((0, 0));
         let noise = NOISE_LEVELS[noise_level];
         let mut base = 0;
@@ -491,12 +605,22 @@ impl Channel {
                         for k in swb[band] as usize..swb[band + 1] as usize {
                             let value = &mut self.spectrum[base + w * 128 + k];
                             if *value == 0.0 {
-                                self.noise_seed = self.noise_seed.wrapping_mul(69069).wrapping_add(5);
-                                *value = if self.noise_seed & 0x10000 != 0 { -noise } else { noise };
-                            } else { all_zero = false; }
+                                self.noise_seed =
+                                    self.noise_seed.wrapping_mul(69069).wrapping_add(5);
+                                *value = if self.noise_seed & 0x10000 != 0 {
+                                    -noise
+                                } else {
+                                    noise
+                                };
+                            } else {
+                                all_zero = false;
+                            }
                         }
                     }
-                    if all_zero { self.scalefactors[scale_index] = (self.scalefactors[scale_index] + noise_offset).max(-200); }
+                    if all_zero {
+                        self.scalefactors[scale_index] =
+                            (self.scalefactors[scale_index] + noise_offset).max(-200);
+                    }
                 }
                 // Our IMDCT has the opposite sign of av_tx's inverse, so
                 // keep positive gains here instead of FFmpeg's negative SF.
@@ -513,15 +637,24 @@ impl Channel {
     }
 
     fn synthesize(&mut self) -> Result<()> {
-        for (dst, &src) in self.transform.iter_mut().zip(&self.spectrum) { *dst = src as f64; }
-        self.pcm = self.filterbank.synthesize_usac(&self.transform, &self.ics, self.stop_start).map_err(codec_error)?;
+        for (dst, &src) in self.transform.iter_mut().zip(&self.spectrum) {
+            *dst = src as f64;
+        }
+        self.pcm = self
+            .filterbank
+            .synthesize_usac(&self.transform, &self.ics, self.stop_start)
+            .map_err(codec_error)?;
         Ok(())
     }
 }
 
 fn offsets(ics: &IcsInfo, rate_index: u8) -> Result<&'static [u16]> {
-    if ics.window_sequence.is_eight_short() { short_window_offsets(rate_index) } else { long_window_offsets(rate_index) }
-        .map_err(codec_error)
+    if ics.window_sequence.is_eight_short() {
+        short_window_offsets(rate_index)
+    } else {
+        long_window_offsets(rate_index)
+    }
+    .map_err(codec_error)
 }
 
 struct Core {
@@ -531,45 +664,83 @@ struct Core {
 
 impl Core {
     fn new(channels: u8, rate_index: u8) -> Result<Self> {
-        Ok(Self { channels: (0..channels).map(|ch| Channel::new(rate_index, ch)).collect::<Result<_>>()?, stereo: Stereo::default() })
+        Ok(Self {
+            channels: (0..channels)
+                .map(|ch| Channel::new(rate_index, ch))
+                .collect::<Result<_>>()?,
+            stereo: Stereo::default(),
+        })
     }
 
-    fn decode(&mut self, bits: &mut BitReader<'_>, independent: bool, noise_fill: bool, rate_index: u8, stats: &mut ToolCounts) -> Result<()> {
+    fn decode(
+        &mut self,
+        bits: &mut BitReader<'_>,
+        independent: bool,
+        noise_fill: bool,
+        rate_index: u8,
+        stats: &mut ToolCounts,
+    ) -> Result<()> {
         for channel in &mut self.channels {
             channel.tns.counts.fill(0);
-            if bits.read_bit()? { return Err(Error::unsupported("AAC USAC: LPD/ACELP core mode")); }
+            if bits.read_bit()? {
+                return Err(Error::unsupported("AAC USAC: LPD/ACELP core mode"));
+            }
         }
         let mut tns_present = [false; 2];
         self.stereo.common = false;
         self.stereo.common_tns = false;
         self.stereo.tns_on_lr = false;
         if self.channels.len() == 2 {
-            self.stereo.parse(bits, &mut self.channels, independent, rate_index, &mut tns_present)?;
+            self.stereo.parse(
+                bits,
+                &mut self.channels,
+                independent,
+                rate_index,
+                &mut tns_present,
+            )?;
         }
         let channel_count = self.channels.len();
         for (ch, channel) in self.channels.iter_mut().enumerate() {
-            if channel_count == 1 { tns_present[ch] = bits.read_bit()?; }
+            if channel_count == 1 {
+                tns_present[ch] = bits.read_bit()?;
+            }
             let gain = bits.read_u32(8)?;
             let noise = if noise_fill {
                 Some((bits.read_u32(3)? as usize, bits.read_u32(5)? as i16 - 16))
-            } else { None };
-            if !self.stereo.common { channel.read_ics(bits, rate_index)?; }
+            } else {
+                None
+            };
+            if !self.stereo.common {
+                channel.read_ics(bits, rate_index)?;
+            }
             channel.scalefactors(bits, gain)?;
-            if tns_present[ch] { channel.tns.parse(bits, &channel.ics)?; }
+            if tns_present[ch] {
+                channel.tns.parse(bits, &channel.ics)?;
+            }
             let reset = independent || bits.read_bit()?;
             let swb = offsets(&channel.ics, rate_index)?;
             let len = swb[channel.ics.max_sfb as usize] as usize;
             let n = N / channel.ics.num_windows as usize;
             for (w, spectrum) in channel.spectrum.chunks_exact_mut(n).enumerate() {
-                channel.arith.spectrum(bits, reset && w == 0, len, spectrum)?;
+                channel
+                    .arith
+                    .spectrum(bits, reset && w == 0, len, spectrum)?;
             }
-            if bits.read_bit()? { return Err(Error::unsupported("AAC USAC: FAC transition from an LPD core")); }
+            if bits.read_bit()? {
+                return Err(Error::unsupported(
+                    "AAC USAC: FAC transition from an LPD core",
+                ));
+            }
             channel.scale(rate_index, noise)?;
             stats.short_window_channels += u64::from(channel.ics.window_sequence.is_eight_short());
             stats.noise_filled_channels += u64::from(noise.is_some_and(|(level, _)| level != 0));
         }
         for ch in 0..channel_count {
-            let tns = if self.stereo.common_tns { &self.channels[0].tns } else { &self.channels[ch].tns };
+            let tns = if self.stereo.common_tns {
+                &self.channels[0].tns
+            } else {
+                &self.channels[ch].tns
+            };
             if (tns_present[ch] || self.stereo.common_tns) && tns.active() {
                 stats.tns_channels += 1;
                 let independent = channel_count == 2 && !self.stereo.common;
@@ -584,11 +755,17 @@ impl Core {
                     stats.prediction_frames += 1;
                     stats.delta_time_frames += u64::from(self.stereo.delta_time);
                     stats.complex_coef_frames += u64::from(self.stereo.complex_coef);
-                    let count = self.channels[0].ics.num_window_groups as usize * self.stereo.max_sfb;
+                    let count =
+                        self.channels[0].ics.num_window_groups as usize * self.stereo.max_sfb;
                     let imaginary = self.stereo.complex_coef
-                        && self.stereo.used[..count].iter().zip(&self.stereo.alpha_im[..count]).any(|(&used, &im)| used && im != 0);
+                        && self.stereo.used[..count]
+                            .iter()
+                            .zip(&self.stereo.alpha_im[..count])
+                            .any(|(&used, &im)| used && im != 0);
                     stats.imaginary_frames += u64::from(imaginary);
-                    stats.imaginary_short_frames += u64::from(imaginary && self.channels[0].ics.window_sequence.is_eight_short());
+                    stats.imaginary_short_frames += u64::from(
+                        imaginary && self.channels[0].ics.window_sequence.is_eight_short(),
+                    );
                     stats.previous_frame_frames += u64::from(self.stereo.use_previous);
                 }
                 _ => {}
@@ -598,18 +775,24 @@ impl Core {
             // The reference orders TNS and stereo processing by tns_on_lr
             // alone: with independent windows there is no stereo stage, but
             // tns_on_lr = 0 still applies TNS (FFmpeg 2da55bf skips it).
-            if !self.stereo.tns_on_lr { self.apply_tns(rate_index)?; }
+            if !self.stereo.tns_on_lr {
+                self.apply_tns(rate_index)?;
+            }
             self.stereo.apply(&mut self.channels, rate_index)?;
             if self.stereo.mode != 3 {
                 self.stereo.alpha_prev_re.fill(0);
                 self.stereo.alpha_prev_im.fill(0);
             }
-            if self.stereo.tns_on_lr { self.apply_tns(rate_index)?; }
+            if self.stereo.tns_on_lr {
+                self.apply_tns(rate_index)?;
+            }
             self.stereo.save(&self.channels);
         } else {
             self.apply_tns(rate_index)?;
         }
-        for channel in &mut self.channels { channel.synthesize()?; }
+        for channel in &mut self.channels {
+            channel.synthesize()?;
+        }
         Ok(())
     }
 
@@ -618,7 +801,11 @@ impl Core {
         let left = &mut first[0];
         left.tns.apply(&mut left.spectrum, &left.ics, rate_index)?;
         if let Some(right) = rest.first_mut() {
-            let tns = if self.stereo.common_tns { &left.tns } else { &right.tns };
+            let tns = if self.stereo.common_tns {
+                &left.tns
+            } else {
+                &right.tns
+            };
             tns.apply(&mut right.spectrum, &right.ics, rate_index)?;
         }
         Ok(())
@@ -660,15 +847,35 @@ struct Stereo {
 
 impl Default for Stereo {
     fn default() -> Self {
-        Self { common: false, common_tns: false, tns_on_lr: false, mode: 0, max_sfb: 0,
-            used: [false; MAX_BANDS], direction: false, complex_coef: false, use_previous: false, delta_time: false,
-            alpha_re: [0; MAX_BANDS], alpha_im: [0; MAX_BANDS], alpha_prev_re: [0; MAX_SFB],
-            alpha_prev_im: [0; MAX_SFB], saved: [[0.0; N]; 2] }
+        Self {
+            common: false,
+            common_tns: false,
+            tns_on_lr: false,
+            mode: 0,
+            max_sfb: 0,
+            used: [false; MAX_BANDS],
+            direction: false,
+            complex_coef: false,
+            use_previous: false,
+            delta_time: false,
+            alpha_re: [0; MAX_BANDS],
+            alpha_im: [0; MAX_BANDS],
+            alpha_prev_re: [0; MAX_SFB],
+            alpha_prev_im: [0; MAX_SFB],
+            saved: [[0.0; N]; 2],
+        }
     }
 }
 
 impl Stereo {
-    fn parse(&mut self, bits: &mut BitReader<'_>, channels: &mut [Channel], independent: bool, rate_index: u8, tns_present: &mut [bool; 2]) -> Result<()> {
+    fn parse(
+        &mut self,
+        bits: &mut BitReader<'_>,
+        channels: &mut [Channel],
+        independent: bool,
+        rate_index: u8,
+        tns_present: &mut [bool; 2],
+    ) -> Result<()> {
         self.used.fill(false);
         self.mode = 0;
         let tns_active = bits.read_bit()?;
@@ -687,7 +894,12 @@ impl Stereo {
             // history.
             right.stop_start = left.stop_start;
             if !bits.read_bit()? {
-                right.ics.max_sfb = bits.read_u32(if right.ics.window_sequence.is_eight_short() { 4 } else { 6 })? as u8;
+                right.ics.max_sfb =
+                    bits.read_u32(if right.ics.window_sequence.is_eight_short() {
+                        4
+                    } else {
+                        6
+                    })? as u8;
             }
             right.setup_ics(rate_index)?;
             self.max_sfb = left.ics.max_sfb.max(right.ics.max_sfb) as usize;
@@ -695,7 +907,11 @@ impl Stereo {
             let count = groups * self.max_sfb;
             self.mode = bits.read_u32(2)?;
             match self.mode {
-                1 => for used in &mut self.used[..count] { *used = bits.read_bit()?; },
+                1 => {
+                    for used in &mut self.used[..count] {
+                        *used = bits.read_bit()?;
+                    }
+                }
                 2 => self.used[..count].fill(true),
                 3 => self.parse_prediction(bits, groups, independent)?,
                 _ => {}
@@ -721,7 +937,12 @@ impl Stereo {
     /// cplx_pred_data(): coefficients are integer DPCM, predicted from the
     /// lower band or, with `delta_code_time`, from the same band of the
     /// last parsed group.
-    fn parse_prediction(&mut self, bits: &mut BitReader<'_>, groups: usize, independent: bool) -> Result<()> {
+    fn parse_prediction(
+        &mut self,
+        bits: &mut BitReader<'_>,
+        groups: usize,
+        independent: bool,
+    ) -> Result<()> {
         let max_sfb = self.max_sfb;
         if bits.read_bit()? {
             self.used[..groups * max_sfb].fill(true);
@@ -730,7 +951,9 @@ impl Stereo {
                 for sfb in (0..max_sfb).step_by(2) {
                     let used = bits.read_bit()?;
                     self.used[g * max_sfb + sfb] = used;
-                    if sfb + 1 < max_sfb { self.used[g * max_sfb + sfb + 1] = used; }
+                    if sfb + 1 < max_sfb {
+                        self.used[g * max_sfb + sfb + 1] = used;
+                    }
                 }
             }
         }
@@ -738,7 +961,8 @@ impl Stereo {
         self.complex_coef = bits.read_bit()?;
         self.use_previous = self.complex_coef && !independent && bits.read_bit()?;
         self.delta_time = !independent && bits.read_bit()?;
-        let delta = |bits: &mut BitReader<'_>| hcod_sf_decode(bits).map(i32::from).map_err(codec_error);
+        let delta =
+            |bits: &mut BitReader<'_>| hcod_sf_decode(bits).map(i32::from).map_err(codec_error);
         for g in 0..groups {
             for sfb in (0..max_sfb).step_by(2) {
                 let index = g * max_sfb + sfb;
@@ -746,12 +970,20 @@ impl Stereo {
                     (self.alpha_prev_re[sfb], self.alpha_prev_im[sfb])
                 } else if sfb > 0 {
                     (self.alpha_re[index - 1], self.alpha_im[index - 1])
-                } else { (0, 0) };
+                } else {
+                    (0, 0)
+                };
                 let (re, im) = if self.used[index] {
                     let re = last_re.saturating_sub(delta(bits)?);
-                    let im = if self.complex_coef { last_im.saturating_sub(delta(bits)?) } else { 0 };
+                    let im = if self.complex_coef {
+                        last_im.saturating_sub(delta(bits)?)
+                    } else {
+                        0
+                    };
                     (re, im)
-                } else { (0, 0) };
+                } else {
+                    (0, 0)
+                };
                 self.alpha_re[index] = re;
                 self.alpha_im[index] = im;
                 if sfb + 1 < max_sfb {
@@ -768,7 +1000,9 @@ impl Stereo {
     }
 
     fn apply(&mut self, channels: &mut [Channel], rate_index: u8) -> Result<()> {
-        if self.mode == 0 { return Ok(()); }
+        if self.mode == 0 {
+            return Ok(());
+        }
         let (first, rest) = channels.split_at_mut(1);
         let left = &mut first[0];
         let right = &mut rest[0];
@@ -779,14 +1013,18 @@ impl Stereo {
         let mut w = 0;
         for (g, &length) in left.ics.window_group_length.iter().enumerate() {
             for _ in 0..length {
-                *group.get_mut(w).ok_or_else(|| Error::invalid("AAC USAC: window grouping exceeds eight windows"))? = g;
+                *group.get_mut(w).ok_or_else(|| {
+                    Error::invalid("AAC USAC: window grouping exceeds eight windows")
+                })? = g;
                 w += 1;
             }
         }
         if self.mode != 3 {
             for (w, &g) in group[..windows].iter().enumerate() {
                 for sfb in 0..self.max_sfb {
-                    if !self.used[g * self.max_sfb + sfb] { continue; }
+                    if !self.used[g * self.max_sfb + sfb] {
+                        continue;
+                    }
                     for i in w * bins + swb[sfb] as usize..w * bins + swb[sfb + 1] as usize {
                         let (a, b) = (left.spectrum[i], right.spectrum[i]);
                         left.spectrum[i] = a + b;
@@ -804,7 +1042,11 @@ impl Stereo {
             let mut downmix = [0.0f32; N];
             for (w, &g) in group[..windows].iter().enumerate() {
                 let window = w * bins..(w + 1) * bins;
-                for ((d, &l), &r) in downmix[window.clone()].iter_mut().zip(&left.spectrum[window.clone()]).zip(&right.spectrum[window]) {
+                for ((d, &l), &r) in downmix[window.clone()]
+                    .iter_mut()
+                    .zip(&left.spectrum[window.clone()])
+                    .zip(&right.spectrum[window])
+                {
                     *d = 0.5 * (l + sign * r);
                 }
                 for sfb in 0..self.max_sfb {
@@ -833,11 +1075,25 @@ impl Stereo {
             }
             for w in 0..windows {
                 let current = &downmix[w * bins..(w + 1) * bins];
-                let previous = if w == 0 { self.use_previous.then_some(&previous_frame[..bins]) } else { Some(&downmix[(w - 1) * bins..w * bins]) };
+                let previous = if w == 0 {
+                    self.use_previous.then_some(&previous_frame[..bins])
+                } else {
+                    Some(&downmix[(w - 1) * bins..w * bins])
+                };
                 let estimate = &mut downmix_im[w * bins..(w + 1) * bins];
-                filter_and_add(current, &MDST_CURRENT[kind][previous_shape][shape], estimate, 1.0);
+                filter_and_add(
+                    current,
+                    &MDST_CURRENT[kind][previous_shape][shape],
+                    estimate,
+                    1.0,
+                );
                 if let Some(previous) = previous {
-                    filter_and_add(previous, &MDST_PREVIOUS[previous_kind][previous_shape], estimate, -1.0);
+                    filter_and_add(
+                        previous,
+                        &MDST_PREVIOUS[previous_kind][previous_shape],
+                        estimate,
+                        -1.0,
+                    );
                 }
                 previous_shape = shape;
             }
@@ -845,9 +1101,15 @@ impl Stereo {
         for (w, &g) in group[..windows].iter().enumerate() {
             for sfb in 0..self.max_sfb {
                 let band = g * self.max_sfb + sfb;
-                if !self.used[band] { continue; }
+                if !self.used[band] {
+                    continue;
+                }
                 let alpha_re = self.alpha_re[band] as f32 * 0.1;
-                let alpha_im = if self.complex_coef { self.alpha_im[band] as f32 * 0.1 } else { 0.0 };
+                let alpha_im = if self.complex_coef {
+                    self.alpha_im[band] as f32 * 0.1
+                } else {
+                    0.0
+                };
                 for i in w * bins + swb[sfb] as usize..w * bins + swb[sfb + 1] as usize {
                     let (l, r) = (left.spectrum[i], right.spectrum[i]);
                     let residual = r - alpha_re * l - alpha_im * downmix_im[i];
@@ -868,7 +1130,15 @@ impl Stereo {
     /// frame's last window, laid out by the last channel's window as in the
     /// reference (for independent windows the two may differ).
     fn save(&mut self, channels: &[Channel]) {
-        let bins = if channels[channels.len() - 1].ics.window_sequence.is_eight_short() { N / 8 } else { N };
+        let bins = if channels[channels.len() - 1]
+            .ics
+            .window_sequence
+            .is_eight_short()
+        {
+            N / 8
+        } else {
+            N
+        };
         for (saved, channel) in self.saved.iter_mut().zip(channels) {
             saved[N - bins..].copy_from_slice(&channel.spectrum[N - bins..]);
         }
@@ -884,7 +1154,13 @@ fn filter_and_add(input: &[f32], filter: &[f32; 7], estimate: &mut [f32], even: 
         let mut value = 0.0f32;
         for tap in 0..7 {
             let position = i as isize + tap as isize - 3;
-            let index = if position < 0 { -position - 1 } else if position >= n { 2 * n - 1 - position } else { position };
+            let index = if position < 0 {
+                -position - 1
+            } else if position >= n {
+                2 * n - 1 - position
+            } else {
+                position
+            };
             let term = filter[6 - tap] * input[index as usize];
             value = if tap == 0 { term } else { value + term };
         }
@@ -909,7 +1185,10 @@ struct Tns {
 impl Tns {
     /// Whether any parsed filter has a nonzero order.
     fn active(&self) -> bool {
-        self.counts.iter().zip(&self.filters).any(|(&count, filters)| filters[..count as usize].iter().any(|f| f.order != 0))
+        self.counts
+            .iter()
+            .zip(&self.filters)
+            .any(|(&count, filters)| filters[..count as usize].iter().any(|f| f.order != 0))
     }
 
     fn parse(&mut self, bits: &mut BitReader<'_>, ics: &IcsInfo) -> Result<()> {
@@ -917,13 +1196,17 @@ impl Tns {
         for w in 0..ics.num_windows as usize {
             let count = bits.read_u32(if short { 1 } else { 2 })? as usize;
             self.counts[w] = count as u8;
-            if count == 0 { continue; }
+            if count == 0 {
+                continue;
+            }
             let resolution = bits.read_u32(1)?;
             for filter in &mut self.filters[w][..count] {
                 filter.length = bits.read_u32(if short { 4 } else { 6 })? as u8;
                 // USAC long-window TNS order is four bits, not GA AAC's five.
                 filter.order = bits.read_u32(if short { 3 } else { 4 })? as u8;
-                if filter.order == 0 { continue; }
+                if filter.order == 0 {
+                    continue;
+                }
                 filter.reverse = bits.read_bit()?;
                 let compress = bits.read_u32(1)?;
                 let table = TNS_REFLECTION[(2 * compress + resolution) as usize];
@@ -945,7 +1228,11 @@ impl Tns {
 
     fn apply(&self, spectrum: &mut [f32; N], ics: &IcsInfo, rate_index: u8) -> Result<()> {
         let swb = offsets(ics, rate_index)?;
-        let cap = if ics.window_sequence.is_eight_short() { TNS_SHORT[rate_index as usize] } else { TNS_LONG[rate_index as usize] };
+        let cap = if ics.window_sequence.is_eight_short() {
+            TNS_SHORT[rate_index as usize]
+        } else {
+            TNS_LONG[rate_index as usize]
+        };
         let cap = cap.min(ics.max_sfb as usize);
         for w in 0..ics.num_windows as usize {
             let mut bottom = swb.len() - 1;
@@ -955,9 +1242,16 @@ impl Tns {
                 let start = swb[bottom.min(cap)] as usize;
                 let end = swb[top.min(cap)] as usize;
                 let order = filter.order as usize;
-                if order == 0 { continue; }
+                if order == 0 {
+                    continue;
+                }
                 for m in 0..end - start {
-                    let index = w * 128 + if filter.reverse { end - 1 - m } else { start + m };
+                    let index = w * 128
+                        + if filter.reverse {
+                            end - 1 - m
+                        } else {
+                            start + m
+                        };
                     for j in 1..=m.min(order) {
                         let previous = if filter.reverse { index + j } else { index - j };
                         spectrum[index] -= spectrum[previous] * filter.lpc[j - 1];
@@ -972,8 +1266,8 @@ impl Tns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::bits::BitWriter;
     use oxideav_core::TimeBase;
+    use oxideav_core::bits::BitWriter;
 
     fn mono_params() -> CodecParameters {
         let mut params = CodecParameters::audio(CodecId::new("aac"));
@@ -990,7 +1284,9 @@ mod tests {
         bits.write_u32(sequence as u32, 2);
         bits.write_u32(0, 1); // sine
         bits.write_u32(0, if sequence.is_eight_short() { 4 } else { 6 });
-        if sequence.is_eight_short() { bits.write_u32(0x7f, 7); }
+        if sequence.is_eight_short() {
+            bits.write_u32(0x7f, 7);
+        }
         bits.write_u32(0, 1); // no FAC
         bits.write_u32(0, 1); // extension absent
         let mut packet = Packet::new(0, TimeBase::new(1, 48000), bits.finish());
@@ -1001,30 +1297,48 @@ mod tests {
     #[test]
     fn fd_silence_window_switching_flush_and_reset() {
         let mut decoder = UsacDecoder::new(&mono_params()).unwrap();
-        for sequence in [WindowSequence::OnlyLong, WindowSequence::LongStart, WindowSequence::EightShort, WindowSequence::LongStop] {
+        for sequence in [
+            WindowSequence::OnlyLong,
+            WindowSequence::LongStart,
+            WindowSequence::EightShort,
+            WindowSequence::LongStop,
+        ] {
             decoder.send_packet(&silent_frame(sequence)).unwrap();
-            let Frame::Audio(frame) = decoder.receive_frame().unwrap() else { panic!("not audio"); };
+            let Frame::Audio(frame) = decoder.receive_frame().unwrap() else {
+                panic!("not audio");
+            };
             assert_eq!(frame.samples, 1024);
             assert_eq!(frame.pts, Some(17));
             assert_eq!(frame.data[0].len(), N * 4);
             // IEEE -0.0 from a windowed zero coefficient is also silence.
             for (i, bytes) in frame.data[0].chunks_exact(4).enumerate() {
-                assert_eq!(f32::from_le_bytes(bytes.try_into().unwrap()), 0.0, "sample {i}");
+                assert_eq!(
+                    f32::from_le_bytes(bytes.try_into().unwrap()),
+                    0.0,
+                    "sample {i}"
+                );
             }
             assert!(matches!(decoder.receive_frame(), Err(Error::NeedMore)));
         }
         decoder.flush().unwrap();
         assert!(matches!(decoder.receive_frame(), Err(Error::Eof)));
-        assert!(decoder.send_packet(&silent_frame(WindowSequence::OnlyLong)).is_err());
+        assert!(
+            decoder
+                .send_packet(&silent_frame(WindowSequence::OnlyLong))
+                .is_err()
+        );
         decoder.reset().unwrap();
-        decoder.send_packet(&silent_frame(WindowSequence::OnlyLong)).unwrap();
+        decoder
+            .send_packet(&silent_frame(WindowSequence::OnlyLong))
+            .unwrap();
         assert!(decoder.receive_frame().is_ok());
         assert_eq!(decoder.output_audio_format().unwrap().sample_rate, 48000);
     }
 
     #[test]
     fn unsupported_core_transitions_do_not_emit_partial_pcm() {
-        for mask in [(0, 0x40), (2, 0x08)] { // LPD core, FAC transition
+        for mask in [(0, 0x40), (2, 0x08)] {
+            // LPD core, FAC transition
             let mut decoder = UsacDecoder::new(&mono_params()).unwrap();
             let mut packet = silent_frame(WindowSequence::OnlyLong);
             packet.data[mask.0] |= mask.1;
@@ -1042,7 +1356,9 @@ mod tests {
         bits.write_u32(15, 4);
         bits.write_u32(0, 1); // forward
         bits.write_u32(0, 1); // uncompressed
-        for _ in 0..15 { bits.write_u32(0, 3); }
+        for _ in 0..15 {
+            bits.write_u32(0, 3);
+        }
         let bytes = bits.finish();
         let mut reader = BitReader::new(&bytes);
         let channel = Channel::new(3, 0).unwrap();
@@ -1056,7 +1372,14 @@ mod tests {
 
     #[test]
     fn target_level_accepts_the_ffmpeg_range() {
-        for (value, accepted) in [("-70", true), ("0", true), ("-24", true), ("-71", false), ("1", false), ("x", false)] {
+        for (value, accepted) in [
+            ("-70", true),
+            ("0", true),
+            ("-24", true),
+            ("-71", false),
+            ("1", false),
+            ("x", false),
+        ] {
             let mut params = mono_params();
             params.options.insert("target_level", value);
             assert_eq!(UsacDecoder::new(&params).is_ok(), accepted, "{value}");
@@ -1105,7 +1428,9 @@ mod tests {
             Some(payload) => {
                 w.write_u32(2, 2); // present, explicit length
                 w.write_u32(payload.len() as u32, 8);
-                for &byte in payload { w.write_u32(byte.into(), 8); }
+                for &byte in payload {
+                    w.write_u32(byte.into(), 8);
+                }
             }
         }
         w.write_u32(0, 2); // FD core, no TNS
@@ -1119,12 +1444,16 @@ mod tests {
     fn preroll_payload(config: &[u8], units: &[&[u8]]) -> Vec<u8> {
         let mut w = BitWriter::new();
         w.write_u32(config.len() as u32, 4);
-        for &byte in config { w.write_u32(byte.into(), 8); }
+        for &byte in config {
+            w.write_u32(byte.into(), 8);
+        }
         w.write_u32(0, 2); // applyCrossfade, reserved
         w.write_u32(units.len() as u32, 2);
         for unit in units {
             w.write_u32(unit.len() as u32, 16);
-            for &byte in *unit { w.write_u32(byte.into(), 8); }
+            for &byte in *unit {
+                w.write_u32(byte.into(), 8);
+            }
         }
         w.finish()
     }
@@ -1135,17 +1464,30 @@ mod tests {
         let ipf = preroll_frame(Some(&preroll_payload(&[], &[&unit])));
         let mut decoder = UsacDecoder::new(&preroll_params()).unwrap();
         decoder.send_packet(&ipf).unwrap();
-        assert_eq!((decoder.stats.preroll_payloads, decoder.stats.preroll_decoded, decoder.stats.preroll_skipped), (1, 1, 0));
+        assert_eq!(
+            (
+                decoder.stats.preroll_payloads,
+                decoder.stats.preroll_decoded,
+                decoder.stats.preroll_skipped
+            ),
+            (1, 1, 0)
+        );
         assert_eq!(decoder.pending.len(), 1, "pre-roll PCM is discarded");
         decoder.send_packet(&ipf).unwrap();
-        assert_eq!((decoder.stats.preroll_decoded, decoder.stats.preroll_skipped), (1, 1));
+        assert_eq!(
+            (decoder.stats.preroll_decoded, decoder.stats.preroll_skipped),
+            (1, 1)
+        );
         decoder.reset().unwrap();
         assert!(decoder.pending.is_empty());
         decoder.send_packet(&ipf).unwrap();
         assert_eq!(decoder.stats.preroll_decoded, 2);
         let same = preroll_frame(Some(&preroll_payload(&usac_config(3, 1), &[&unit])));
         decoder.send_packet(&same).unwrap();
-        assert_eq!((decoder.stats.config_changes, decoder.stats.preroll_skipped), (0, 2));
+        assert_eq!(
+            (decoder.stats.config_changes, decoder.stats.preroll_skipped),
+            (0, 2)
+        );
     }
 
     #[test]
@@ -1159,16 +1501,30 @@ mod tests {
         // more than the payload holds.
         let mut w = BitWriter::new();
         w.write_u32(config.len() as u32, 4);
-        for &byte in &config { w.write_u32(byte.into(), 8); }
+        for &byte in &config {
+            w.write_u32(byte.into(), 8);
+        }
         w.write_u32(0, 2);
         w.write_u32(1, 2);
         w.write_u32(unit.len() as u32 + 1, 16);
-        for &byte in &unit { w.write_u32(byte.into(), 8); }
-        assert!(decoder.send_packet(&preroll_frame(Some(&w.finish()))).is_err());
+        for &byte in &unit {
+            w.write_u32(byte.into(), 8);
+        }
+        assert!(
+            decoder
+                .send_packet(&preroll_frame(Some(&w.finish())))
+                .is_err()
+        );
         assert!(decoder.pending.is_empty());
-        decoder.send_packet(&preroll_frame(Some(&preroll_payload(&config, &[&unit])))).unwrap();
+        decoder
+            .send_packet(&preroll_frame(Some(&preroll_payload(&config, &[&unit]))))
+            .unwrap();
         assert_eq!(decoder.output_audio_format().unwrap().sample_rate, 44100);
-        assert_eq!((decoder.stats.preroll_decoded, decoder.stats.preroll_skipped), (1, 0), "the rebuilt cores must be primed");
+        assert_eq!(
+            (decoder.stats.preroll_decoded, decoder.stats.preroll_skipped),
+            (1, 0),
+            "the rebuilt cores must be primed"
+        );
         assert_eq!(decoder.pending.len(), 1);
     }
 
@@ -1182,7 +1538,9 @@ mod tests {
             (preroll_payload(&[], &[&unit[..1]]), ""),
         ] {
             let mut decoder = UsacDecoder::new(&preroll_params()).unwrap();
-            let error = decoder.send_packet(&preroll_frame(Some(&payload))).unwrap_err();
+            let error = decoder
+                .send_packet(&preroll_frame(Some(&payload)))
+                .unwrap_err();
             assert!(error.to_string().contains(message), "{error}");
             assert!(decoder.pending.is_empty());
         }

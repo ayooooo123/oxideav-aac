@@ -12,7 +12,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use oxideav_aac::decode::StreamDecoder;
-use oxideav_aac::he_aac_encoder::{HeAacConfig, HeAacEncoder, HE_FRAME_LEN};
+use oxideav_aac::he_aac_encoder::{HE_FRAME_LEN, HeAacConfig, HeAacEncoder};
 use oxideav_aac::sbr_qmf::EncoderAnalysisQmf;
 
 /// Read the `data` chunk of a 16-bit WAV as interleaved `i16`.
@@ -27,7 +27,9 @@ fn read_wav_s16(path: &PathBuf) -> Option<Vec<i16>> {
             let end = (body + sz).min(d.len());
             return Some(
                 d[body..end]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| i16::from_le_bytes([c[0], c[1]]))
                     .collect(),
             );
@@ -67,7 +69,7 @@ fn best_lag(input: &[f64], output: &[f64], max_lag: usize) -> usize {
 fn band_energies(x: &[f64]) -> [f64; 64] {
     let mut bank = EncoderAnalysisQmf::new();
     let mut e = [0.0f64; 64];
-    for slot in x.chunks_exact(64) {
+    for slot in x.as_chunks::<64>().0 {
         let cols = bank.push_slot(slot).unwrap();
         for (k, c) in cols.iter().enumerate() {
             e[k] += c.norm_sqr();
@@ -226,10 +228,7 @@ fn synthetic(seconds: f64, fs: u32, channels: usize) -> Vec<i16> {
 fn synthetic_mono_44100_reconstructs_the_high_band_envelope() {
     let pcm = synthetic(2.0, 44_100, 1);
     for interp in [true, false] {
-        let cfg = HeAacConfig {
-            interpol_freq: interp,
-            ..HeAacConfig::new(44_100, 1, 32_000)
-        };
+        let cfg = HeAacConfig::new(44_100, 1, 32_000).with_interpol_freq(interp);
         let m = round_trip(&pcm, cfg);
         eprintln!(
             "mono 32k interp={interp}: lag {} low-SNR {:.1} dB env-err {:.2} dB (worst {:.1}) HF ratio {:.2} dB, {} bytes",
@@ -252,11 +251,9 @@ fn synthetic_mono_44100_reconstructs_the_high_band_envelope() {
 fn synthetic_stereo_48000_with_crc_and_coupling() {
     let pcm = synthetic(1.5, 48_000, 2);
     for coupling in [false, true] {
-        let cfg = HeAacConfig {
-            sbr_crc: true,
-            coupling,
-            ..HeAacConfig::new(48_000, 2, 64_000)
-        };
+        let cfg = HeAacConfig::new(48_000, 2, 64_000)
+            .with_sbr_crc(true)
+            .with_coupling(coupling);
         let m = round_trip(&pcm, cfg);
         eprintln!(
             "stereo 64k coupling={coupling}: lag {} low-SNR {:.1} dB env-err {:.2} dB (worst {:.1}) HF ratio {:.2} dB, {} bytes",

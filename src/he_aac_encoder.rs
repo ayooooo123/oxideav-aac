@@ -79,11 +79,11 @@
 use std::collections::VecDeque;
 
 use crate::adts::ADTS_SAMPLE_RATES_HZ;
-use crate::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
+use crate::encoder::{EncoderConfig, FRAME_LEN, StreamEncoder};
 use crate::ps_encoder::{PsEncoder, PsEncoderConfig, PsFrame};
 use crate::ps_hybrid::{LOOKAHEAD, NUM_QMF_SLOTS};
-use crate::sbr_element::{SbrExtension, EXTENSION_ID_PS};
-use crate::sbr_encoder::{SbrEncoder, SbrEncoderConfig, SbrFrame, RATE, SBR_ENC_COLS, T_HF_GEN};
+use crate::sbr_element::{EXTENSION_ID_PS, SbrExtension};
+use crate::sbr_encoder::{RATE, SBR_ENC_COLS, SbrEncoder, SbrEncoderConfig, SbrFrame, T_HF_GEN};
 use crate::sbr_qmf::{Complex, EncoderAnalysisQmf, SynthesisQmf};
 use crate::{Error, Result};
 
@@ -93,22 +93,27 @@ pub const HE_FRAME_LEN: usize = 2 * FRAME_LEN;
 /// Taps of the downsampling low-pass (odd, so the group delay
 /// `(FIR_TAPS − 1) / 2` is a whole number of full-rate samples — and
 /// even, so it is a whole number of core samples too).
+#[doc(hidden)]
 pub const FIR_TAPS: usize = 65;
 
 /// The FIR group delay in full-rate samples.
+#[doc(hidden)]
 pub const FIR_DELAY: usize = (FIR_TAPS - 1) / 2;
 
 /// Delay of the 64-band analysis → synthesis QMF pair
 /// ([`EncoderAnalysisQmf`] into [`SynthesisQmf`]) in samples — nine
 /// columns, measured on the pair (near-perfect reconstruction).
+#[doc(hidden)]
 pub const QMF_PAIR_DELAY: usize = 576;
 
 /// Extra delay on the PS downmix so that `FIR_DELAY + QMF_PAIR_DELAY
 /// + PS_MONO_PAD` is a whole number of QMF columns.
+#[doc(hidden)]
 pub const PS_MONO_PAD: usize = 64 - (FIR_DELAY + QMF_PAIR_DELAY) % 64;
 
 /// The mono path's analysis column `j` covers the same input samples
 /// as the stereo analysis column `j − PS_ALIGN_COLS`.
+#[doc(hidden)]
 pub const PS_ALIGN_COLS: usize = (FIR_DELAY + QMF_PAIR_DELAY + PS_MONO_PAD) / 64;
 
 /// Cap on the PS downmix gain (`+12 dB`): anti-phase content whose
@@ -117,6 +122,7 @@ const PS_DOWNMIX_GAIN_MAX: f64 = 4.0;
 
 /// Configuration for [`HeAacEncoder`].
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct HeAacConfig {
     /// Output (SBR) sample rate in Hz. Its half must be a Table 1.18
     /// ADTS rate with a §4.5.4 band table, and the rate itself one of
@@ -145,6 +151,87 @@ pub struct HeAacConfig {
     pub parametric_stereo: bool,
     /// The PS encoder's configuration (used when `parametric_stereo`).
     pub ps: PsEncoderConfig,
+}
+
+/// `with_*` builders: each returns the configuration with one field
+/// replaced (the record is `#[non_exhaustive]`).
+impl HeAacConfig {
+    /// This configuration with [`Self::sample_rate`] set to `sample_rate`.
+    #[must_use]
+    pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
+        self.sample_rate = sample_rate;
+        self
+    }
+
+    /// This configuration with [`Self::channels`] set to `channels`.
+    #[must_use]
+    pub fn with_channels(mut self, channels: u8) -> Self {
+        self.channels = channels;
+        self
+    }
+
+    /// This configuration with [`Self::bitrate`] set to `bitrate`.
+    #[must_use]
+    pub fn with_bitrate(mut self, bitrate: u32) -> Self {
+        self.bitrate = bitrate;
+        self
+    }
+
+    /// This configuration with [`Self::crossover_hz`] set to `crossover_hz`.
+    #[must_use]
+    pub fn with_crossover_hz(mut self, crossover_hz: Option<f64>) -> Self {
+        self.crossover_hz = crossover_hz;
+        self
+    }
+
+    /// This configuration with [`Self::sbr_crc`] set to `sbr_crc`.
+    #[must_use]
+    pub fn with_sbr_crc(mut self, sbr_crc: bool) -> Self {
+        self.sbr_crc = sbr_crc;
+        self
+    }
+
+    /// This configuration with [`Self::add_harmonic`] set to `add_harmonic`.
+    #[must_use]
+    pub fn with_add_harmonic(mut self, add_harmonic: bool) -> Self {
+        self.add_harmonic = add_harmonic;
+        self
+    }
+
+    /// This configuration with [`Self::coupling`] set to `coupling`.
+    #[must_use]
+    pub fn with_coupling(mut self, coupling: bool) -> Self {
+        self.coupling = coupling;
+        self
+    }
+
+    /// This configuration with [`Self::header_interval`] set to `header_interval`.
+    #[must_use]
+    pub fn with_header_interval(mut self, header_interval: u32) -> Self {
+        self.header_interval = header_interval;
+        self
+    }
+
+    /// This configuration with [`Self::interpol_freq`] set to `interpol_freq`.
+    #[must_use]
+    pub fn with_interpol_freq(mut self, interpol_freq: bool) -> Self {
+        self.interpol_freq = interpol_freq;
+        self
+    }
+
+    /// This configuration with [`Self::parametric_stereo`] set to `parametric_stereo`.
+    #[must_use]
+    pub fn with_parametric_stereo(mut self, parametric_stereo: bool) -> Self {
+        self.parametric_stereo = parametric_stereo;
+        self
+    }
+
+    /// This configuration with [`Self::ps`] set to `ps`.
+    #[must_use]
+    pub fn with_ps(mut self, ps: PsEncoderConfig) -> Self {
+        self.ps = ps;
+        self
+    }
 }
 
 impl HeAacConfig {
@@ -218,6 +305,7 @@ impl HeAacConfig {
 
 /// Default SBR crossover per bit of core-channel rate (see
 /// [`HeAacConfig::crossover`]).
+#[doc(hidden)]
 pub const CROSSOVER_HZ_PER_BPS: f64 = 0.35;
 
 /// Windowed-sinc low-pass FIR with cutoff `fc` (cycles per sample,
@@ -422,7 +510,7 @@ impl HeAacEncoder {
         if config.parametric_stereo && config.channels != 2 {
             return Err(Error::EncoderInvalidConfig);
         }
-        if config.sample_rate % 2 != 0 {
+        if !config.sample_rate.is_multiple_of(2) {
             return Err(Error::EncoderInvalidConfig);
         }
         let core_rate = config.sample_rate / 2;
@@ -474,6 +562,23 @@ impl HeAacEncoder {
             last_sbr: None,
             last_ps: None,
         })
+    }
+
+    /// Emit bare `raw_data_block()`s (MP4 / CAF access units) instead
+    /// of ADTS frames; see [`StreamEncoder::set_raw`]. The stream is then
+    /// described by [`Self::audio_specific_config`] (explicit SBR / PS
+    /// signalling).
+    pub fn set_raw(&mut self, raw: bool) {
+        self.core.set_raw(raw);
+    }
+
+    /// Change the target total bitrate from the next frame on. The SBR
+    /// crossover keeps the value chosen at construction. Errors with
+    /// [`Error::EncoderInvalidConfig`] for 0.
+    pub fn set_bitrate(&mut self, bitrate: u32) -> Result<()> {
+        self.core.set_bitrate(bitrate)?;
+        self.config.bitrate = bitrate;
+        Ok(())
     }
 
     /// The configuration.
@@ -538,7 +643,7 @@ impl HeAacEncoder {
         fe.qmf_delay.clear();
         fe.qmf_delay
             .extend_from_slice(&hop[hop.len() - FIR_DELAY..]);
-        for slot in delayed.chunks_exact(64) {
+        for slot in delayed.as_chunks::<64>().0 {
             let x = fe.bank.push_slot(slot).expect("64-sample slot");
             fe.cols.push_back(x);
             if fe.cols.len() > RING_COLS {
@@ -563,13 +668,30 @@ impl HeAacEncoder {
     /// samples (a shorter tail is zero-padded) into one ADTS frame.
     pub fn encode_frame(&mut self, interleaved: &[i16]) -> Result<Vec<u8>> {
         let ch = usize::from(self.config.channels);
-        if interleaved.len() > HE_FRAME_LEN * ch || interleaved.len() % ch != 0 {
+        if interleaved.len() > HE_FRAME_LEN * ch || !interleaved.len().is_multiple_of(ch) {
             return Err(Error::EncoderInvalidConfig);
         }
         let mut hops: Vec<Vec<f64>> = vec![vec![0.0; HE_FRAME_LEN]; ch];
         for (j, hop) in hops.iter_mut().enumerate() {
             for (n, v) in hop.iter_mut().take(interleaved.len() / ch).enumerate() {
                 *v = f64::from(interleaved[n * ch + j]);
+            }
+        }
+        self.encode_hops(&hops)
+    }
+
+    /// [`HeAacEncoder::encode_frame`] for float PCM: `interleaved`
+    /// holds at most `2048 × channels` samples normalised to ±1.0 (1.0
+    /// is 32768 on the `i16` axis), coded without rounding to 16 bits.
+    pub fn encode_frame_f64(&mut self, interleaved: &[f64]) -> Result<Vec<u8>> {
+        let ch = usize::from(self.config.channels);
+        if interleaved.len() > HE_FRAME_LEN * ch || !interleaved.len().is_multiple_of(ch) {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        let mut hops: Vec<Vec<f64>> = vec![vec![0.0; HE_FRAME_LEN]; ch];
+        for (j, hop) in hops.iter_mut().enumerate() {
+            for (n, v) in hop.iter_mut().take(interleaved.len() / ch).enumerate() {
+                *v = interleaved[n * ch + j] * 32768.0;
             }
         }
         self.encode_hops(&hops)
@@ -611,15 +733,9 @@ impl HeAacEncoder {
         let sbr_frame = self.sbr.encode_frame_with_extension(&refs, extension)?;
         let fills = vec![sbr_frame.payload.clone()];
         self.last_sbr = Some(sbr_frame);
-        // Core encode (interleaved S16 on the ±32768 axis).
-        let mut inter = Vec::with_capacity(FRAME_LEN * ch);
-        for n in 0..FRAME_LEN {
-            for pcm in core_pcm.iter() {
-                inter.push(crate::pcm::to_s16(pcm[n]));
-            }
-        }
+        // Core encode (planar, on the ±32768 axis).
         self.frames += 1;
-        self.core.encode_frame_with_fills(&inter, &fills)
+        self.core.encode_planar_with_fills(&core_pcm, &fills)
     }
 
     /// Flush: one trailing frame covering the final core overlap (and
@@ -634,7 +750,7 @@ impl HeAacEncoder {
     /// stream (`⌈n / 2048⌉ + 1` frames including the flush).
     pub fn encode_all(&mut self, interleaved: &[i16]) -> Result<Vec<u8>> {
         let ch = usize::from(self.config.channels);
-        if interleaved.len() % ch != 0 {
+        if !interleaved.len().is_multiple_of(ch) {
             return Err(Error::EncoderInvalidConfig);
         }
         let mut out = Vec::new();
@@ -689,6 +805,46 @@ impl HeAacEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn float_input_codes_like_i16_input() {
+        let pcm: Vec<i16> = (0..HE_FRAME_LEN * 2 * 3)
+            .map(|i| ((i as f64 * 0.013).sin() * 9000.0 + (i as f64 * 0.31).cos() * 3000.0) as i16)
+            .collect();
+        let float: Vec<f64> = pcm.iter().map(|&v| f64::from(v) / 32768.0).collect();
+        let mut a = HeAacEncoder::new(HeAacConfig::new(44_100, 2, 48_000)).unwrap();
+        let mut b = HeAacEncoder::new(HeAacConfig::new(44_100, 2, 48_000)).unwrap();
+        for (x, y) in pcm
+            .chunks(HE_FRAME_LEN * 2)
+            .zip(float.chunks(HE_FRAME_LEN * 2))
+        {
+            assert_eq!(a.encode_frame(x).unwrap(), b.encode_frame_f64(y).unwrap());
+        }
+    }
+
+    #[test]
+    fn raw_blocks_are_adts_payloads_with_the_header_budget() {
+        // 64 kb/s at a 24 kHz core is a 334-byte ADTS payload budget,
+        // the whole budget of a raw block at 62 625 b/s.
+        let pcm: Vec<f64> = (0..HE_FRAME_LEN * 2 * 4)
+            .map(|i| (i as f64 * 0.017).sin() * 0.3 + (i as f64 * 0.9).sin() * 0.05)
+            .collect();
+        let config = |bitrate| HeAacConfig {
+            crossover_hz: Some(8_000.0),
+            ..HeAacConfig::new(48_000, 2, bitrate)
+        };
+        let mut adts = HeAacEncoder::new(config(64_000)).unwrap();
+        let mut raw = HeAacEncoder::new(config(62_625)).unwrap();
+        raw.set_raw(true);
+        for hop in pcm.chunks(HE_FRAME_LEN * 2) {
+            let a = adts.encode_frame_f64(hop).unwrap();
+            assert_eq!(&a[..2], &[0xff, 0xf1]);
+            assert_eq!(raw.encode_frame_f64(hop).unwrap(), &a[7..]);
+        }
+        raw.set_bitrate(32_000).unwrap();
+        assert_eq!(raw.config().bitrate, 32_000);
+        assert!(raw.set_bitrate(0).is_err());
+    }
 
     #[test]
     fn config_validation() {
@@ -754,9 +910,11 @@ mod tests {
         assert!(frames.iter().all(|f| f.sample_rate == 44_100));
         assert!(frames.iter().all(|f| f.channels == 2));
         assert!(frames.iter().all(|f| f.pcm.len() == 2 * HE_FRAME_LEN));
-        assert!(frames
-            .iter()
-            .all(|f| f.pcm.chunks_exact(2).all(|lr| lr[0] == lr[1])));
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.pcm.chunks_exact(2).all(|lr| lr[0] == lr[1]))
+        );
         assert!(enc.last_sbr_frame().is_some());
     }
 
@@ -765,11 +923,13 @@ mod tests {
     /// it as two channels at the full rate, and the v2 ASCs signal PS.
     #[test]
     fn parametric_stereo_frames_decode_as_stereo() {
-        assert!(HeAacEncoder::new(HeAacConfig {
-            channels: 1,
-            ..HeAacConfig::new_v2(44_100, 32_000)
-        })
-        .is_err());
+        assert!(
+            HeAacEncoder::new(HeAacConfig {
+                channels: 1,
+                ..HeAacConfig::new_v2(44_100, 32_000)
+            })
+            .is_err()
+        );
         let mut enc = HeAacEncoder::new(HeAacConfig::new_v2(44_100, 32_000)).unwrap();
         assert_eq!(enc.config().core_channels(), 1);
         let n = 4 * HE_FRAME_LEN;
@@ -821,7 +981,7 @@ mod tests {
             })
             .collect();
         let mut output = Vec::new();
-        for slot in input.chunks_exact(64) {
+        for slot in input.as_chunks::<64>().0 {
             let x = a.push_slot(slot).unwrap();
             output.extend_from_slice(&s.push_slot(&x).unwrap());
         }

@@ -46,6 +46,9 @@
 //!   window region. Frame `f` covers input samples
 //!   `[f·1024 − 1024, f·1024 + 1024)`; the leading frame is primed
 //!   with zeros, giving the standard 1024-sample encoder delay.
+//!   Under the 960-line family ([`StreamEncoder::set_frame_family`])
+//!   every length scales: 960-sample hops, `N = 1920 / 240`, a
+//!   960-sample delay.
 //! * **Quantizer** — the exact inverse of §4.6.2:
 //!   `q = round((|x| / 2^(0.25·(sf−100)))^(3/4))`, with
 //!   round-half-away-from-zero (the §1.3 `NINT` convention).
@@ -151,34 +154,31 @@
 //! [`crate::spectral_codebook::MAX_QUANT`] (8191, the §4.6.3.3 ESC
 //! ceiling), and `aac_frame_length` stays within its 13-bit field.
 
-use crate::adts::{AdtsHeader, ADTS_HEADER_BYTES_NO_CRC, ADTS_SAMPLE_RATES_HZ};
-use crate::encoder_tns::detect_and_apply_tns;
-use crate::filterbank::{
-    forward_mdct, long_sequence_window, short_window_j, SHORT_SEQ_HOP, SHORT_SEQ_START,
-};
+use crate::adts::{ADTS_HEADER_BYTES_NO_CRC, ADTS_SAMPLE_RATES_HZ, AdtsHeader};
+use crate::asc::AacResilienceFlags;
+use crate::encoder_tns::detect_and_apply_tns_family;
+use crate::filterbank::{forward_mdct, long_sequence_window_n, short_window_n};
 use crate::ics_body::IcsBody;
-use crate::ics_info::{
-    IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW, NUM_SWB_SHORT_WINDOW,
-};
+use crate::ics_info::{IcsInfo, NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape};
 use crate::pce::{ElementSelect, Pce};
-use crate::pulse_data::{Pulse, PulseData, MAX_PULSES};
+use crate::pulse_data::{MAX_PULSES, Pulse, PulseData};
 use crate::raw_data_block::{FrameAssembler, IdSynEle};
 use crate::scale_factor_data::{
-    differentiate, AbsoluteScaleFactorEntry, AbsoluteScaleFactors, NOISE_OFFSET,
+    AbsoluteScaleFactorEntry, AbsoluteScaleFactors, NOISE_OFFSET, differentiate,
 };
 use crate::section_data::{
-    Section, SectionData, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, ZERO_HCB,
+    INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, Section, SectionData, ZERO_HCB,
 };
 use crate::spectral_codebook::MAX_QUANT;
 use crate::spectral_data::SpectralData;
 use crate::swb_offset::{
-    long_window_offsets, short_window_offsets, LONG_WINDOW_LEN, SHORT_WINDOW_LEN,
+    FrameFamily, LONG_WINDOW_LEN, long_window_offsets_family, short_window_offsets_family,
 };
 use crate::tns_data::TnsData;
 use crate::{Error, Result};
 
-use oxideav_core::bits::BitWriter;
 use oxideav_core::ChannelPosition;
+use oxideav_core::bits::BitWriter;
 
 /// Historical direct-factory endpoint (the crate convention's
 /// `<crate>::encoder::make_encoder` path) — re-exported from
@@ -189,8 +189,50 @@ pub use crate::codec_encoder::make_encoder;
 /// family this crate implements).
 pub const FRAME_LEN: usize = LONG_WINDOW_LEN as usize;
 
-/// The long transform length `N = 2048`.
-const LONG_TRANSFORM_LEN: usize = 2 * FRAME_LEN;
+/// The frame geometry one encode runs under: the §4.5.1.1
+/// frame-length family (`Lc1024` or `Lc960`) and the Table 1.18
+/// sampling-frequency index that selects its §4.5.4 band tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Geom {
+    family: FrameFamily,
+    fs: u8,
+}
+
+impl Geom {
+    #[cfg(test)]
+    fn lc(fs: u8) -> Self {
+        Geom {
+            family: FrameFamily::Lc1024,
+            fs,
+        }
+    }
+
+    /// Spectral lines (and PCM samples) per frame: 1024 / 960.
+    fn frame_len(self) -> usize {
+        self.family.frame_len()
+    }
+
+    /// Spectral lines per short window: 128 / 120.
+    fn short_len(self) -> usize {
+        self.family.short_window_len().unwrap_or(128)
+    }
+
+    fn long_offsets(self) -> Result<&'static [u16]> {
+        long_window_offsets_family(self.family, self.fs)
+    }
+
+    fn short_offsets(self) -> Result<&'static [u16]> {
+        short_window_offsets_family(self.family, self.fs)
+    }
+
+    fn num_swb_long(self) -> Result<usize> {
+        Ok(self.long_offsets()?.len() - 1)
+    }
+
+    fn num_swb_short(self) -> Result<usize> {
+        Ok(self.short_offsets()?.len() - 1)
+    }
+}
 
 /// §4.6.2.3.3 `SF_OFFSET` — the scalefactor of unit gain.
 const SF_OFFSET: i32 = 100;
@@ -213,15 +255,20 @@ const SPREAD: f64 = 0.5;
 /// relative to the frame and is sent as `ZERO_HCB`.
 const MIN_TARGET_MAG: f64 = 0.7;
 
-/// Upper bound on rate-loop iterations. Each iteration coarsens
-/// every quantizer by 3 dB (sf offset +4), so 48 iterations span
-/// ~144 dB — beyond that the frame is all-zero anyway.
-const MAX_RATE_ITERATIONS: usize = 48;
+/// Coarsest scalefactor offset the rate search reaches: 48 steps
+/// of 3 dB (sf offset +4 each) span ~144 dB — beyond that the frame
+/// is all-zero anyway. A frame that still overflows there is
+/// emitted over budget.
+const MAX_SF_OFFSET: i32 = 192;
 
-/// Deepest refinement the rate loop applies when a frame comes in
+/// Deepest refinement the rate search applies when a frame comes in
 /// under budget: −32 scalefactors ≈ 24 dB of extra precision
 /// (magnitudes ×2^6 over the [`TARGET_PEAK_MAG`] baseline).
-const MAX_REFINE_OFFSET: i32 = 32;
+const MIN_SF_OFFSET: i32 = -32;
+
+/// One end of the rate search's bracket: a scalefactor offset and
+/// the raw data block assembled at it.
+type Bracket = Option<(i32, Vec<u8>)>;
 
 /// Default coded bandwidth per bit of channel rate: the audio
 /// bandwidth kept at `bitrate / channels` bits per second per
@@ -252,8 +299,10 @@ const PNS_MIN_WIDTH: usize = 8;
 /// coding.
 const PNS_DENSITY_MIN: f64 = 0.4;
 
-/// Configuration for [`StreamEncoder`].
+/// Configuration for [`StreamEncoder`]. Build it with
+/// [`EncoderConfig::new`] (fields may be added in later releases).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EncoderConfig {
     /// Output sample rate in Hz. Must be one of the ISO/IEC 14496-3
     /// Table 1.18 rates expressible in an ADTS header (index 0..=12).
@@ -280,6 +329,38 @@ pub struct EncoderConfig {
 }
 
 impl EncoderConfig {
+    /// A configuration for `channels` channels at `sample_rate` Hz and
+    /// a target of `bitrate` bits per second.
+    #[must_use]
+    pub const fn new(sample_rate: u32, channels: u8, bitrate: u32) -> Self {
+        EncoderConfig {
+            sample_rate,
+            channels,
+            bitrate,
+        }
+    }
+
+    /// This configuration at another sample rate.
+    #[must_use]
+    pub const fn with_sample_rate(mut self, sample_rate: u32) -> Self {
+        self.sample_rate = sample_rate;
+        self
+    }
+
+    /// This configuration with another channel count.
+    #[must_use]
+    pub const fn with_channels(mut self, channels: u8) -> Self {
+        self.channels = channels;
+        self
+    }
+
+    /// This configuration at another target bitrate.
+    #[must_use]
+    pub const fn with_bitrate(mut self, bitrate: u32) -> Self {
+        self.bitrate = bitrate;
+        self
+    }
+
     /// The default coded bandwidth for this rate (see
     /// [`BANDWIDTH_HZ_PER_BPS`]): `0.26 Hz` per bit/s of per-channel
     /// rate — 8.3 kHz at 32 kbps per channel, 12.5 kHz at 48,
@@ -307,13 +388,14 @@ impl EncoderConfig {
     }
 
     /// Per-frame payload byte budget from the bitrate:
-    /// `bitrate · 1024 / sample_rate` bits, minus the 7-byte ADTS
-    /// header, floored at a minimum that always allows a syntactically
-    /// valid (silent) frame.
-    fn frame_budget_bytes(&self) -> usize {
-        let bits = (self.bitrate as u64 * FRAME_LEN as u64) / self.sample_rate.max(1) as u64;
+    /// `bitrate · frame_len / sample_rate` bits, minus `header` bytes of
+    /// framing (the 7-byte ADTS header, or none for bare access units),
+    /// floored at a minimum that always allows a syntactically valid
+    /// (silent) frame.
+    fn frame_budget_bytes(&self, frame_len: usize, header: usize) -> usize {
+        let bits = (self.bitrate as u64 * frame_len as u64) / self.sample_rate.max(1) as u64;
         let bytes = (bits / 8) as usize;
-        bytes.saturating_sub(ADTS_HEADER_BYTES_NO_CRC).max(16)
+        bytes.saturating_sub(header).max(16)
     }
 
     /// The Table 1.19 default `channelConfiguration` for this channel
@@ -566,6 +648,12 @@ pub struct StreamEncoder {
     /// history hop, so this frame *must* be `EIGHT_SHORT_SEQUENCE`
     /// (the `LONG_START → EIGHT_SHORT` contract).
     short_pending: bool,
+    /// The previous frame's scalefactor offset, where the next
+    /// frame's rate search starts (see [`Self::search_offset`]).
+    sf_offset_hint: i32,
+    /// Raw data blocks the rate search has assembled so far — see
+    /// [`Self::rate_passes`].
+    rate_passes: u64,
     /// §4.6.13 PNS emission toggle — see [`StreamEncoder::set_pns`].
     pns_enabled: bool,
     /// §4.6.9 TNS emission toggle — see [`StreamEncoder::set_tns`].
@@ -575,6 +663,18 @@ pub struct StreamEncoder {
     is_enabled: bool,
     /// Coded bandwidth (`None` = full band); see [`Self::set_bandwidth`].
     bandwidth_hz: Option<f64>,
+    /// §4.5.1.1 frame-length family: 1024 / 960-line AAC-LC (see
+    /// [`Self::set_frame_family`]), or ER AAC LD's 512 / 480 lines
+    /// (long windows only, `er_raw_data_block()` syntax; see
+    /// [`Self::new_ld`]).
+    family: FrameFamily,
+    /// Emit bare access units from the frame entry points; see
+    /// [`Self::set_raw`].
+    raw: bool,
+    /// ER AAC ELD (AOT 39): the low-delay filterbank of §4.6.20 in
+    /// place of LD's MDCT, `history` holding the three previous hops,
+    /// and the ELD channel syntax; see [`Self::new_eld`].
+    eld: bool,
 }
 
 impl StreamEncoder {
@@ -668,11 +768,255 @@ impl StreamEncoder {
             history: vec![vec![0.0; FRAME_LEN]; ch],
             prev_seq: WindowSequence::OnlyLong,
             short_pending: false,
+            sf_offset_hint: 0,
+            rate_passes: 0,
             pns_enabled: false,
             tns_enabled: true,
             is_enabled: false,
             bandwidth_hz: Some(config.default_bandwidth_hz()),
+            family: FrameFamily::Lc1024,
+            raw: false,
+            eld: false,
         })
+    }
+
+    /// Build an ER AAC LD (AOT 23) encoder: `frame_len` 512 or 480
+    /// spectral lines per frame (`frameLengthFlag` 0 / 1), long windows
+    /// with the sine shape only (§4.6.17.2.2: no block switching), and
+    /// each frame an `er_raw_data_block()` (§4.4.2.3 Table 4.19: the
+    /// channel configuration's fixed element sequence without
+    /// `id_syn_ele`, no `END`) — the access unit an MP4 / CAF sample
+    /// carries, described by [`Self::audio_specific_config`] (no
+    /// resilience tools, `epConfig` 0). TNS, PNS and intensity stereo
+    /// stay off.
+    ///
+    /// Errors with [`Error::EncoderInvalidConfig`] for another frame
+    /// length, a rate without an LD band table, a channel count
+    /// without a Table 1.19 configuration, or bitrate 0.
+    pub fn new_ld(config: EncoderConfig, frame_len: usize) -> Result<Self> {
+        let family = match frame_len {
+            512 => FrameFamily::Ld512,
+            480 => FrameFamily::Ld480,
+            _ => return Err(Error::EncoderInvalidConfig),
+        };
+        let mut encoder = Self::new(config)?;
+        long_window_offsets_family(family, encoder.fs_index)
+            .map_err(|_| Error::EncoderInvalidConfig)?;
+        encoder.family = family;
+        encoder.history = vec![vec![0.0; frame_len]; usize::from(config.channels)];
+        encoder.raw = true;
+        encoder.tns_enabled = false;
+        Ok(encoder)
+    }
+
+    /// Build an ER AAC ELD (AOT 39) encoder without low-delay SBR:
+    /// `frame_len` 512 or 480 spectral lines per frame
+    /// (`frameLengthFlag` 0 / 1), the LD band tables, and each frame
+    /// an `er_raw_data_block()` of untagged ELD channel elements
+    /// (§4.4.2.9 Tables 4.75–4.79: `max_sfb` instead of `ics_info()`,
+    /// no pulse or gain-control data), for an `ELDSpecificConfig`
+    /// without the resilience tools or extensions
+    /// ([`Self::audio_specific_config`]). The analysis is the inverse
+    /// of the §4.6.20.2 low-delay synthesis: block `m`'s coefficients
+    /// are
+    ///
+    /// `X[k] = -2 · Σ w[4N-1-p] · x[p] · cos(π/N · (p - 5N/2 + n0) · (k + 1/2))`
+    ///
+    /// over the `4N` samples `x` that end with block `m`'s input hop
+    /// (`w` the synthesis window, `n0 = (-N/2 + 1)/2`), so the decoder
+    /// reconstructs the input `N/2` samples late. TNS, PNS and
+    /// intensity stereo stay off.
+    ///
+    /// Errors as [`Self::new_ld`].
+    pub fn new_eld(config: EncoderConfig, frame_len: usize) -> Result<Self> {
+        let mut encoder = Self::new_ld(config, frame_len)?;
+        encoder.eld = true;
+        encoder.history = vec![vec![0.0; 3 * frame_len]; usize::from(config.channels)];
+        Ok(encoder)
+    }
+
+    /// Keep a coded hop as the analysis history: the previous hop, or
+    /// for ELD the three previous hops.
+    fn remember(&mut self, cur: Vec<Vec<f64>>) {
+        if !self.eld {
+            self.history = cur;
+            return;
+        }
+        let n = self.frame_len();
+        for (hist, hop) in self.history.iter_mut().zip(cur) {
+            hist.drain(..n);
+            hist.extend(hop);
+        }
+    }
+
+    /// Select the §4.5.1.1 frame-length family: `Lc1024` (the
+    /// default) or `Lc960` — the `frameLengthFlag == 1` 960/120-line
+    /// geometry (the bracketed Table 4.129–4.141 band columns, the
+    /// `N = 1920 / 240` transform pair, 960-sample hops). Select
+    /// before the first frame (it restarts the analysis state).
+    ///
+    /// ADTS cannot signal the 960-line family, so under `Lc960` the
+    /// ADTS entry points ([`Self::encode_frame`], [`Self::finish`],
+    /// [`Self::encode_all`]) return [`Error::EncoderInvalidConfig`];
+    /// use the access-unit entry points ([`Self::encode_access_unit`],
+    /// [`Self::finish_access_unit`], [`Self::encode_all_access_units`])
+    /// with [`Self::audio_specific_config`] (MP4 / Matroska / LATM
+    /// carriage). Any other family is rejected with
+    /// [`Error::EncoderInvalidConfig`].
+    pub fn set_frame_family(&mut self, family: FrameFamily) -> Result<()> {
+        if !matches!(family, FrameFamily::Lc1024 | FrameFamily::Lc960) {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        Geom {
+            family,
+            fs: self.fs_index,
+        }
+        .short_offsets()?;
+        self.family = family;
+        let ch = self.config.channels as usize;
+        self.history = vec![vec![0.0; family.frame_len()]; ch];
+        self.prev_seq = WindowSequence::OnlyLong;
+        self.short_pending = false;
+        Ok(())
+    }
+
+    /// The active §4.5.1.1 frame-length family.
+    pub fn frame_family(&self) -> FrameFamily {
+        self.family
+    }
+
+    /// PCM samples per channel per frame (1024 / 960).
+    pub fn frame_len(&self) -> usize {
+        self.family.frame_len()
+    }
+
+    /// The §1.6.2.1 `AudioSpecificConfig` describing this encoder's
+    /// access units: AOT 2 (AAC LC), the sampling-frequency index,
+    /// the `channelConfiguration` (with the `program_config_element()`
+    /// inline for a PCE layout) and `frameLengthFlag` per the family.
+    pub fn audio_specific_config(&self) -> Result<Vec<u8>> {
+        if self.family.is_ld() {
+            return match &self.program_config {
+                Some(_) => Err(Error::EncoderInvalidConfig),
+                None => Ok(crate::asc_writer::er_ld_asc(
+                    self.aot(),
+                    self.config.sample_rate,
+                    self.channel_configuration,
+                    self.family == FrameFamily::Ld480,
+                )),
+            };
+        }
+        let mut asc = match &self.program_config {
+            Some(pce) => crate::asc_writer::aac_lc_asc_with_pce(self.config.sample_rate, pce)?,
+            None => {
+                crate::asc_writer::aac_lc_asc(self.config.sample_rate, self.channel_configuration)
+            }
+        };
+        if self.family == FrameFamily::Lc960 {
+            // frameLengthFlag: bit 13 (after the 5-bit AOT, 4-bit
+            // sampling-frequency index and 4-bit channelConfiguration).
+            asc[1] |= 0x04;
+        }
+        Ok(asc)
+    }
+
+    fn geom(&self) -> Geom {
+        Geom {
+            family: self.family,
+            fs: self.fs_index,
+        }
+    }
+
+    /// De-interleave one hop onto the ±32768 axis in element order.
+    fn deinterleave(&self, interleaved: &[i16]) -> Result<Vec<Vec<f64>>> {
+        let ch = self.config.channels as usize;
+        let n = self.frame_len();
+        if interleaved.len() > n * ch || !interleaved.len().is_multiple_of(ch) {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        let mut cur: Vec<Vec<f64>> = vec![vec![0.0; n]; ch];
+        for (j, chan) in cur.iter_mut().enumerate() {
+            let src = self.element_src[j];
+            for (k, slot) in chan.iter_mut().take(interleaved.len() / ch).enumerate() {
+                *slot = f64::from(interleaved[k * ch + src]);
+            }
+        }
+        Ok(cur)
+    }
+
+    /// [`Self::deinterleave`] for float PCM normalised to ±1.0 (1.0
+    /// is 32768 on the `i16` axis), without rounding to 16 bits.
+    fn deinterleave_f64(&self, interleaved: &[f64]) -> Result<Vec<Vec<f64>>> {
+        let ch = self.config.channels as usize;
+        let n = self.frame_len();
+        if interleaved.len() > n * ch || !interleaved.len().is_multiple_of(ch) {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        let mut cur: Vec<Vec<f64>> = vec![vec![0.0; n]; ch];
+        for (j, chan) in cur.iter_mut().enumerate() {
+            let src = self.element_src[j];
+            for (k, slot) in chan.iter_mut().take(interleaved.len() / ch).enumerate() {
+                *slot = interleaved[k * ch + src] * 32768.0;
+            }
+        }
+        Ok(cur)
+    }
+
+    /// Encode one hop (at most [`Self::frame_len`] samples per
+    /// channel, zero-padded) into one bare access unit — a
+    /// `raw_data_block()` (or, for ER AAC LD, an `er_raw_data_block()`),
+    /// the MP4 / Matroska / LATM payload, configured by
+    /// [`Self::audio_specific_config`]. Works under every family.
+    pub fn encode_access_unit(&mut self, interleaved: &[i16]) -> Result<Vec<u8>> {
+        let cur = self.deinterleave(interleaved)?;
+        let au = self.encode_hop_raw(&cur, &[], true)?;
+        self.remember(cur);
+        Ok(au)
+    }
+
+    /// [`Self::encode_access_unit`] for float PCM normalised to ±1.0.
+    pub fn encode_access_unit_f64(&mut self, interleaved: &[f64]) -> Result<Vec<u8>> {
+        let cur = self.deinterleave_f64(interleaved)?;
+        let au = self.encode_hop_raw(&cur, &[], true)?;
+        self.remember(cur);
+        Ok(au)
+    }
+
+    /// Flush the final analysis overlap as one trailing access unit
+    /// (the access-unit counterpart of [`Self::finish`]).
+    pub fn finish_access_unit(&mut self) -> Result<Vec<u8>> {
+        let zeros = vec![vec![0.0; self.frame_len()]; self.config.channels as usize];
+        let au = self.encode_hop_raw(&zeros, &[], true)?;
+        self.remember(zeros);
+        Ok(au)
+    }
+
+    /// One-shot access-unit encode of a whole interleaved buffer:
+    /// `⌈n / frame_len⌉` content units plus the flush unit.
+    pub fn encode_all_access_units(&mut self, interleaved: &[i16]) -> Result<Vec<Vec<u8>>> {
+        let ch = self.config.channels as usize;
+        if !interleaved.len().is_multiple_of(ch) {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        let mut out = Vec::new();
+        let mut chunks = interleaved.chunks(self.frame_len() * ch);
+        let first = chunks.next().unwrap_or(&[]);
+        out.push(self.encode_access_unit(first)?);
+        for chunk in chunks {
+            out.push(self.encode_access_unit(chunk)?);
+        }
+        out.push(self.finish_access_unit()?);
+        Ok(out)
+    }
+
+    /// ADTS carries only the 1024-line family (the frame entry points
+    /// under [`Self::set_raw`] emit bare access units for any family).
+    fn require_adts_family(&self) -> Result<()> {
+        if self.raw || self.family == FrameFamily::Lc1024 {
+            Ok(())
+        } else {
+            Err(Error::EncoderInvalidConfig)
+        }
     }
 
     /// The `program_config_element()` of a PCE-described layout
@@ -700,7 +1044,7 @@ impl StreamEncoder {
     /// Turning the default on awaits a cross-frame tonality /
     /// predictability measure.
     pub fn set_pns(&mut self, enabled: bool) {
-        self.pns_enabled = enabled;
+        self.pns_enabled = enabled && !self.family.is_ld();
     }
 
     /// Set the coded bandwidth: spectral lines above `hz` are zeroed
@@ -732,7 +1076,7 @@ impl StreamEncoder {
     /// envelope. Safe to leave on: windows without a clear envelope
     /// simply carry no filter.
     pub fn set_tns(&mut self, enabled: bool) {
-        self.tns_enabled = enabled;
+        self.tns_enabled = enabled && !self.family.is_ld();
     }
 
     /// Enable / disable §4.6.8.2 intensity-stereo emission (default
@@ -756,7 +1100,39 @@ impl StreamEncoder {
     /// perceptual trade appropriate for low-rate coding but not for
     /// transparent transcodes.
     pub fn set_intensity_stereo(&mut self, enabled: bool) {
-        self.is_enabled = enabled;
+        self.is_enabled = enabled && !self.family.is_ld();
+    }
+
+    /// Make the frame entry points ([`Self::encode_frame`],
+    /// [`Self::encode_frame_f64`], [`Self::finish`], [`Self::encode_all`])
+    /// emit bare access units — what [`Self::encode_access_unit`]
+    /// produces — instead of ADTS frames (default **off**; always on
+    /// for ER AAC LD). The configuration then travels out of band in
+    /// [`Self::audio_specific_config`] (a PCE layout's
+    /// `program_config_element()` included, so it is not repeated in
+    /// the blocks), and the 7-byte ADTS header no longer comes out of
+    /// the frame budget.
+    pub fn set_raw(&mut self, raw: bool) {
+        self.raw = raw || self.family.is_ld();
+    }
+
+    /// Change the target bitrate from the next frame on (the coded
+    /// bandwidth keeps its setting). Errors with
+    /// [`Error::EncoderInvalidConfig`] for 0.
+    pub fn set_bitrate(&mut self, bitrate: u32) -> Result<()> {
+        if bitrate == 0 {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        self.config.bitrate = bitrate;
+        Ok(())
+    }
+
+    /// Raw data blocks the rate search has assembled over the stream
+    /// so far. Each is a complete quantize-and-price pass over every
+    /// channel, so passes per frame is the encoder's cost; a steady
+    /// signal settles in about two per frame.
+    pub fn rate_passes(&self) -> u64 {
+        self.rate_passes
     }
 
     /// The configuration this encoder was built with.
@@ -772,63 +1148,67 @@ impl StreamEncoder {
     /// window spans the previous hop and this one, so the emitted
     /// frame carries the overlap-add contribution of both.
     pub fn encode_frame(&mut self, interleaved: &[i16]) -> Result<Vec<u8>> {
-        let ch = self.config.channels as usize;
-        if interleaved.len() > FRAME_LEN * ch || interleaved.len() % ch != 0 {
-            return Err(Error::EncoderInvalidConfig);
-        }
+        self.require_adts_family()?;
         // De-interleave onto the ±32768 axis the §4.6.11 output
         // contract uses (no rescaling — the decoder's PCM stage
         // rounds these values back to i16 directly), permuting the
         // canonical input order into bitstream element order
         // (`element_src` — the inverse of the decoder's Table 1.19
         // output reorder).
-        let mut cur: Vec<Vec<f64>> = vec![vec![0.0; FRAME_LEN]; ch];
-        for (j, chan) in cur.iter_mut().enumerate() {
-            let src = self.element_src[j];
-            for (n, slot) in chan.iter_mut().take(interleaved.len() / ch).enumerate() {
-                *slot = f64::from(interleaved[n * ch + src]);
-            }
-        }
+        let cur = self.deinterleave(interleaved)?;
         let frame = self.encode_hop(&cur, &[])?;
-        self.history = cur;
+        self.remember(cur);
         Ok(frame)
     }
 
     /// Flush the final analysis overlap: emits one trailing ADTS
     /// frame whose window covers the last real hop and a zero hop.
     pub fn finish(&mut self) -> Result<Vec<u8>> {
+        self.require_adts_family()?;
         let ch = self.config.channels as usize;
-        let zeros: Vec<Vec<f64>> = vec![vec![0.0; FRAME_LEN]; ch];
+        let zeros: Vec<Vec<f64>> = vec![vec![0.0; self.frame_len()]; ch];
         let frame = self.encode_hop(&zeros, &[])?;
-        self.history = zeros;
+        self.remember(zeros);
         Ok(frame)
     }
 
-    /// [`StreamEncoder::encode_frame`] with `extension_payload()` fill
-    /// elements interleaved into the `raw_data_block()`: `fills[i]` is
-    /// emitted as a `fill_element()` immediately after the `i`-th
-    /// element of the Table 1.19 plan (an empty entry emits nothing).
-    /// The fill bytes are charged against the frame's byte budget so
-    /// the rate loop leaves room for them. This is how the HE-AAC
-    /// encoder attaches its SBR payload to each SCE / CPE.
-    pub(crate) fn encode_frame_with_fills(
+    /// [`StreamEncoder::encode_frame`] for float PCM: `interleaved`
+    /// holds at most [`Self::frame_len`]` × channels` samples
+    /// normalised to ±1.0 (1.0 is 32768 on the `i16` axis), which are
+    /// coded as they are, without rounding to 16 bits.
+    pub fn encode_frame_f64(&mut self, interleaved: &[f64]) -> Result<Vec<u8>> {
+        self.require_adts_family()?;
+        let cur = self.deinterleave_f64(interleaved)?;
+        let frame = self.encode_hop(&cur, &[])?;
+        self.remember(cur);
+        Ok(frame)
+    }
+
+    /// One hop of planar PCM on the `i16` axis (one `frame_len` hop per
+    /// channel in canonical input order, coded without rounding to 16
+    /// bits) with `extension_payload()` fill elements interleaved into
+    /// the `raw_data_block()`: `fills[i]` is emitted as a
+    /// `fill_element()` immediately after the `i`-th element of the
+    /// Table 1.19 plan (an empty entry emits nothing). The fill bytes
+    /// are charged against the frame's byte budget so the rate loop
+    /// leaves room for them. This is how the HE-AAC encoder attaches its
+    /// SBR payload to each SCE / CPE.
+    pub(crate) fn encode_planar_with_fills(
         &mut self,
-        interleaved: &[i16],
+        planar: &[Vec<f64>],
         fills: &[Vec<u8>],
     ) -> Result<Vec<u8>> {
+        self.require_adts_family()?;
         let ch = self.config.channels as usize;
-        if interleaved.len() > FRAME_LEN * ch || interleaved.len() % ch != 0 {
+        let frame_len = self.frame_len();
+        if planar.len() != ch || planar.iter().any(|hop| hop.len() != frame_len) {
             return Err(Error::EncoderInvalidConfig);
         }
-        let mut cur: Vec<Vec<f64>> = vec![vec![0.0; FRAME_LEN]; ch];
-        for (j, chan) in cur.iter_mut().enumerate() {
-            let src = self.element_src[j];
-            for (n, slot) in chan.iter_mut().take(interleaved.len() / ch).enumerate() {
-                *slot = f64::from(interleaved[n * ch + src]);
-            }
-        }
+        let cur: Vec<Vec<f64>> = (0..ch)
+            .map(|j| planar[self.element_src[j]].clone())
+            .collect();
         let frame = self.encode_hop(&cur, fills)?;
-        self.history = cur;
+        self.remember(cur);
         Ok(frame)
     }
 
@@ -836,12 +1216,13 @@ impl StreamEncoder {
     /// to a complete ADTS stream (`⌈n/1024⌉ + 1` frames — the `+1`
     /// is the [`StreamEncoder::finish`] flush).
     pub fn encode_all(&mut self, interleaved: &[i16]) -> Result<Vec<u8>> {
+        self.require_adts_family()?;
         let ch = self.config.channels as usize;
-        if interleaved.len() % ch != 0 {
+        if !interleaved.len().is_multiple_of(ch) {
             return Err(Error::EncoderInvalidConfig);
         }
         let mut out = Vec::new();
-        let hop = FRAME_LEN * ch;
+        let hop = self.frame_len() * ch;
         let mut chunks = interleaved.chunks(hop);
         // Always emit at least one content frame (an empty input
         // yields one silent frame + the flush frame).
@@ -857,7 +1238,45 @@ impl StreamEncoder {
     /// Window `[history | cur]`, transform, quantize under the rate
     /// loop, and wrap the raw data block in an ADTS header.
     fn encode_hop(&mut self, cur: &[Vec<f64>], fills: &[Vec<u8>]) -> Result<Vec<u8>> {
+        if self.raw {
+            return self.encode_hop_raw(cur, fills, true);
+        }
+        let raw_block = self.encode_hop_raw(cur, fills, false)?;
+        // ADTS wrap. aac_frame_length is 13 bits; the budget floor
+        // (16 bytes) and MAX_SF_OFFSET guarantee headroom for
+        // every realistic configuration, but validate regardless.
+        let frame_len = ADTS_HEADER_BYTES_NO_CRC + raw_block.len();
+        if frame_len >= (1 << 13) {
+            return Err(Error::EncoderFrameOverflow);
+        }
+        let header = AdtsHeader {
+            mpeg_version_mpeg2: false,
+            protection_absent: true,
+            profile: 1, // AAC LC: profile_ObjectType = AOT − 1 = 1
+            sampling_frequency_index: self.fs_index,
+            channel_configuration: self.channel_configuration,
+            aac_frame_length: frame_len as u16,
+            adts_buffer_fullness: 0x7FF, // VBR sentinel
+            number_of_raw_data_blocks_in_frame: 1,
+        };
+        let mut out = Vec::with_capacity(frame_len);
+        out.extend_from_slice(&header.write()?);
+        out.extend_from_slice(&raw_block);
+        Ok(out)
+    }
+
+    /// Window `[history | cur]`, transform, and quantize under the
+    /// rate loop into one `raw_data_block()`: a `bare` access unit
+    /// (the configuration out of band — no PCE in the block, no
+    /// framing out of the budget), or the payload of an ADTS frame.
+    fn encode_hop_raw(
+        &mut self,
+        cur: &[Vec<f64>],
+        fills: &[Vec<u8>],
+        bare: bool,
+    ) -> Result<Vec<u8>> {
         let ch = self.config.channels as usize;
+        let geom = self.geom();
 
         // §4.6.11.3.2 block-switching state machine. A transient in
         // `cur` means the *next* frame (whose window's left half is
@@ -868,12 +1287,14 @@ impl StreamEncoder {
         // exits through LONG_STOP.
         // LFE channels neither trigger nor follow block switching —
         // §4.5.2.1.3 fixes their window_sequence to ONLY_LONG.
-        let transient = self
-            .history
-            .iter()
-            .zip(cur.iter())
-            .zip(self.lfe_slot.iter())
-            .any(|((h, c), &lfe)| !lfe && detect_transient(h, c));
+        // ER AAC LD has no block switching (§4.6.17.2.2).
+        let transient = !self.family.is_ld()
+            && self
+                .history
+                .iter()
+                .zip(cur.iter())
+                .zip(self.lfe_slot.iter())
+                .any(|((h, c), &lfe)| !lfe && detect_transient(h, c, geom.short_len()));
         let seq = if self.short_pending {
             WindowSequence::EightShort
         } else if transient && self.prev_seq != WindowSequence::EightShort {
@@ -901,9 +1322,15 @@ impl StreamEncoder {
             .zip(self.lfe_slot.iter())
         {
             let ch_seq = if lfe { WindowSequence::OnlyLong } else { seq };
-            let mut spec = analyze_channel(hist, chan, ch_seq)?;
+            let mut spec = if self.eld {
+                analyze_channel_eld(hist, chan, self.family)
+            } else if self.family.is_ld() {
+                analyze_channel_ld(hist, chan)
+            } else {
+                analyze_channel(hist, chan, ch_seq, geom)?
+            };
             if let (Some(hz), false) = (self.bandwidth_hz, lfe) {
-                cull_bandwidth(&mut spec, ch_seq, hz, self.config.sample_rate);
+                cull_bandwidth(&mut spec, ch_seq, hz, self.config.sample_rate, geom);
             }
             spectra.push(spec);
         }
@@ -917,27 +1344,32 @@ impl StreamEncoder {
         // the spectra once, outside the rate loop (the filter choice
         // is independent of the scalefactor offset).
         let max_sfb = if seq == WindowSequence::EightShort {
-            NUM_SWB_SHORT_WINDOW[self.fs_index as usize]
+            geom.num_swb_short()?
         } else {
-            NUM_SWB_LONG_WINDOW[self.fs_index as usize]
-        };
+            geom.num_swb_long()?
+        } as u8;
         let mut tns: Vec<Option<TnsData>> = vec![None; ch];
         if self.tns_enabled {
             for (j, (spec, slot)) in spectra.iter_mut().zip(tns.iter_mut()).enumerate() {
                 if self.lfe_slot[j] {
                     continue; // §4.5.2.1.3: no TNS on an LFE element
                 }
-                let permit = tns_temporal_permits(&self.history[j], &cur[j], seq);
-                *slot = detect_and_apply_tns(spec, seq, max_sfb, self.fs_index, &permit)?;
+                let permit = tns_temporal_permits(&self.history[j], &cur[j], seq, geom);
+                *slot = detect_and_apply_tns_family(
+                    spec,
+                    seq,
+                    max_sfb,
+                    geom.family,
+                    self.fs_index,
+                    &permit,
+                )?;
             }
         }
 
-        // Rate loop: uniform scalefactor offset in ±4 steps (3 dB
-        // per step on the §4.6.2.3.3 quarter-step ladder). Coarsen
-        // until the raw data block fits the budget; when it already
-        // fits, refine (spend the remaining budget on precision) as
-        // long as the finer frame still fits, down to
-        // `-MAX_REFINE_OFFSET`.
+        // Rate search: one uniform scalefactor offset for the frame
+        // (¾ dB per step on the §4.6.2.3.3 quarter-step ladder), the
+        // least that fits the budget, found from the previous frame's
+        // answer (see `search_offset`).
         // Fill elements ride inside the assembled raw data block, so
         // the block is priced against the whole frame budget; the
         // floor only guarantees the channel elements a minimal
@@ -952,62 +1384,36 @@ impl StreamEncoder {
             .filter(|f| !f.is_empty())
             .map(|f| f.len() + if f.len() >= 15 { 2 } else { 1 })
             .sum();
-        let budget = self.config.frame_budget_bytes().max(fill_bytes + 16);
-        let mut sf_offset = 0i32;
-        let mut raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset, fills)?;
-        let mut iterations = 0usize;
-        if raw_block.len() > budget {
-            while raw_block.len() > budget && iterations < MAX_RATE_ITERATIONS {
-                sf_offset += 4;
-                raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset, fills)?;
-                iterations += 1;
-            }
-        } else {
-            while sf_offset > -MAX_REFINE_OFFSET && iterations < MAX_RATE_ITERATIONS {
-                let finer = self.assemble_raw_block(seq, &spectra, &tns, sf_offset - 4, fills)?;
-                if finer.len() > budget {
-                    break;
-                }
-                sf_offset -= 4;
-                raw_block = finer;
-                iterations += 1;
-            }
-        }
-        // Fine pass: the ±4 ladder can leave up to 3 scalefactors of
-        // precision unspent at the budget boundary (a full −4 step
-        // un-zeros a whole swath of near-threshold coefficients at
-        // once). Try the intermediate offsets, finest first.
-        if raw_block.len() <= budget && sf_offset > -MAX_REFINE_OFFSET {
-            for fine in [3i32, 2, 1] {
-                let cand = self.assemble_raw_block(seq, &spectra, &tns, sf_offset - fine, fills)?;
-                if cand.len() <= budget {
-                    raw_block = cand;
-                    break;
-                }
-            }
-        }
+        let budget = self
+            .config
+            .frame_budget_bytes(
+                geom.frame_len(),
+                if bare { 0 } else { ADTS_HEADER_BYTES_NO_CRC },
+            )
+            .max(fill_bytes + 16);
+        // The frame's loudest full-range coefficient anchors every
+        // full-range channel's masking spread (see
+        // `assemble_raw_block`); an LFE keeps its own anchor.
+        let frame_peak = spectra
+            .iter()
+            .zip(self.lfe_slot.iter())
+            .filter(|(_, lfe)| !**lfe)
+            .flat_map(|(spec, _)| spec.iter())
+            .fold(0.0f64, |m, &v| m.max(v.abs()));
+        let (sf_offset, raw_block, passes) = self.search_offset(
+            seq,
+            &spectra,
+            &tns,
+            frame_peak,
+            fills,
+            budget,
+            self.sf_offset_hint,
+            bare,
+        )?;
+        self.sf_offset_hint = sf_offset;
+        self.rate_passes += passes;
 
-        // ADTS wrap. aac_frame_length is 13 bits; the budget floor
-        // (16 bytes) and MAX_RATE_ITERATIONS guarantee headroom for
-        // every realistic configuration, but validate regardless.
-        let frame_len = ADTS_HEADER_BYTES_NO_CRC + raw_block.len();
-        if frame_len >= (1 << 13) {
-            return Err(Error::EncoderFrameOverflow);
-        }
-        let header = AdtsHeader {
-            mpeg_version_mpeg2: false,
-            protection_absent: true,
-            profile: 1, // AAC LC: profile_ObjectType = AOT − 1 = 1
-            sampling_frequency_index: self.fs_index,
-            channel_configuration: self.channel_configuration,
-            aac_frame_length: frame_len as u16,
-            adts_buffer_fullness: 0x7FF, // VBR sentinel
-            number_of_raw_data_blocks_in_frame: 1,
-        };
-        let mut out = Vec::with_capacity(frame_len);
-        out.extend_from_slice(&header.write()?);
-        out.extend_from_slice(&raw_block);
-        Ok(out)
+        Ok(raw_block)
     }
 
     /// Assemble one `raw_data_block()` — the Table 1.19 element plan
@@ -1019,16 +1425,130 @@ impl StreamEncoder {
     /// they land in each channel's `tns_data_present` / `tns_data`
     /// wire slots. Element instance tags count up per element kind,
     /// so the decoder's per-`(id, tag)` state slots stay distinct.
+    ///
+    /// `frame_peak` is the loudest coefficient over the frame's
+    /// full-range channels: every SCE and CPE judges its bands'
+    /// masking spread against it, the way the two channels of a pair
+    /// already judge theirs against the pair's peak, so a quiet
+    /// speaker (room tone 35 dB under the dialogue in a film mix)
+    /// takes the precision its level warrants and the loud one keeps
+    /// the rate. Judged each against its own peak, six channels at
+    /// equal precision starved the loud one: on a 5.1 film excerpt at
+    /// 6 x 96 kbit/s this anchor takes the center from 33 dB SNR to
+    /// 54 (a reference encoder reads 42) while the room-tone channels
+    /// go from 30 to 26-28 dB (the reference reads 27-29). The LFE,
+    /// band-limited and independent, keeps its own anchor.
+    #[allow(clippy::too_many_arguments)]
+    /// The least scalefactor offset whose raw data block fits
+    /// `budget`, with that block. Bits fall as the offset rises (each
+    /// step coarsens every quantizer by ¾ dB), so the fit boundary is
+    /// a threshold: the search confirms or refutes `hint` (the
+    /// previous frame's answer), gallops away from it in doubling
+    /// steps until the boundary is bracketed, then bisects. A steady
+    /// signal costs two passes per frame (the hint fits, the next
+    /// finer offset does not); a boundary that moved by `d` costs
+    /// about `2·log2(d)` more. The search stays within
+    /// [`MIN_SF_OFFSET`, `MAX_SF_OFFSET`]; a frame that overflows even
+    /// at the top returns that block over budget. Also returns the
+    /// number of blocks assembled.
+    #[allow(clippy::too_many_arguments)]
+    fn search_offset(
+        &self,
+        seq: WindowSequence,
+        spectra: &[Vec<f64>],
+        tns: &[Option<TnsData>],
+        frame_peak: f64,
+        fills: &[Vec<u8>],
+        budget: usize,
+        hint: i32,
+        bare: bool,
+    ) -> Result<(i32, Vec<u8>, u64)> {
+        let mut passes = 0u64;
+        let mut assemble = |offset: i32| -> Result<(bool, Vec<u8>)> {
+            passes += 1;
+            let block =
+                self.assemble_raw_block(seq, spectra, tns, offset, frame_peak, fills, bare)?;
+            let fits = block.len() <= budget;
+            Ok((fits, block))
+        };
+        let start = hint.clamp(MIN_SF_OFFSET, MAX_SF_OFFSET);
+        let (fits, block) = assemble(start)?;
+        // `fit`: the least offset known to fit; `fail`: the greatest
+        // known not to. Each with its block.
+        let (mut fit, mut fail): (Bracket, Bracket) = if fits {
+            (Some((start, block)), None)
+        } else {
+            (None, Some((start, block)))
+        };
+        let mut step = 1i32;
+        if fits {
+            loop {
+                let lo = fit.as_ref().map_or(start, |(o, _)| *o);
+                if lo <= MIN_SF_OFFSET {
+                    break;
+                }
+                let probe = (lo - step).max(MIN_SF_OFFSET);
+                let (ok, block) = assemble(probe)?;
+                if ok {
+                    fit = Some((probe, block));
+                    step *= 2;
+                } else {
+                    fail = Some((probe, block));
+                    break;
+                }
+            }
+        } else {
+            loop {
+                let hi = fail.as_ref().map_or(start, |(o, _)| *o);
+                if hi >= MAX_SF_OFFSET {
+                    break;
+                }
+                let probe = (hi + step).min(MAX_SF_OFFSET);
+                let (ok, block) = assemble(probe)?;
+                if ok {
+                    fit = Some((probe, block));
+                    break;
+                } else {
+                    fail = Some((probe, block));
+                    step *= 2;
+                }
+            }
+        }
+        while let (Some(lo), Some(hi)) = (
+            fit.as_ref().map(|(o, _)| *o),
+            fail.as_ref().map(|(o, _)| *o),
+        ) {
+            if lo - hi <= 1 {
+                break;
+            }
+            let mid = hi + (lo - hi) / 2;
+            let (ok, block) = assemble(mid)?;
+            if ok {
+                fit = Some((mid, block));
+            } else {
+                fail = Some((mid, block));
+            }
+        }
+        let (offset, block) = fit
+            .or(fail)
+            .expect("the rate search assembled at least one block");
+        Ok((offset, block, passes))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn assemble_raw_block(
         &self,
         seq: WindowSequence,
         spectra: &[Vec<f64>],
         tns: &[Option<TnsData>],
         sf_offset: i32,
+        frame_peak: f64,
         fills: &[Vec<u8>],
+        bare: bool,
     ) -> Result<Vec<u8>> {
         let mut asm = FrameAssembler::new();
-        if let Some(pce) = &self.program_config {
+        // A bare access unit's PCE travels in the AudioSpecificConfig.
+        if let (Some(pce), false) = (&self.program_config, bare) {
             asm.push_pce(pce)?;
         }
         let mut sce_tag = 0u8;
@@ -1038,17 +1558,24 @@ impl StreamEncoder {
             let mut body_bits = BitWriter::new();
             match elem {
                 ElementPlan::Sce(ch) => {
-                    asm.push_channel_header(IdSynEle::Sce, sce_tag)?;
+                    self.push_element_header(&mut asm, IdSynEle::Sce, sce_tag)?;
                     sce_tag += 1;
-                    self.assemble_sce(&mut body_bits, &spectra[ch], &tns[ch], seq, sf_offset)?;
+                    self.assemble_sce(
+                        &mut body_bits,
+                        &spectra[ch],
+                        &tns[ch],
+                        seq,
+                        sf_offset,
+                        frame_peak,
+                    )?;
                 }
                 ElementPlan::Lfe(ch) => {
-                    asm.push_channel_header(IdSynEle::Lfe, lfe_tag)?;
+                    self.push_element_header(&mut asm, IdSynEle::Lfe, lfe_tag)?;
                     lfe_tag += 1;
                     self.assemble_lfe(&mut body_bits, &spectra[ch], sf_offset)?;
                 }
                 ElementPlan::Cpe(l, r) => {
-                    asm.push_channel_header(IdSynEle::Cpe, cpe_tag)?;
+                    self.push_element_header(&mut asm, IdSynEle::Cpe, cpe_tag)?;
                     cpe_tag += 1;
                     self.assemble_cpe(
                         &mut body_bits,
@@ -1058,6 +1585,7 @@ impl StreamEncoder {
                         &tns[r],
                         seq,
                         sf_offset,
+                        frame_peak,
                     )?;
                 }
             }
@@ -1067,7 +1595,55 @@ impl StreamEncoder {
                 asm.push_fill(fill)?;
             }
         }
-        Ok(asm.push_end())
+        Ok(if self.family.is_ld() {
+            asm.finish_er()
+        } else {
+            asm.push_end()
+        })
+    }
+
+    /// A channel element's header: `id_syn_ele` + `element_instance_tag`,
+    /// or the tag alone in an `er_raw_data_block()`.
+    fn push_element_header(&self, asm: &mut FrameAssembler, kind: IdSynEle, tag: u8) -> Result<()> {
+        if self.eld {
+            // ELD channel elements carry no element_instance_tag.
+            Ok(())
+        } else if self.family.is_ld() {
+            asm.push_er_channel_header(tag)
+        } else {
+            asm.push_channel_header(kind, tag)
+        }
+    }
+
+    /// The audio object type the elements are written for: 2 (AAC LC),
+    /// 23 (ER AAC LD) or 39 (ER AAC ELD).
+    fn aot(&self) -> u8 {
+        if self.eld {
+            39
+        } else if self.family.is_ld() {
+            23
+        } else {
+            2
+        }
+    }
+
+    /// A single channel's stream before its `spectral_data()`: the
+    /// Table 4.50 `individual_channel_stream()` with its `ics_info()`,
+    /// for ER AAC LD in its §4.5.2.4.2 category order (no resilience
+    /// tools).
+    fn write_single(&self, body_bits: &mut BitWriter, chan: &QuantizedChannel) -> Result<()> {
+        if self.eld {
+            chan.body.write_eld(body_bits, &chan.info, false)
+        } else if self.family.is_ld() {
+            chan.body.write_er(
+                body_bits,
+                self.aot(),
+                self.fs_index,
+                AacResilienceFlags::default(),
+            )
+        } else {
+            chan.body.write(body_bits, 2, self.fs_index, false)
+        }
     }
 
     /// Quantize a spectrum for this frame: the grouped short-window
@@ -1083,16 +1659,18 @@ impl StreamEncoder {
         is_bands: &[IsBand],
     ) -> Result<QuantizedChannel> {
         if seq == WindowSequence::EightShort {
-            quantize_channel_short(spec, self.fs_index, sf_offset, peak)
+            quantize_channel_short(spec, self.geom(), sf_offset, peak)
         } else {
+            // ELD carries no pulse_data() (Table 4.79).
             quantize_channel(
                 spec,
                 seq,
-                self.fs_index,
+                self.geom(),
                 sf_offset,
                 peak,
                 pns_bands,
                 is_bands,
+                !self.eld,
             )
         }
     }
@@ -1107,13 +1685,14 @@ impl StreamEncoder {
         tns: &Option<TnsData>,
         seq: WindowSequence,
         sf_offset: i32,
+        frame_peak: f64,
     ) -> Result<()> {
         // §4.6.13 PNS emission is opt-in (set_pns) and long-frame
         // only; a lone channel grants a blanket per-band allowance
         // (the noise-likeness test in quantize_group decides).
         let pns_long = self.pns_enabled && seq != WindowSequence::EightShort;
-        let num_swb_long = NUM_SWB_LONG_WINDOW[self.fs_index as usize] as usize;
-        let peak = spec.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
+        let num_swb_long = self.geom().num_swb_long()?;
+        let peak = spec.iter().fold(frame_peak, |m, &v| m.max(v.abs()));
         let pns_bands = if pns_long {
             vec![true; num_swb_long]
         } else {
@@ -1121,7 +1700,7 @@ impl StreamEncoder {
         };
         let mut chan = self.quantize_seq(spec, seq, sf_offset, peak, &pns_bands, &[])?;
         attach_tns(&mut chan, tns);
-        chan.body.write(body_bits, 2, self.fs_index, false)?;
+        self.write_single(body_bits, &chan)?;
         chan.spectral.write(
             body_bits,
             &chan.info,
@@ -1149,7 +1728,7 @@ impl StreamEncoder {
             &[],
             &[],
         )?;
-        chan.body.write(body_bits, 2, self.fs_index, false)?;
+        self.write_single(body_bits, &chan)?;
         chan.spectral.write(
             body_bits,
             &chan.info,
@@ -1171,6 +1750,7 @@ impl StreamEncoder {
         tns_r: &Option<TnsData>,
         seq: WindowSequence,
         sf_offset: i32,
+        frame_peak: f64,
     ) -> Result<()> {
         let pns_long = self.pns_enabled && seq != WindowSequence::EightShort;
         // §4.6.8.2: per-band intensity decision first (opt-in,
@@ -1180,7 +1760,7 @@ impl StreamEncoder {
         // intensity band signals the §4.6.8.2.3 phase
         // reversal, not an M/S de-matrix).
         let is_bands: Vec<IsBand> = if self.is_enabled && seq != WindowSequence::EightShort {
-            is_decide(l_spec, r_spec, self.fs_index)?
+            is_decide(l_spec, r_spec, self.geom())?
         } else {
             Vec::new()
         };
@@ -1189,7 +1769,7 @@ impl StreamEncoder {
         // mutual exclusion, §4.6.13.5 — and IS wins where the
         // two overlap).
         let pns = if pns_long {
-            pns_decide_pair(l_spec, r_spec, &is_bands, self.fs_index)?
+            pns_decide_pair(l_spec, r_spec, &is_bands, self.geom())?
         } else {
             PairPns::default()
         };
@@ -1213,8 +1793,8 @@ impl StreamEncoder {
                 .zip(r_spec.iter())
                 .map(|(&l, &r)| (l * l + r * r).sqrt())
                 .collect();
-            let offsets = short_window_offsets(self.fs_index)?;
-            let num_swb = NUM_SWB_SHORT_WINDOW[self.fs_index as usize] as usize;
+            let offsets = self.geom().short_offsets()?;
+            let num_swb = self.geom().num_swb_short()?;
             let wgl = decide_short_grouping(&combined, offsets, num_swb);
             let rows = ms_decide_short(l_spec, r_spec, offsets, num_swb, &wgl);
             let (code_l, code_r) = if rows.iter().flatten().any(|&b| b) {
@@ -1225,24 +1805,24 @@ impl StreamEncoder {
             let pair_peak = code_l
                 .iter()
                 .chain(code_r.iter())
-                .fold(0.0f64, |m, &v| m.max(v.abs()));
+                .fold(frame_peak, |m, &v| m.max(v.abs()));
             left = quantize_channel_short_grouped(
                 &code_l,
-                self.fs_index,
+                self.geom(),
                 sf_offset,
                 pair_peak,
                 wgl.clone(),
             )?;
             right =
-                quantize_channel_short_grouped(&code_r, self.fs_index, sf_offset, pair_peak, wgl)?;
+                quantize_channel_short_grouped(&code_r, self.geom(), sf_offset, pair_peak, wgl)?;
             ms_rows = rows;
         } else {
-            let mut ms_used = ms_decide(l_spec, r_spec, self.fs_index)?;
+            let mut ms_used = ms_decide(l_spec, r_spec, self.geom())?;
             for (sfb, band) in is_bands.iter().enumerate() {
-                if band.is_some() {
-                    if let Some(m) = ms_used.get_mut(sfb) {
-                        *m = false;
-                    }
+                if band.is_some()
+                    && let Some(m) = ms_used.get_mut(sfb)
+                {
+                    *m = false;
                 }
             }
             // A band either channel will noise-code is excluded
@@ -1267,14 +1847,14 @@ impl StreamEncoder {
                 })
                 .collect();
             let (code_l, code_r) = if ms_transform.iter().any(|&b| b) {
-                apply_ms(l_spec, r_spec, &ms_transform, self.fs_index)?
+                apply_ms(l_spec, r_spec, &ms_transform, self.geom())?
             } else {
                 (l_spec.to_vec(), r_spec.to_vec())
             };
             let pair_peak = code_l
                 .iter()
                 .chain(code_r.iter())
-                .fold(0.0f64, |m, &v| m.max(v.abs()));
+                .fold(frame_peak, |m, &v| m.max(v.abs()));
             left = self.quantize_seq(&code_l, seq, sf_offset, pair_peak, &pns.l_noise, &[])?;
             right =
                 self.quantize_seq(&code_r, seq, sf_offset, pair_peak, &pns.r_noise, &is_bands)?;
@@ -1286,8 +1866,15 @@ impl StreamEncoder {
         // §4.4.2.3: common_window = 1, one shared ics_info,
         // then the two-bit ms_mask_present (+ mask when 1: one bit
         // per (window group, sfb), group-major — Table 4.5).
-        body_bits.write_bit(true);
-        left.info.write(body_bits, 2, self.fs_index, true)?;
+        // An ELD pair has no common_window bit and transmits only
+        // max_sfb (Table 4.78).
+        if self.eld {
+            body_bits.write_u32(u32::from(left.info.max_sfb), 6);
+        } else {
+            body_bits.write_bit(true);
+            left.info
+                .write(body_bits, self.aot(), self.fs_index, true)?;
+        }
         let any_ms = ms_rows.iter().flatten().any(|&b| b);
         let all_ms = !ms_rows.is_empty()
             && ms_rows.iter().all(|row| !row.is_empty())
@@ -1303,8 +1890,19 @@ impl StreamEncoder {
             body_bits.write_u32(0, 2);
         }
         for chan in [&left, &right] {
-            chan.body
-                .write_with_ics_info(body_bits, &chan.info, 2, false)?;
+            if self.eld {
+                chan.body.write_eld(body_bits, &chan.info, true)?;
+            } else if self.family.is_ld() {
+                chan.body.write_with_ics_info_er(
+                    body_bits,
+                    &chan.info,
+                    self.aot(),
+                    AacResilienceFlags::default(),
+                )?;
+            } else {
+                chan.body
+                    .write_with_ics_info(body_bits, &chan.info, 2, false)?;
+            }
             chan.spectral.write(
                 body_bits,
                 &chan.info,
@@ -1328,7 +1926,7 @@ fn attach_tns(chan: &mut QuantizedChannel, slot: &Option<TnsData>) {
 /// Subblock length of the transient detector — one short-window hop
 /// (128 samples), so a detected attack aligns with the short-window
 /// grid it triggers.
-const TRANSIENT_SUBBLOCK: usize = SHORT_SEQ_HOP;
+const TRANSIENT_SUBBLOCK: usize = 128;
 
 /// Energy jump (×) a subblock must show over the running average of
 /// the preceding subblocks to count as a transient attack.
@@ -1365,31 +1963,44 @@ const TRANSIENT_ARM: f64 = TRANSIENT_FLOOR / TRANSIENT_RATIO;
 /// Zero the spectral lines above `cutoff_hz` (per window of an
 /// `EIGHT_SHORT` frame): the bandwidth limit the rate loop then
 /// never has to price.
-fn cull_bandwidth(spec: &mut [f64], seq: WindowSequence, cutoff_hz: f64, sample_rate: u32) {
+fn cull_bandwidth(
+    spec: &mut [f64],
+    seq: WindowSequence,
+    cutoff_hz: f64,
+    sample_rate: u32,
+    geom: Geom,
+) {
     let frac = (cutoff_hz / (f64::from(sample_rate) / 2.0)).clamp(0.0, 1.0);
     if seq == WindowSequence::EightShort {
-        let short_len = SHORT_WINDOW_LEN as usize;
+        let short_len = geom.short_len();
         let keep = ((frac * short_len as f64).ceil() as usize).min(short_len);
         for window in spec.chunks_exact_mut(short_len) {
             window[keep..].iter_mut().for_each(|v| *v = 0.0);
         }
     } else {
-        let keep = ((frac * FRAME_LEN as f64).ceil() as usize).min(spec.len());
+        let keep = ((frac * geom.frame_len() as f64).ceil() as usize).min(spec.len());
         spec[keep..].iter_mut().for_each(|v| *v = 0.0);
     }
 }
 
-fn detect_transient(hist: &[f64], cur: &[f64]) -> bool {
+fn detect_transient(hist: &[f64], cur: &[f64], subblock: usize) -> bool {
+    // The thresholds are stated for a [`TRANSIENT_SUBBLOCK`]-sample
+    // subblock; a shorter short-window hop (the 960-line family's
+    // 120) scales the absolute floors with it.
+    let scale = subblock as f64 / TRANSIENT_SUBBLOCK as f64;
     let energies: Vec<f64> = hist
-        .chunks(TRANSIENT_SUBBLOCK)
-        .chain(cur.chunks(TRANSIENT_SUBBLOCK))
+        .chunks(subblock)
+        .chain(cur.chunks(subblock))
         .map(|b| b.iter().map(|&v| v * v).sum())
         .collect();
-    let hist_blocks = hist.len() / TRANSIENT_SUBBLOCK;
+    let hist_blocks = hist.len() / subblock;
     for (j, &e) in energies.iter().enumerate().skip(hist_blocks) {
         let ctx = &energies[j.saturating_sub(hist_blocks.max(1))..j];
         let reference = ctx.iter().fold(0.0f64, |m, &v| m.max(v));
-        if e > TRANSIENT_FLOOR && reference > TRANSIENT_ARM && e > TRANSIENT_RATIO * reference {
+        if e > TRANSIENT_FLOOR * scale
+            && reference > TRANSIENT_ARM * scale
+            && e > TRANSIENT_RATIO * reference
+        {
             return true;
         }
     }
@@ -1414,7 +2025,7 @@ const TNS_TEMPORAL_FLOOR: f64 = 128.0 * 90.0 * 90.0;
 /// strongly non-flat energy envelope.
 ///
 /// The window's time region (2048 samples for a long sequence; the
-/// 256-sample `SHORT_SEQ_START + j·SHORT_SEQ_HOP` slice per short
+/// 256-sample `(N_l − N_s)/4 + j·N_s/2` slice per short
 /// window) is split into 16 subblocks whose energies are reduced to
 /// the `max / mean` flatness ratio; the gate opens above
 /// [`TNS_TEMPORAL_RATIO`] (with a [`TNS_TEMPORAL_FLOOR`] silence
@@ -1425,14 +2036,11 @@ const TNS_TEMPORAL_FLOOR: f64 = 128.0 * 90.0 * 90.0;
 /// directly on the input samples keeps TNS to the transient /
 /// speech-like windows it exists for (§4.6.9.1's duality argument
 /// run forward).
-fn tns_temporal_permits(hist: &[f64], cur: &[f64], seq: WindowSequence) -> Vec<bool> {
-    let region = |i: usize| -> f64 {
-        if i < FRAME_LEN {
-            hist[i]
-        } else {
-            cur[i - FRAME_LEN]
-        }
-    };
+fn tns_temporal_permits(hist: &[f64], cur: &[f64], seq: WindowSequence, geom: Geom) -> Vec<bool> {
+    let n = geom.frame_len();
+    let (n_l, n_s) = (2 * n, 2 * geom.short_len());
+    let (start, hop) = ((n_l - n_s) / 4, n_s / 2);
+    let region = |i: usize| -> f64 { if i < n { hist[i] } else { cur[i - n] } };
     let flatness_permits = |base: usize, len: usize| -> bool {
         let sub = len / 16;
         let energies: Vec<f64> = (0..16)
@@ -1454,55 +2062,91 @@ fn tns_temporal_permits(hist: &[f64], cur: &[f64], seq: WindowSequence) -> Vec<b
     };
     if seq == WindowSequence::EightShort {
         (0..8)
-            .map(|j| {
-                flatness_permits(
-                    SHORT_SEQ_START + j * SHORT_SEQ_HOP,
-                    2 * SHORT_WINDOW_LEN as usize,
-                )
-            })
+            .map(|j| flatness_permits(start + j * hop, n_s))
             .collect()
     } else {
-        vec![flatness_permits(0, LONG_TRANSFORM_LEN)]
+        vec![flatness_permits(0, n_l)]
     }
 }
 
 /// Run the §4.6.11.3.1 analysis transform for one channel under the
-/// chosen `window_sequence`, over the 2048-sample region
-/// `[hist | cur]`.
+/// chosen `window_sequence`, over the `2·frame_len`-sample region
+/// `[hist | cur]` (2048, or 1920 for the 960-line family).
 ///
-/// * Long sequences: one 2048-point MDCT under the
-///   [`long_sequence_window`] (sine shape throughout — this encoder
+/// * Long sequences: one `N_l`-point MDCT under the
+///   [`long_sequence_window_n`] window (sine shape throughout — this encoder
 ///   never switches shapes, so left/right inheritance is trivial).
 /// * `EIGHT_SHORT`: eight 256-point MDCTs at offsets
-///   `448 + j·128` inside the region ([`SHORT_SEQ_START`] /
-///   [`SHORT_SEQ_HOP`]), each under its [`short_window_j`];
+///   `448 + j·128` inside the region (`(N_l − N_s)/4 + j·N_s/2`;
+///   `420 + j·120` for the 960-line family), each under its short
+///   window;
 ///   concatenated window-major (`8 × 128` coefficients).
-fn analyze_channel(hist: &[f64], cur: &[f64], seq: WindowSequence) -> Result<Vec<f64>> {
-    debug_assert_eq!(hist.len(), FRAME_LEN);
-    debug_assert_eq!(cur.len(), FRAME_LEN);
-    let region = |i: usize| -> f64 {
-        if i < FRAME_LEN {
-            hist[i]
-        } else {
-            cur[i - FRAME_LEN]
-        }
-    };
+fn analyze_channel(hist: &[f64], cur: &[f64], seq: WindowSequence, geom: Geom) -> Result<Vec<f64>> {
+    let n = geom.frame_len();
+    debug_assert_eq!(hist.len(), n);
+    debug_assert_eq!(cur.len(), n);
+    let region = |i: usize| -> f64 { if i < n { hist[i] } else { cur[i - n] } };
+    let short_len = geom.short_len(); // 128 / 120
+    let (n_l, n_s) = (2 * n, 2 * short_len); // 2048/256 or 1920/240
     if seq == WindowSequence::EightShort {
-        let short_len = SHORT_WINDOW_LEN as usize; // 128
-        let n_s = 2 * short_len; // 256
+        // §4.6.11.3.2 c): window j at (N_l − N_s)/4 + j·N_s/2.
+        let (start, hop) = ((n_l - n_s) / 4, n_s / 2);
         let mut out = Vec::with_capacity(8 * short_len);
         for j in 0..8 {
-            let w = short_window_j(j, WindowShape::Sine, WindowShape::Sine);
-            let base = SHORT_SEQ_START + j * SHORT_SEQ_HOP;
+            let w = short_window_n(n_s, j, WindowShape::Sine, WindowShape::Sine);
+            let base = start + j * hop;
             let seg: Vec<f64> = (0..n_s).map(|m| region(base + m) * w[m]).collect();
             out.extend_from_slice(&forward_mdct(&seg, n_s));
         }
         Ok(out)
     } else {
-        let w = long_sequence_window(seq, WindowShape::Sine, WindowShape::Sine)?;
-        let z: Vec<f64> = (0..LONG_TRANSFORM_LEN).map(|m| region(m) * w[m]).collect();
-        Ok(forward_mdct(&z, LONG_TRANSFORM_LEN))
+        let w = long_sequence_window_n(n_l, n_s, seq, WindowShape::Sine, WindowShape::Sine)?;
+        let z: Vec<f64> = (0..n_l).map(|m| region(m) * w[m]).collect();
+        Ok(forward_mdct(&z, n_l))
     }
+}
+
+/// The ER AAC LD analysis transform (§4.6.17.2): one `2N`-point MDCT
+/// over `[hist | cur]` (`N` = the frame length) under the sine window
+/// `w(n) = sin(π (n + ½) / 2N)` (`window_shape` 0).
+fn analyze_channel_ld(hist: &[f64], cur: &[f64]) -> Vec<f64> {
+    let n = 2 * hist.len();
+    let z: Vec<f64> = hist
+        .iter()
+        .chain(cur.iter())
+        .enumerate()
+        .map(|(i, &v)| v * (core::f64::consts::PI * (i as f64 + 0.5) / n as f64).sin())
+        .collect();
+    forward_mdct(&z, n)
+}
+
+/// The ER AAC ELD analysis (see [`StreamEncoder::new_eld`]): the `4N`
+/// samples `[hist (3N) | cur (N)]` weighted by the time-reversed
+/// synthesis window, folded onto `2N` (each `2N` period of the
+/// modulation flips its sign) and transformed by the `2N`-point MDCT,
+/// whose phase `(N + 1)/2` is ELD's `n0` advanced by `3N/4`.
+fn analyze_channel_eld(hist: &[f64], cur: &[f64], family: FrameFamily) -> Vec<f64> {
+    let n = cur.len();
+    let window: &[f64] = match family {
+        FrameFamily::Ld512 => &crate::eld_window::LD_WINDOW_512,
+        _ => &crate::eld_window::LD_WINDOW_480,
+    };
+    let mut folded = vec![0.0f64; 2 * n];
+    for (p, &x) in hist.iter().chain(cur.iter()).enumerate() {
+        // The window's last N/4 coefficients (p < N/4) are zero.
+        let Some(&w) = window.get(4 * n - 1 - p) else {
+            continue;
+        };
+        // q = p - 13N/4, brought into [0, 2N).
+        let q = p as isize - (13 * n / 4) as isize;
+        let wraps = q.div_euclid(2 * n as isize);
+        let sign = if wraps % 2 == 0 { 1.0 } else { -1.0 };
+        folded[q.rem_euclid(2 * n as isize) as usize] += sign * w * x;
+    }
+    forward_mdct(&folded, 2 * n)
+        .into_iter()
+        .map(|v| -v)
+        .collect()
 }
 
 /// One quantized channel, ready for wire assembly.
@@ -1523,7 +2167,7 @@ type IsBand = Option<(u8, i32)>;
 /// intensity stereo exploits the ear's insensitivity to phase at
 /// high frequencies (§4.6.8.2.1), so the bottom quarter of the
 /// spectrum always keeps discrete coding.
-const IS_MIN_SPECTRAL_LINE: usize = FRAME_LEN / 4;
+const IS_MIN_SPECTRAL_FRACTION: usize = 4;
 
 /// Minimum normalised cross-correlation `|Σ l·r| / sqrt(Σl²·Σr²)`
 /// for a band to qualify for intensity coding. Deliberately strict:
@@ -1533,6 +2177,7 @@ const IS_MIN_SPECTRAL_LINE: usize = FRAME_LEN / 4;
 /// measured correlating as high as 0.93 on synthetic two-tone
 /// content; IS-coding those would substitute the wrong (if masked)
 /// waveform for no bit win over the cull they get anyway.
+#[doc(hidden)]
 pub const IS_CORR_MIN: f64 = 0.95;
 
 /// Relative peak floor for the intensity decision: a band whose
@@ -1556,9 +2201,10 @@ const IS_PEAK_FLOOR_RATIO: f64 = 3e-3;
 /// — and the codebook carries the phase: `INTENSITY_HCB` (15) when
 /// the channels correlate positively, `INTENSITY_HCB2` (14) when
 /// they anti-correlate.
-fn is_decide(l_spec: &[f64], r_spec: &[f64], fs_index: u8) -> Result<Vec<IsBand>> {
-    let offsets = long_window_offsets(fs_index)?;
-    let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
+fn is_decide(l_spec: &[f64], r_spec: &[f64], geom: Geom) -> Result<Vec<IsBand>> {
+    let offsets = geom.long_offsets()?;
+    let num_swb = geom.num_swb_long()?;
+    let min_line = geom.frame_len() / IS_MIN_SPECTRAL_FRACTION;
     let frame_peak = l_spec
         .iter()
         .chain(r_spec.iter())
@@ -1568,7 +2214,7 @@ fn is_decide(l_spec: &[f64], r_spec: &[f64], fs_index: u8) -> Result<Vec<IsBand>
     for (sfb, slot) in out.iter_mut().enumerate() {
         let start = offsets[sfb] as usize;
         let end = offsets[sfb + 1] as usize;
-        if start < IS_MIN_SPECTRAL_LINE {
+        if start < min_line {
             continue;
         }
         let mut e_l = 0.0f64;
@@ -1610,6 +2256,7 @@ fn is_decide(l_spec: &[f64], r_spec: &[f64], fs_index: u8) -> Result<Vec<IsBand>
 /// correlation only — the shared vector reproduces positively
 /// correlated noise, so anti-correlated noise stays on independent
 /// draws.
+#[doc(hidden)]
 pub const PNS_CORR_MIN: f64 = 0.5;
 
 /// Per-band §4.6.13 PNS decision for a channel pair (encode side).
@@ -1642,10 +2289,10 @@ fn pns_decide_pair(
     l_spec: &[f64],
     r_spec: &[f64],
     is_bands: &[IsBand],
-    fs_index: u8,
+    geom: Geom,
 ) -> Result<PairPns> {
-    let offsets = long_window_offsets(fs_index)?;
-    let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
+    let offsets = geom.long_offsets()?;
+    let num_swb = geom.num_swb_long()?;
     let mut out = PairPns {
         l_noise: vec![false; num_swb],
         r_noise: vec![false; num_swb],
@@ -1685,9 +2332,9 @@ fn pns_decide_pair(
 /// energy (≥ ~5 dB below its partner) — it will cull or code
 /// cheaply while the dominant channel carries the band once instead
 /// of twice.
-fn ms_decide(l_spec: &[f64], r_spec: &[f64], fs_index: u8) -> Result<Vec<bool>> {
-    let offsets = long_window_offsets(fs_index)?;
-    let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
+fn ms_decide(l_spec: &[f64], r_spec: &[f64], geom: Geom) -> Result<Vec<bool>> {
+    let offsets = geom.long_offsets()?;
+    let num_swb = geom.num_swb_long()?;
     let mut used = Vec::with_capacity(num_swb);
     for sfb in 0..num_swb {
         let start = offsets[sfb] as usize;
@@ -1716,9 +2363,9 @@ fn apply_ms(
     l_spec: &[f64],
     r_spec: &[f64],
     ms_used: &[bool],
-    fs_index: u8,
+    geom: Geom,
 ) -> Result<(Vec<f64>, Vec<f64>)> {
-    let offsets = long_window_offsets(fs_index)?;
+    let offsets = geom.long_offsets()?;
     let mut code_l = l_spec.to_vec();
     let mut code_r = r_spec.to_vec();
     for (sfb, &used) in ms_used.iter().enumerate() {
@@ -1750,7 +2397,8 @@ fn ms_decide_short(
     num_swb: usize,
     wgl: &[u8],
 ) -> Vec<Vec<bool>> {
-    let short_len = SHORT_WINDOW_LEN as usize;
+    // The table's sentinel is the short-window length (128 / 120).
+    let short_len = usize::from(offsets[offsets.len() - 1]);
     let mut rows = Vec::with_capacity(wgl.len());
     let mut win_base = 0usize;
     for &len in wgl {
@@ -1787,7 +2435,7 @@ fn apply_ms_short(
     offsets: &[u16],
     wgl: &[u8],
 ) -> (Vec<f64>, Vec<f64>) {
-    let short_len = SHORT_WINDOW_LEN as usize;
+    let short_len = usize::from(offsets[offsets.len() - 1]);
     let mut code_l = l_spec.to_vec();
     let mut code_r = r_spec.to_vec();
     let mut win_base = 0usize;
@@ -1819,11 +2467,7 @@ fn quantize_coef(x: f64, sf: i32) -> i32 {
     let gain = (0.25 * f64::from(sf - SF_OFFSET)).exp2();
     let mag = (x.abs() / gain).powf(0.75).round();
     let mag = mag.min(f64::from(MAX_QUANT)) as i32;
-    if x < 0.0 {
-        -mag
-    } else {
-        mag
-    }
+    if x < 0.0 { -mag } else { mag }
 }
 
 /// The masking-spread scalefactor for a band whose peak coefficient
@@ -2055,23 +2699,23 @@ fn scalefactor_track(groups: &[GroupQuant]) -> (u8, AbsoluteScaleFactors) {
 
 /// Exact §4.6.3.3 wire cost, in bits, of coding one band's
 /// coefficient range with spectrum book `cb` — Huffman codewords +
-/// sign bits + escape sequences, measured by running the actual
-/// [`crate::spectral_data`] tuple writer into a scratch buffer.
-/// `None` when the book cannot carry the band (a magnitude beyond
-/// the book's Table 4.95 LAV; book 11 escapes up to `MAX_QUANT`).
+/// sign bits + escape sequences, counted tuple by tuple by
+/// [`crate::spectral_data::tuple_bits`], which the tuple writer's
+/// differential test holds to the wire. `None` when the book cannot
+/// carry the band (a magnitude beyond the book's Table 4.95 LAV;
+/// book 11 escapes up to `MAX_QUANT`) or the band is not a whole
+/// number of tuples.
 fn band_bits(cb: u8, coeffs: &[i32]) -> Option<u32> {
     let row = crate::spectral_codebook::table_4_95(cb).ok()?;
     let dim = row.dimension? as usize;
-    let mut bw = BitWriter::new();
-    let mut k = 0;
-    while k + dim <= coeffs.len() {
-        crate::spectral_data::write_tuple(&mut bw, cb, dim, &coeffs[k..k + dim]).ok()?;
-        k += dim;
+    if !coeffs.len().is_multiple_of(dim) {
+        return None;
     }
-    if k != coeffs.len() {
-        return None; // band width not a whole number of tuples
+    let mut bits = 0u32;
+    for tuple in coeffs.chunks_exact(dim) {
+        bits += crate::spectral_data::tuple_bits(cb, dim, tuple).ok()?;
     }
-    Some(bw.bit_position() as u32)
+    Some(bits)
 }
 
 /// The §4.4.2.7-adjacent `section_data()` header cost of one section
@@ -2457,16 +3101,18 @@ fn cheapest_band_bits(coeffs: &[i32]) -> Option<u32> {
 fn quantize_channel(
     spec: &[f64],
     seq: WindowSequence,
-    fs_index: u8,
+    geom: Geom,
     sf_offset: i32,
     frame_peak: f64,
     pns_bands: &[bool],
     is_bands: &[IsBand],
+    pulses: bool,
 ) -> Result<QuantizedChannel> {
-    debug_assert_eq!(spec.len(), FRAME_LEN);
+    debug_assert_eq!(spec.len(), geom.frame_len());
     debug_assert!(seq != WindowSequence::EightShort);
-    let offsets = long_window_offsets(fs_index)?;
-    let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
+    let fs_index = geom.fs;
+    let offsets = geom.long_offsets()?;
+    let num_swb = geom.num_swb_long()?;
     let mut prev_sf: Option<i32> = None;
     let mut group = quantize_group(
         spec,
@@ -2480,9 +3126,10 @@ fn quantize_channel(
     if !is_bands.is_empty() {
         apply_is_overrides(&mut group, is_bands, offsets);
     }
-    let pulse_candidate = extract_pulse_candidate(&group.x_quant, &group.sfb_cb, offsets);
+    let pulse_candidate =
+        extract_pulse_candidate(&group.x_quant, &group.sfb_cb, offsets).filter(|_| pulses);
     let info = IcsInfo {
-        family: crate::swb_offset::FrameFamily::Lc1024,
+        family: geom.family,
         ics_reserved_bit: false,
         window_sequence: seq,
         window_shape: WindowShape::Sine,
@@ -2565,7 +3212,7 @@ const GROUP_MERGE_EPS: f64 = 1.0;
 /// attack window's jump keeps it in its own group. Returns the
 /// `window_group_length` vector (summing to 8).
 fn decide_short_grouping(spec: &[f64], offsets: &[u16], num_swb: usize) -> Vec<u8> {
-    let short_len = SHORT_WINDOW_LEN as usize;
+    let short_len = usize::from(offsets[offsets.len() - 1]);
     let band_energy = |w: usize, sfb: usize| -> f64 {
         let base = w * short_len;
         spec[base + offsets[sfb] as usize..base + offsets[sfb + 1] as usize]
@@ -2619,14 +3266,14 @@ fn grouping_mask(window_group_length: &[u8]) -> u8 {
 /// `(sfb, window, bin)` transmission order.
 fn quantize_channel_short(
     spec: &[f64],
-    fs_index: u8,
+    geom: Geom,
     sf_offset: i32,
     frame_peak: f64,
 ) -> Result<QuantizedChannel> {
-    let offsets = short_window_offsets(fs_index)?;
-    let num_swb = NUM_SWB_SHORT_WINDOW[fs_index as usize] as usize;
+    let offsets = geom.short_offsets()?;
+    let num_swb = geom.num_swb_short()?;
     let window_group_length = decide_short_grouping(spec, offsets, num_swb);
-    quantize_channel_short_grouped(spec, fs_index, sf_offset, frame_peak, window_group_length)
+    quantize_channel_short_grouped(spec, geom, sf_offset, frame_peak, window_group_length)
 }
 
 /// [`quantize_channel_short`] under an *imposed* grouping — the
@@ -2636,15 +3283,16 @@ fn quantize_channel_short(
 /// scalefactor / interleave layouts follow it.
 fn quantize_channel_short_grouped(
     spec: &[f64],
-    fs_index: u8,
+    geom: Geom,
     sf_offset: i32,
     frame_peak: f64,
     window_group_length: Vec<u8>,
 ) -> Result<QuantizedChannel> {
-    let short_len = SHORT_WINDOW_LEN as usize;
+    let short_len = geom.short_len();
     debug_assert_eq!(spec.len(), 8 * short_len);
-    let offsets = short_window_offsets(fs_index)?;
-    let num_swb = NUM_SWB_SHORT_WINDOW[fs_index as usize] as usize;
+    let fs_index = geom.fs;
+    let offsets = geom.short_offsets()?;
+    let num_swb = geom.num_swb_short()?;
     let mask = grouping_mask(&window_group_length);
     let mut prev_sf: Option<i32> = None;
     let mut groups = Vec::with_capacity(window_group_length.len());
@@ -2681,7 +3329,7 @@ fn quantize_channel_short_grouped(
         win_base += wgl;
     }
     let info = IcsInfo {
-        family: crate::swb_offset::FrameFamily::Lc1024,
+        family: geom.family,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::EightShort,
         window_shape: WindowShape::Sine,
@@ -2706,6 +3354,218 @@ fn quantize_channel_short_grouped(
 mod tests {
     use super::*;
     use crate::dequant::{inverse_quantize, scale_factor_gain};
+    use crate::ics_info::NUM_SWB_SHORT_WINDOW;
+    use crate::swb_offset::{SHORT_WINDOW_LEN, long_window_offsets, short_window_offsets};
+
+    /// ER AAC LD round trip through the crate's ER decoder: 512 and 480
+    /// lines, mono and stereo, at the delay of one frame; the
+    /// `AudioSpecificConfig` parses back to the stream's parameters.
+    #[test]
+    fn ld_round_trip() {
+        use crate::asc::{AacResilienceFlags, AudioSpecificConfig};
+        use crate::decode::StreamDecoder;
+        for (frame_len, family) in [(512, FrameFamily::Ld512), (480, FrameFamily::Ld480)] {
+            for channels in [1u8, 2] {
+                let ch = usize::from(channels);
+                let config = EncoderConfig {
+                    sample_rate: 48_000,
+                    channels,
+                    bitrate: 96_000 * u32::from(channels),
+                };
+                let mut enc = StreamEncoder::new_ld(config, frame_len).unwrap();
+                assert_eq!(enc.frame_len(), frame_len);
+                let (asc, _) =
+                    AudioSpecificConfig::parse(&enc.audio_specific_config().unwrap()).unwrap();
+                assert_eq!(asc.aot, 23);
+                assert_eq!(asc.channel_configuration, channels);
+                assert_eq!(asc.ga_body.frame_length.family(asc.aot), family);
+                let frames = 40;
+                let input: Vec<f64> = (0..frame_len * frames * ch)
+                    .map(|i| {
+                        let t = (i / ch) as f64 / 48_000.0;
+                        0.4 * (2.0 * core::f64::consts::PI * (440.0 + 220.0 * (i % ch) as f64) * t)
+                            .sin()
+                    })
+                    .collect();
+                let mut dec = StreamDecoder::new();
+                dec.set_frame_family(family);
+                let mut out: Vec<f64> = Vec::new();
+                for hop in input.chunks(frame_len * ch) {
+                    let au = enc.encode_frame_f64(hop).unwrap();
+                    let frame = dec
+                        .decode_er_raw_data_block(
+                            23,
+                            3,
+                            48_000,
+                            channels,
+                            AacResilienceFlags::default(),
+                            &au,
+                        )
+                        .unwrap();
+                    out.extend(frame.pcm.iter().map(|&v| f64::from(v) * 32768.0));
+                }
+                // Decoded frame f reconstructs input hop f - 1.
+                let (mut energy, mut error) = (0.0, 0.0);
+                for i in frame_len * ch..out.len() {
+                    let x = input[i - frame_len * ch] * 32768.0;
+                    energy += x * x;
+                    error += (out[i] - x) * (out[i] - x);
+                }
+                let snr = 10.0 * (energy / error).log10();
+                assert!(snr > 25.0, "LD {frame_len} ch={channels}: {snr} dB");
+            }
+        }
+    }
+
+    /// The ELD analysis inverts the decoder's §4.6.20 low-delay
+    /// synthesis: unquantised coefficients reconstruct the input
+    /// `N/2` samples late, to the precision of the window table.
+    #[test]
+    fn eld_analysis_inverts_synthesis() {
+        use crate::filterbank::Filterbank;
+        use crate::ics_info::IcsInfo;
+        for family in [FrameFamily::Ld512, FrameFamily::Ld480] {
+            let n = family.frame_len();
+            let info = IcsInfo::eld(family, 0, 3).unwrap();
+            let mut fb = Filterbank::new_low_delay(family).unwrap();
+            let mut hist = vec![0.0f64; 3 * n];
+            let mut seed = 7u32;
+            let input: Vec<f64> = (0..12 * n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    f64::from(seed >> 8) / 16_777_216.0 - 0.5
+                })
+                .collect();
+            let mut out = Vec::new();
+            for hop in input.chunks(n) {
+                let spec = analyze_channel_eld(&hist, hop, family);
+                out.extend(fb.synthesize(&spec, &info).unwrap());
+                hist.drain(..n);
+                hist.extend_from_slice(hop);
+            }
+            let (mut energy, mut error) = (0.0, 0.0);
+            for i in 4 * n..out.len() {
+                let x = input[i - n / 2];
+                energy += x * x;
+                error += (out[i] - x) * (out[i] - x);
+            }
+            let snr = 10.0 * (energy / error).log10();
+            assert!(snr > 100.0, "ELD {n}: {snr} dB");
+        }
+    }
+
+    /// ER AAC ELD round trip through the crate's ELD decoder: 512 and
+    /// 480 lines, one to six channels; the decoder reconstructs the
+    /// input `N/2` samples late.
+    #[test]
+    fn eld_round_trip() {
+        use crate::asc::AacResilienceFlags;
+        use crate::decode::StreamDecoder;
+        for (frame_len, family) in [(512, FrameFamily::Ld512), (480, FrameFamily::Ld480)] {
+            for (channels, configuration) in [(1u8, 1u8), (2, 2), (6, 6)] {
+                let ch = usize::from(channels);
+                let config = EncoderConfig {
+                    sample_rate: 48_000,
+                    channels,
+                    bitrate: 96_000 * u32::from(channels),
+                };
+                let mut enc = StreamEncoder::new_eld(config, frame_len).unwrap();
+                let frames = 40;
+                let input: Vec<f64> = (0..frame_len * frames * ch)
+                    .map(|i| {
+                        let t = (i / ch) as f64 / 48_000.0;
+                        0.4 * (2.0 * core::f64::consts::PI * (440.0 + 220.0 * (i % ch) as f64) * t)
+                            .sin()
+                    })
+                    .collect();
+                let mut dec = StreamDecoder::new();
+                dec.set_frame_family(family);
+                dec.set_declaration_order(false);
+                let mut out: Vec<f64> = Vec::new();
+                for hop in input.chunks(frame_len * ch) {
+                    let au = enc.encode_frame_f64(hop).unwrap();
+                    let frame = dec
+                        .decode_er_raw_data_block(
+                            39,
+                            3,
+                            48_000,
+                            configuration,
+                            AacResilienceFlags::default(),
+                            &au,
+                        )
+                        .unwrap();
+                    out.extend(frame.pcm.iter().map(|&v| f64::from(v) * 32768.0));
+                }
+                let delay = frame_len / 2 * ch;
+                // LFE channels carry only the lowest lines: score the others.
+                let lfe = |i: usize| channels == 6 && i % ch == 3;
+                let (mut energy, mut error) = (0.0, 0.0);
+                for i in 4 * frame_len * ch..out.len() {
+                    if lfe(i) {
+                        continue;
+                    }
+                    let x = input[i - delay] * 32768.0;
+                    energy += x * x;
+                    error += (out[i] - x) * (out[i] - x);
+                }
+                let snr = 10.0 * (energy / error).log10();
+                assert!(snr > 25.0, "ELD {frame_len} ch={channels}: {snr} dB");
+            }
+        }
+    }
+
+    #[test]
+    fn float_input_codes_like_i16_input() {
+        let pcm: Vec<i16> = (0..FRAME_LEN * 2 * 3)
+            .map(|i| ((i as f64 * 0.021).sin() * 12000.0) as i16)
+            .collect();
+        let float: Vec<f64> = pcm.iter().map(|&v| f64::from(v) / 32768.0).collect();
+        let config = EncoderConfig {
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate: 128_000,
+        };
+        let mut a = StreamEncoder::new(config).unwrap();
+        let mut b = StreamEncoder::new(config).unwrap();
+        for (x, y) in pcm.chunks(FRAME_LEN * 2).zip(float.chunks(FRAME_LEN * 2)) {
+            assert_eq!(a.encode_frame(x).unwrap(), b.encode_frame_f64(y).unwrap());
+        }
+    }
+
+    /// Under `set_raw` the frame entry points emit what the
+    /// access-unit entry points do, and an ADTS frame's payload is a
+    /// bare unit coded at the bitrate whose budget equals the ADTS
+    /// payload budget.
+    #[test]
+    fn raw_frames_are_access_units() {
+        let pcm: Vec<i16> = (0..FRAME_LEN * 2 * 4)
+            .map(|i| ((i as f64 * 0.017).sin() * 9000.0 + (i as f64 * 0.9).sin() * 1500.0) as i16)
+            .collect();
+        let config = |bitrate| EncoderConfig {
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate,
+        };
+        // 128 kb/s: 333 bytes per frame, 326 after the ADTS header —
+        // the whole budget of a bare unit at 326·8·48000/1024 b/s.
+        let mut adts = StreamEncoder::new(config(128_000)).unwrap();
+        let mut raw = StreamEncoder::new(config(122_250)).unwrap();
+        let mut au = StreamEncoder::new(config(122_250)).unwrap();
+        raw.set_raw(true);
+        // The default bandwidth follows the bitrate; pin it.
+        for enc in [&mut adts, &mut raw, &mut au] {
+            enc.set_bandwidth(Some(15_000.0));
+        }
+        for hop in pcm.chunks(FRAME_LEN * 2) {
+            let a = adts.encode_frame(hop).unwrap();
+            let r = raw.encode_frame(hop).unwrap();
+            assert_eq!(r, &a[7..]);
+            assert_eq!(au.encode_access_unit(hop).unwrap(), r);
+        }
+        raw.set_bitrate(32_000).unwrap();
+        assert_eq!(raw.config().bitrate, 32_000);
+        assert!(raw.set_bitrate(0).is_err());
+    }
 
     #[test]
     fn quantize_coef_inverts_dequant_within_rounding() {
@@ -2763,12 +3623,14 @@ mod tests {
 
     #[test]
     fn config_rejects_bad_parameters() {
-        assert!(StreamEncoder::new(EncoderConfig {
-            sample_rate: 44_100,
-            channels: 1,
-            bitrate: 64_000,
-        })
-        .is_ok());
+        assert!(
+            StreamEncoder::new(EncoderConfig {
+                sample_rate: 44_100,
+                channels: 1,
+                bitrate: 64_000,
+            })
+            .is_ok()
+        );
         assert!(matches!(
             StreamEncoder::new(EncoderConfig {
                 sample_rate: 44_056, // not a Table 1.18 rate
@@ -3030,7 +3892,7 @@ mod tests {
             }
         }
         let frame_peak = spec.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
-        let chan = quantize_channel_short(&spec, fs_index, 0, frame_peak).unwrap();
+        let chan = quantize_channel_short(&spec, Geom::lc(fs_index), 0, frame_peak).unwrap();
         assert_eq!(chan.info.window_group_length, vec![3, 5]);
 
         let mut bw = BitWriter::new();
@@ -3312,8 +4174,17 @@ mod tests {
                 *slot = 0.0095; // the band floor
             }
         }
-        let chan =
-            quantize_channel(&spec, WindowSequence::OnlyLong, fs_index, 0, 1.0, &[], &[]).unwrap();
+        let chan = quantize_channel(
+            &spec,
+            WindowSequence::OnlyLong,
+            Geom::lc(fs_index),
+            0,
+            1.0,
+            &[],
+            &[],
+            true,
+        )
+        .unwrap();
         let plain = quantize_group(
             &spec,
             offsets,

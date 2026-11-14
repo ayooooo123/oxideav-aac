@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use oxideav_aac::decode::StreamDecoder;
-use oxideav_aac::he_aac_encoder::{HeAacConfig, HeAacEncoder, HE_FRAME_LEN};
+use oxideav_aac::he_aac_encoder::{HE_FRAME_LEN, HeAacConfig, HeAacEncoder};
 use oxideav_aac::sbr_qmf::EncoderAnalysisQmf;
 
 fn ffmpeg() -> Option<&'static str> {
@@ -48,7 +48,9 @@ fn read_wav(path: &PathBuf) -> Option<(Vec<f32>, usize, u32)> {
         if cid == b"data" {
             let end = (body + sz).min(d.len());
             let pcm = d[body..end]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
                 .collect();
             return Some((pcm, channels.max(1), rate));
@@ -68,7 +70,7 @@ fn band_energies(pcm: &[i16], channels: usize, c: usize) -> [f64; 64] {
         .collect();
     let mut bank = EncoderAnalysisQmf::new();
     let mut e = [0.0f64; 64];
-    for slot in mono.chunks_exact(64) {
+    for slot in mono.as_chunks::<64>().0 {
         let cols = bank.push_slot(slot).unwrap();
         for (k, v) in cols.iter().enumerate() {
             e[k] += v.norm_sqr();
@@ -277,7 +279,12 @@ fn reference_binary_accepts_double_onset_varvar_frames() {
     let frames = dec.decode_all(&stream).expect("own decode");
     let ours: Vec<i16> = frames
         .iter()
-        .flat_map(|f| f.pcm.iter().step_by(f.channels.max(1)).map(|&s| (s * 32768.0) as i16))
+        .flat_map(|f| {
+            f.pcm
+                .iter()
+                .step_by(f.channels.max(1))
+                .map(|&s| (s * 32768.0) as i16)
+        })
         .collect();
     let ref_pcm_i16: Vec<i16> = ref_pcm.iter().map(|&s| (s * 32768.0) as i16).collect();
     let e_ref = band_energies(&ref_pcm_i16, ref_ch, 0);
@@ -338,7 +345,12 @@ fn cross_decode(
     let frames = dec.decode_all(stream).expect("own decode");
     let ours: Vec<i16> = frames
         .iter()
-        .flat_map(|f| f.pcm.iter().step_by(f.channels.max(1)).map(|&s| (s * 32768.0) as i16))
+        .flat_map(|f| {
+            f.pcm
+                .iter()
+                .step_by(f.channels.max(1))
+                .map(|&s| (s * 32768.0) as i16)
+        })
         .collect();
     let ref_pcm_i16: Vec<i16> = ref_pcm.iter().map(|&s| (s * 32768.0) as i16).collect();
     let e_ref = band_energies(&ref_pcm_i16, ref_ch, 0);
@@ -418,7 +430,9 @@ fn reference_binary_accepts_triple_onset_varvar_frames() {
         }
     }
     stream.extend_from_slice(&enc.finish().unwrap());
-    eprintln!("five-envelope frames {five}, three-onset frames {three_onsets}, mixed-resolution frames {mixed_res}");
+    eprintln!(
+        "five-envelope frames {five}, three-onset frames {three_onsets}, mixed-resolution frames {mixed_res}"
+    );
     assert!(five > 0, "no five-envelope frame");
     assert!(three_onsets > 0, "no frame with three onset envelopes");
     assert!(mixed_res > 0, "no frame with per-envelope resolution");

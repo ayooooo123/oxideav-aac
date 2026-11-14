@@ -10,7 +10,7 @@
 
 use oxideav_aac::adts::AdtsHeader;
 use oxideav_aac::decode::StreamDecoder;
-use oxideav_aac::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
+use oxideav_aac::encoder::{EncoderConfig, FRAME_LEN, StreamEncoder};
 
 /// Encode `pcm` and decode it back, returning the interleaved
 /// decoder output.
@@ -69,11 +69,7 @@ fn multitone(n: usize, channels: usize) -> Vec<i16> {
 fn mono_multitone_roundtrips_within_tolerance() {
     let n = 8 * FRAME_LEN;
     let pcm = multitone(n, 1);
-    let config = EncoderConfig {
-        sample_rate: 44_100,
-        channels: 1,
-        bitrate: 128_000,
-    };
+    let config = EncoderConfig::new(44_100, 1, 128_000);
     let decoded = roundtrip(&pcm, config);
     // ⌈n/1024⌉ + 1 frames, 1024 samples each.
     assert_eq!(decoded.len(), n + FRAME_LEN);
@@ -114,11 +110,7 @@ fn mono_multitone_roundtrips_within_tolerance() {
 fn stereo_multitone_roundtrips_within_tolerance() {
     let n = 8 * FRAME_LEN;
     let pcm = multitone(n, 2);
-    let config = EncoderConfig {
-        sample_rate: 48_000,
-        channels: 2,
-        bitrate: 192_000,
-    };
+    let config = EncoderConfig::new(48_000, 2, 192_000);
     let decoded = roundtrip(&pcm, config);
     assert_eq!(decoded.len(), (n + FRAME_LEN) * 2);
     let ratio = err_to_signal_rms(&pcm, &decoded[FRAME_LEN * 2..]);
@@ -135,11 +127,7 @@ fn low_rate_mono_stays_within_budget_and_decodes() {
     // the per-frame budget, and the stream still decodes end to end.
     let n = 6 * FRAME_LEN;
     let pcm = multitone(n, 1);
-    let config = EncoderConfig {
-        sample_rate: 8_000,
-        channels: 1,
-        bitrate: 16_000,
-    };
+    let config = EncoderConfig::new(8_000, 1, 16_000);
     let mut enc = StreamEncoder::new(config).unwrap();
     let stream = enc.encode_all(&pcm).unwrap();
 
@@ -183,22 +171,13 @@ fn every_supported_sample_rate_produces_a_decodable_stream() {
     // 12 (7350 Hz) has no long-window band table and is rejected at
     // config time (7350 Hz content conventionally ships under index
     // 11 — see the staged corpus notes on the 8 kHz fixture).
-    assert!(StreamEncoder::new(EncoderConfig {
-        sample_rate: 7_350,
-        channels: 1,
-        bitrate: 96_000,
-    })
-    .is_err());
+    assert!(StreamEncoder::new(EncoderConfig::new(7_350, 1, 96_000)).is_err());
     for &rate in &[
         96_000u32, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025,
         8_000,
     ] {
         let pcm = multitone(FRAME_LEN, 1);
-        let config = EncoderConfig {
-            sample_rate: rate,
-            channels: 1,
-            bitrate: 96_000,
-        };
+        let config = EncoderConfig::new(rate, 1, 96_000);
         let mut enc = StreamEncoder::new(config).unwrap();
         let stream = enc.encode_all(&pcm).unwrap();
         let (hdr, _) = AdtsHeader::parse(&stream).unwrap();
@@ -219,11 +198,7 @@ fn full_scale_input_does_not_overflow() {
     let pcm: Vec<i16> = (0..n)
         .map(|i| if (i / 64) % 2 == 0 { 32_767 } else { -32_768 })
         .collect();
-    let config = EncoderConfig {
-        sample_rate: 44_100,
-        channels: 1,
-        bitrate: 256_000,
-    };
+    let config = EncoderConfig::new(44_100, 1, 256_000);
     let decoded = roundtrip(&pcm, config);
     assert_eq!(decoded.len(), n + FRAME_LEN);
     let ratio = err_to_signal_rms(&pcm, &decoded[FRAME_LEN..]);
@@ -235,11 +210,7 @@ fn full_scale_input_does_not_overflow() {
 fn hop_by_hop_api_matches_encode_all() {
     let n = 3 * FRAME_LEN + 500; // non-multiple tail
     let pcm = multitone(n, 2);
-    let config = EncoderConfig {
-        sample_rate: 44_100,
-        channels: 2,
-        bitrate: 128_000,
-    };
+    let config = EncoderConfig::new(44_100, 2, 128_000);
     let mut a = StreamEncoder::new(config).unwrap();
     let one_shot = a.encode_all(&pcm).unwrap();
 
@@ -268,20 +239,10 @@ fn identical_channels_engage_ms_and_shrink_the_stream() {
         stereo.push(s);
     }
 
-    let mut enc_m = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44_100,
-        channels: 1,
-        bitrate: 128_000,
-    })
-    .unwrap();
+    let mut enc_m = StreamEncoder::new(EncoderConfig::new(44_100, 1, 128_000)).unwrap();
     let mono_stream = enc_m.encode_all(&mono).unwrap();
 
-    let mut enc_s = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44_100,
-        channels: 2,
-        bitrate: 128_000,
-    })
-    .unwrap();
+    let mut enc_s = StreamEncoder::new(EncoderConfig::new(44_100, 2, 128_000)).unwrap();
     let stereo_stream = enc_s.encode_all(&stereo).unwrap();
 
     eprintln!(
@@ -311,7 +272,9 @@ fn identical_channels_engage_ms_and_shrink_the_stream() {
     // Channel coherence: decoded L and R stay near-identical.
     let steady = &out[FRAME_LEN * 2..];
     let max_lr_diff = steady
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| (i32::from(p[0]) - i32::from(p[1])).abs())
         .max()
         .unwrap();
@@ -333,14 +296,7 @@ fn phase_inverted_channels_roundtrip_through_ms() {
         stereo.push(s);
         stereo.push(s.saturating_neg());
     }
-    let decoded = roundtrip(
-        &stereo,
-        EncoderConfig {
-            sample_rate: 44_100,
-            channels: 2,
-            bitrate: 128_000,
-        },
-    );
+    let decoded = roundtrip(&stereo, EncoderConfig::new(44_100, 2, 128_000));
     let ratio = err_to_signal_rms(&stereo, &decoded[FRAME_LEN * 2..]);
     eprintln!("phase-inverted stereo err/sig RMS = {ratio:.5}");
     assert!(ratio < 0.03, "anti-correlated M/S ratio {ratio:.5}");
@@ -357,14 +313,7 @@ fn uncorrelated_channels_still_roundtrip() {
         stereo.push((9000.0 * (0.033 * t).sin()) as i16);
         stereo.push((9000.0 * (0.171 * t + 0.9).sin()) as i16);
     }
-    let decoded = roundtrip(
-        &stereo,
-        EncoderConfig {
-            sample_rate: 44_100,
-            channels: 2,
-            bitrate: 160_000,
-        },
-    );
+    let decoded = roundtrip(&stereo, EncoderConfig::new(44_100, 2, 160_000));
     let ratio = err_to_signal_rms(&stereo, &decoded[FRAME_LEN * 2..]);
     eprintln!("uncorrelated stereo err/sig RMS = {ratio:.5}");
     assert!(ratio < 0.03, "independent-channel ratio {ratio:.5}");
@@ -407,22 +356,13 @@ fn transient_input_switches_to_short_windows() {
             let quiet = (300.0 * (0.02 * i as f64).sin()) as i16;
             if (3 * FRAME_LEN..3 * FRAME_LEN + 400).contains(&i) {
                 // Sharp burst.
-                if i % 2 == 0 {
-                    28_000
-                } else {
-                    -28_000
-                }
+                if i % 2 == 0 { 28_000 } else { -28_000 }
             } else {
                 quiet
             }
         })
         .collect();
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44_100,
-        channels: 1,
-        bitrate: 128_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(44_100, 1, 128_000)).unwrap();
     // The burst is a Nyquist-rate square wave: full band.
     enc.set_bandwidth(None);
     let stream = enc.encode_all(&pcm).unwrap();
@@ -456,12 +396,7 @@ fn steady_tonal_input_never_switches() {
 
     let n = 5 * FRAME_LEN;
     let pcm = multitone(n, 1);
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44_100,
-        channels: 1,
-        bitrate: 128_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(44_100, 1, 128_000)).unwrap();
     let stream = enc.encode_all(&pcm).unwrap();
     let seqs = window_sequences(&stream);
     assert!(
@@ -479,11 +414,7 @@ fn stereo_transient_stream_roundtrips() {
     for i in 0..n {
         let base = (400.0 * (0.025 * i as f64).sin()) as i16;
         let burst = if (2 * FRAME_LEN..2 * FRAME_LEN + 300).contains(&i) {
-            if i % 2 == 0 {
-                24_000
-            } else {
-                -24_000
-            }
+            if i % 2 == 0 { 24_000 } else { -24_000 }
         } else {
             0
         };
@@ -491,14 +422,7 @@ fn stereo_transient_stream_roundtrips() {
         pcm.push(v);
         pcm.push(v);
     }
-    let decoded = roundtrip(
-        &pcm,
-        EncoderConfig {
-            sample_rate: 48_000,
-            channels: 2,
-            bitrate: 192_000,
-        },
-    );
+    let decoded = roundtrip(&pcm, EncoderConfig::new(48_000, 2, 192_000));
     let ratio = err_to_signal_rms(&pcm, &decoded[FRAME_LEN * 2..]);
     eprintln!("stereo transient err/sig RMS = {ratio:.5}");
     assert!(ratio < 0.08, "stereo transient ratio {ratio:.5}");
@@ -536,12 +460,7 @@ fn fixture_transcode_preserves_the_signal() {
         }
         assert_eq!(frames[0].sample_rate, rate, "{name}");
 
-        let mut enc = StreamEncoder::new(EncoderConfig {
-            sample_rate: rate,
-            channels,
-            bitrate,
-        })
-        .unwrap();
+        let mut enc = StreamEncoder::new(EncoderConfig::new(rate, channels, bitrate)).unwrap();
         // Transcode fidelity over the whole band (the chirp sweeps to
         // Nyquist).
         enc.set_bandwidth(None);
@@ -642,11 +561,7 @@ fn scaled_pair(n: usize, gain: f64) -> Vec<i16> {
 fn correlated_high_bands_engage_intensity_stereo() {
     let n = 6 * FRAME_LEN;
     let pcm = scaled_pair(n, 0.5);
-    let config = EncoderConfig {
-        sample_rate: 44_100,
-        channels: 2,
-        bitrate: 128_000,
-    };
+    let config = EncoderConfig::new(44_100, 2, 128_000);
     let mut enc = StreamEncoder::new(config).unwrap();
     enc.set_intensity_stereo(true);
     enc.set_bandwidth(None); // the IS bands are the top of the spectrum
@@ -697,12 +612,7 @@ fn correlated_high_bands_engage_intensity_stereo() {
 fn anti_correlated_pair_uses_out_of_phase_book() {
     let n = 4 * FRAME_LEN;
     let pcm = scaled_pair(n, -0.7);
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44_100,
-        channels: 2,
-        bitrate: 128_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(44_100, 2, 128_000)).unwrap();
     enc.set_intensity_stereo(true);
     let stream = enc.encode_all(&pcm).unwrap();
     let (in_phase, out_phase) = count_intensity_bands(&stream);
@@ -724,7 +634,7 @@ fn anti_correlated_pair_uses_out_of_phase_book() {
     }
     let steady = &out[FRAME_LEN * 2..];
     let (mut dot, mut el, mut er) = (0.0f64, 0.0f64, 0.0f64);
-    for p in steady.chunks_exact(2) {
+    for p in steady.as_chunks::<2>().0 {
         let (l, r) = (f64::from(p[0]), f64::from(p[1]));
         dot += l * r;
         el += l * l;
@@ -742,12 +652,7 @@ fn anti_correlated_pair_uses_out_of_phase_book() {
 fn default_config_never_emits_intensity() {
     let n = 3 * FRAME_LEN;
     let pcm = scaled_pair(n, 0.5);
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44_100,
-        channels: 2,
-        bitrate: 128_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(44_100, 2, 128_000)).unwrap();
     let stream = enc.encode_all(&pcm).unwrap();
     assert_eq!(count_intensity_bands(&stream), (0, 0));
 }
@@ -764,11 +669,7 @@ fn uncorrelated_high_bands_stay_discrete_under_is() {
         pcm.push((6000.0 * (1.37 * t).sin()) as i16);
         pcm.push((6000.0 * (2.11 * t + 0.9).sin()) as i16);
     }
-    let config = EncoderConfig {
-        sample_rate: 44_100,
-        channels: 2,
-        bitrate: 160_000,
-    };
+    let config = EncoderConfig::new(44_100, 2, 160_000);
     let mut enc_on = StreamEncoder::new(config).unwrap();
     enc_on.set_intensity_stereo(true);
     let with_is = enc_on.encode_all(&pcm).unwrap();
@@ -826,11 +727,7 @@ fn burst_decay_noise(n: usize, amp: f64, tau: f64, seed: u32) -> Vec<i16> {
 fn burst_decay_noise_engages_tns_and_roundtrips() {
     let n = 6 * FRAME_LEN;
     let pcm = burst_decay_noise(n, 8_000.0, 300.0, 0x5EED_5EED);
-    let config = EncoderConfig {
-        sample_rate: 44_100,
-        channels: 1,
-        bitrate: 128_000,
-    };
+    let config = EncoderConfig::new(44_100, 1, 128_000);
     let mut enc = StreamEncoder::new(config).unwrap();
     let stream = enc.encode_all(&pcm).unwrap();
 
@@ -883,12 +780,7 @@ fn steady_tonal_content_stays_tns_free() {
     // though their leakage skirts show spectral prediction gain.
     let n = 5 * FRAME_LEN;
     let pcm = multitone(n, 1);
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44_100,
-        channels: 1,
-        bitrate: 128_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(44_100, 1, 128_000)).unwrap();
     let stream = enc.encode_all(&pcm).unwrap();
     assert_eq!(
         count_tns_filters(&stream),
@@ -1005,12 +897,7 @@ fn identical_noise_channels_emit_correlated_pns() {
         pcm.push(s);
         pcm.push(s);
     }
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44_100,
-        channels: 2,
-        bitrate: 96_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(44_100, 2, 96_000)).unwrap();
     enc.set_pns(true);
     enc.set_bandwidth(None); // full-band noise: the energy contract spans it
     let stream = enc.encode_all(&pcm).unwrap();
@@ -1050,11 +937,9 @@ fn identical_noise_channels_emit_correlated_pns() {
     }
 }
 
-#[test]
-fn independent_noise_channels_stay_uncorrelated() {
-    // Fully independent noise per channel: pair PNS still fires but
-    // the correlation flag must (essentially) never be set, and the
-    // decoded channels stay decorrelated.
+/// Fully independent noise per channel, PNS on: pair PNS still fires
+/// but the correlation flag must (essentially) never be set.
+fn independent_noise_stream() -> Vec<u8> {
     let n = 5 * FRAME_LEN;
     let l = noise_pcm(n, 8_000.0, 0xAAAA_1111);
     let r = noise_pcm(n, 8_000.0, 0x5555_9999);
@@ -1063,12 +948,7 @@ fn independent_noise_channels_stay_uncorrelated() {
         pcm.push(l[i]);
         pcm.push(r[i]);
     }
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44_100,
-        channels: 2,
-        bitrate: 96_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(44_100, 2, 96_000)).unwrap();
     enc.set_pns(true);
     enc.set_bandwidth(None); // full-band noise: the energy contract spans it
     let stream = enc.encode_all(&pcm).unwrap();
@@ -1080,10 +960,12 @@ fn independent_noise_channels_stay_uncorrelated() {
         correlated * 10 <= both,
         "independent noise must (almost) never flag correlation: {correlated}/{both}"
     );
+    stream
+}
 
-    // Decoded channels stay decorrelated (independent draws).
-    let mut dec = StreamDecoder::new();
-    let frames = dec.decode_all(&stream).expect("decodes");
+/// Normalised L/R correlation of `dec`'s output past the first frame.
+fn decoded_lr_correlation(dec: &mut StreamDecoder, stream: &[u8]) -> f64 {
+    let frames = dec.decode_all(stream).expect("decodes");
     let mut out = Vec::new();
     for f in &frames {
         // Decoded f32 → the encoder's i16 domain.
@@ -1091,13 +973,21 @@ fn independent_noise_channels_stay_uncorrelated() {
     }
     let steady = &out[FRAME_LEN * 2..];
     let (mut dot, mut el, mut er) = (0.0f64, 0.0f64, 0.0f64);
-    for p in steady.chunks_exact(2) {
+    for p in steady.as_chunks::<2>().0 {
         let (a, b) = (f64::from(p[0]), f64::from(p[1]));
         dot += a * b;
         el += a * a;
         er += b * b;
     }
-    let corr = dot / (el * er).sqrt().max(1.0);
+    dot / (el * er).sqrt().max(1.0)
+}
+
+#[test]
+fn independent_noise_channels_stay_uncorrelated() {
+    // Decoded channels stay decorrelated by default: independent draws
+    // from one generator (the §4.6.13.3 default process).
+    let stream = independent_noise_stream();
+    let corr = decoded_lr_correlation(&mut StreamDecoder::new(), &stream);
     eprintln!("decoded L/R correlation = {corr:.4}");
     assert!(
         corr.abs() < 0.3,
@@ -1106,15 +996,27 @@ fn independent_noise_channels_stay_uncorrelated() {
 }
 
 #[test]
+fn independent_noise_channels_share_seeded_noise_when_opted_in() {
+    // With set_shared_pns_seed both channels draw from generators
+    // started from the same seed, so bands that are noise in both
+    // channels carry the same noise until the channels' noise histories
+    // diverge.
+    let stream = independent_noise_stream();
+    let mut dec = StreamDecoder::new();
+    dec.set_shared_pns_seed(true);
+    let corr = decoded_lr_correlation(&mut dec, &stream);
+    eprintln!("decoded L/R correlation (shared seed) = {corr:.4}");
+    assert!(
+        corr > 0.5,
+        "same-seed channel noise must decode correlated: {corr:.4}"
+    );
+}
+
+#[test]
 fn noise_input_engages_pns_and_preserves_energy() {
     let n = 6 * FRAME_LEN;
     let pcm = noise_pcm(n, 8_000.0, 0x1234_5678);
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44_100,
-        channels: 1,
-        bitrate: 64_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(44_100, 1, 64_000)).unwrap();
     enc.set_pns(true);
     let stream = enc.encode_all(&pcm).unwrap();
 
@@ -1158,12 +1060,7 @@ fn default_config_never_emits_pns() {
     // NOISE_HCB bands, even on noise content.
     let n = 4 * FRAME_LEN;
     for pcm in [multitone(n, 1), noise_pcm(n, 8_000.0, 0x0bad_cafe)] {
-        let mut enc = StreamEncoder::new(EncoderConfig {
-            sample_rate: 44_100,
-            channels: 1,
-            bitrate: 128_000,
-        })
-        .unwrap();
+        let mut enc = StreamEncoder::new(EncoderConfig::new(44_100, 1, 128_000)).unwrap();
         let stream = enc.encode_all(&pcm).unwrap();
         assert_eq!(count_noise_bands(&stream), 0);
     }
@@ -1177,12 +1074,7 @@ fn pns_shrinks_noise_frames() {
     // coefficients).
     let n = 4 * FRAME_LEN;
     let pcm = noise_pcm(n, 8_000.0, 0x9e37_79b9);
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44_100,
-        channels: 1,
-        bitrate: 256_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(44_100, 1, 256_000)).unwrap();
     enc.set_pns(true);
     let stream = enc.encode_all(&pcm).unwrap();
     let budget = 256_000usize * 1024 / 44_100 / 8;

@@ -40,8 +40,15 @@ pub struct UsacConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ElementConfig {
-    Audio { channels: u8, noise_fill: bool },
-    Extension { kind: u32, default_length: u32, fragmented: bool },
+    Audio {
+        channels: u8,
+        noise_fill: bool,
+    },
+    Extension {
+        kind: u32,
+        default_length: u32,
+        fragmented: bool,
+    },
 }
 
 pub(crate) fn is_usac(data: &[u8]) -> bool {
@@ -51,7 +58,11 @@ pub(crate) fn is_usac(data: &[u8]) -> bool {
 
 fn audio_object_type(bits: &mut BitReader<'_>) -> Result<u32> {
     let aot = bits.read_u32(5)?;
-    Ok(if aot == 31 { 32 + bits.read_u32(6)? } else { aot })
+    Ok(if aot == 31 {
+        32 + bits.read_u32(6)?
+    } else {
+        aot
+    })
 }
 
 pub(crate) fn escaped(bits: &mut BitReader<'_>, a: u32, b: u32, c: u32) -> Result<u32> {
@@ -74,7 +85,8 @@ fn payload_end(bits: &BitReader<'_>, length_bits: u32) -> Result<u64> {
 }
 
 fn finish_payload(bits: &mut BitReader<'_>, end: u64) -> Result<()> {
-    let remaining = end.checked_sub(bits.bit_position())
+    let remaining = end
+        .checked_sub(bits.bit_position())
         .ok_or_else(|| Error::invalid("AAC USAC: extension exceeds declared length"))?;
     bits.skip(remaining as u32)
 }
@@ -85,7 +97,9 @@ impl UsacConfig {
     pub fn parse(data: &[u8]) -> Result<Self> {
         let mut bits = BitReader::new(data);
         if audio_object_type(&mut bits)? != 42 {
-            return Err(Error::invalid("AAC USAC: AudioSpecificConfig is not AOT 42"));
+            return Err(Error::invalid(
+                "AAC USAC: AudioSpecificConfig is not AOT 42",
+            ));
         }
         let outer_frequency = bits.read_u32(4)?;
         if outer_frequency == 15 {
@@ -120,7 +134,9 @@ impl UsacConfig {
             return Err(Error::invalid("AAC USAC: zero sample rate"));
         }
         if bits.read_u32(3)? != 1 {
-            return Err(Error::unsupported("AAC USAC: only 1024-line FD without eSBR is supported"));
+            return Err(Error::unsupported(
+                "AAC USAC: only 1024-line FD without eSBR is supported",
+            ));
         }
         let channel_configuration = bits.read_u32(5)?;
         let channels = match channel_configuration {
@@ -128,18 +144,26 @@ impl UsacConfig {
             0 => {
                 let count = escaped(bits, 5, 8, 16)?;
                 if !(1..=2).contains(&count) {
-                    return Err(Error::unsupported("AAC USAC: only mono and stereo layouts are supported"));
+                    return Err(Error::unsupported(
+                        "AAC USAC: only mono and stereo layouts are supported",
+                    ));
                 }
                 for ch in 0..count {
                     let position = bits.read_u32(5)?;
                     let expected = if count == 1 { 2 } else { ch };
                     if position != expected {
-                        return Err(Error::unsupported("AAC USAC: noncanonical explicit channel layout"));
+                        return Err(Error::unsupported(
+                            "AAC USAC: noncanonical explicit channel layout",
+                        ));
                     }
                 }
                 count as u8
             }
-            _ => return Err(Error::unsupported("AAC USAC: only mono and stereo layouts are supported")),
+            _ => {
+                return Err(Error::unsupported(
+                    "AAC USAC: only mono and stereo layouts are supported",
+                ));
+            }
         };
         let count = escaped(bits, 4, 8, 16)? + 1;
         if count > 64 {
@@ -150,13 +174,19 @@ impl UsacConfig {
         for _ in 0..count {
             match bits.read_u32(2)? {
                 // lfe_channel_element() has its own restricted FD syntax.
-                2 => return Err(Error::unsupported("AAC USAC: LFE elements are not supported")),
+                2 => {
+                    return Err(Error::unsupported(
+                        "AAC USAC: LFE elements are not supported",
+                    ));
+                }
                 3 => {
                     let kind = escaped(bits, 4, 8, 16)?;
                     let config_length = escaped(bits, 4, 8, 16)?;
                     let default_length = if bits.read_bit()? {
                         escaped(bits, 8, 16, 0)? + 1
-                    } else { 0 };
+                    } else {
+                        0
+                    };
                     let fragmented = bits.read_bit()?;
                     // ISO/IEC 23003-3 UsacExtElementConfig(): "The first
                     // element of every frame shall be an extension element
@@ -164,12 +194,18 @@ impl UsacConfig {
                     // ISO reference decoder and libxaac read it only there,
                     // so a configuration change resumes the AU at element 1.
                     if kind == EXT_AUDIO_PREROLL && !elements.is_empty() {
-                        return Err(Error::invalid("AAC USAC: AudioPreRoll is valid only as the first element"));
+                        return Err(Error::invalid(
+                            "AAC USAC: AudioPreRoll is valid only as the first element",
+                        ));
                     }
                     // DRC gains and ancillary metadata are not applied, as in
                     // the reference FD decoder's default rendering mode.
                     bits.skip(config_length * 8)?;
-                    elements.push(ElementConfig::Extension { kind, default_length, fragmented });
+                    elements.push(ElementConfig::Extension {
+                        kind,
+                        default_length,
+                        fragmented,
+                    });
                 }
                 kind => {
                     if bits.read_bit()? {
@@ -179,14 +215,21 @@ impl UsacConfig {
                     let element_channels = if kind == 1 { 2 } else { 1 };
                     audio_channels += element_channels;
                     if audio_channels > channels {
-                        return Err(Error::invalid("AAC USAC: element channels exceed the declared layout"));
+                        return Err(Error::invalid(
+                            "AAC USAC: element channels exceed the declared layout",
+                        ));
                     }
-                    elements.push(ElementConfig::Audio { channels: element_channels, noise_fill });
+                    elements.push(ElementConfig::Audio {
+                        channels: element_channels,
+                        noise_fill,
+                    });
                 }
             }
         }
         if audio_channels != channels {
-            return Err(Error::invalid("AAC USAC: elements do not cover the declared channel layout"));
+            return Err(Error::invalid(
+                "AAC USAC: elements do not cover the declared channel layout",
+            ));
         }
         let mut loudness_method_value = None;
         if bits.read_bit()? {
@@ -197,15 +240,28 @@ impl UsacConfig {
                 let end = payload_end(bits, bytes * 8)?;
                 match kind {
                     2 => parse_loudness_set(bits, &mut loudness_method_value)?,
-                    7 => { bits.skip(16)?; }
+                    7 => {
+                        bits.skip(16)?;
+                    }
                     _ => {}
                 }
                 finish_payload(bits, end)?;
             }
         }
-        let thresholds = [92017, 75132, 55426, 46009, 37566, 27713, 23004, 18783, 13856, 11502, 9391];
-        let rate_index = thresholds.iter().position(|&minimum| sample_rate >= minimum).unwrap_or(11) as u8;
-        Ok(Self { sample_rate, channels, loudness_method_value, rate_index, elements })
+        let thresholds = [
+            92017, 75132, 55426, 46009, 37566, 27713, 23004, 18783, 13856, 11502, 9391,
+        ];
+        let rate_index = thresholds
+            .iter()
+            .position(|&minimum| sample_rate >= minimum)
+            .unwrap_or(11) as u8;
+        Ok(Self {
+            sample_rate,
+            channels,
+            loudness_method_value,
+            rate_index,
+            elements,
+        })
     }
 }
 
@@ -213,29 +269,50 @@ fn parse_loudness_info(bits: &mut BitReader<'_>, v1: bool) -> Result<Option<u8>>
     let drc_set = bits.read_u32(6)?;
     let eq_set = if v1 { bits.read_u32(6)? } else { 0 };
     let downmix = bits.read_u32(7)?;
-    if bits.read_bit()? { bits.skip(12)?; }
-    if bits.read_bit()? { bits.skip(18)?; }
+    if bits.read_bit()? {
+        bits.skip(12)?;
+    }
+    if bits.read_bit()? {
+        bits.skip(18)?;
+    }
     let measurements = bits.read_u32(4)?;
     let mut selected = None;
     for _ in 0..measurements {
         let method = bits.read_u32(4)?;
-        let width = match method { 7 => 5, 8 => 2, _ => 8 };
+        let width = match method {
+            7 => 5,
+            8 => 2,
+            _ => 8,
+        };
         let value = bits.read_u32(width)? as u8;
         bits.skip(6)?; // measurement system and reliability
-        if selected.is_none() && drc_set == 0 && eq_set == 0 && downmix == 0 && matches!(method, 1 | 2) {
+        if selected.is_none()
+            && drc_set == 0
+            && eq_set == 0
+            && downmix == 0
+            && matches!(method, 1 | 2)
+        {
             selected = Some(value);
         }
     }
     Ok(selected)
 }
 
-fn parse_loudness_entries(bits: &mut BitReader<'_>, v1: bool, selected: &mut Option<u8>) -> Result<()> {
+fn parse_loudness_entries(
+    bits: &mut BitReader<'_>,
+    v1: bool,
+    selected: &mut Option<u8>,
+) -> Result<()> {
     let albums = bits.read_u32(6)?;
     let programs = bits.read_u32(6)?;
-    for _ in 0..albums { parse_loudness_info(bits, v1)?; }
+    for _ in 0..albums {
+        parse_loudness_info(bits, v1)?;
+    }
     for _ in 0..programs {
         let value = parse_loudness_info(bits, v1)?;
-        if selected.is_none() { *selected = value; }
+        if selected.is_none() {
+            *selected = value;
+        }
     }
     Ok(())
 }
@@ -245,11 +322,15 @@ fn parse_loudness_set(bits: &mut BitReader<'_>, selected: &mut Option<u8>) -> Re
     if bits.read_bit()? {
         loop {
             let kind = bits.read_u32(4)?;
-            if kind == 0 { break; }
+            if kind == 0 {
+                break;
+            }
             let size_bits = bits.read_u32(4)? + 4;
             let size = bits.read_u32(size_bits)? + 1;
             let end = payload_end(bits, size)?;
-            if kind == 1 { parse_loudness_entries(bits, true, selected)?; }
+            if kind == 1 {
+                parse_loudness_entries(bits, true, selected)?;
+            }
             finish_payload(bits, end)?;
         }
     }
@@ -284,12 +365,29 @@ mod tests {
 
     #[test]
     fn loudness_extensions_parse_without_consuming_following_syntax() {
-        let conformance = [0xf9,0x46,0x43,0x22,0x14,0xc0,0x08,0x5a,0x00,0x11,0x38,0x40,0x02,0x00,0x00,0x2b,0xc0,0x11,0x87,0x2c,0x00];
-        let exhale = [0xf9,0x46,0x43,0x22,0x1c,0xc0,0x58,0x52,0x00,0x20,0x00,0xa0,0x40,0x46,0xd0,0xb8,0x00];
-        assert!(UsacConfig::parse(&conformance).unwrap().loudness_method_value.is_some());
+        let conformance = [
+            0xf9, 0x46, 0x43, 0x22, 0x14, 0xc0, 0x08, 0x5a, 0x00, 0x11, 0x38, 0x40, 0x02, 0x00,
+            0x00, 0x2b, 0xc0, 0x11, 0x87, 0x2c, 0x00,
+        ];
+        let exhale = [
+            0xf9, 0x46, 0x43, 0x22, 0x1c, 0xc0, 0x58, 0x52, 0x00, 0x20, 0x00, 0xa0, 0x40, 0x46,
+            0xd0, 0xb8, 0x00,
+        ];
+        assert!(
+            UsacConfig::parse(&conformance)
+                .unwrap()
+                .loudness_method_value
+                .is_some()
+        );
         let xhe = UsacConfig::parse(&exhale).unwrap();
         assert!(xhe.loudness_method_value.is_some());
-        assert!(matches!(xhe.elements[0], ElementConfig::Extension { kind: EXT_AUDIO_PREROLL, .. }));
+        assert!(matches!(
+            xhe.elements[0],
+            ElementConfig::Extension {
+                kind: EXT_AUDIO_PREROLL,
+                ..
+            }
+        ));
         for bytes in [&conformance[..], &exhale[..]] {
             for length in 0..bytes.len() {
                 assert!(UsacConfig::parse(&bytes[..length]).is_err());
@@ -299,7 +397,10 @@ mod tests {
 
     #[test]
     fn two_thousand_seeded_config_mutations_are_bounded() {
-        let original = [0xf9,0x46,0x43,0x22,0x1c,0xc0,0x58,0x52,0x00,0x20,0x00,0xa0,0x40,0x46,0xd0,0xb8,0x00];
+        let original = [
+            0xf9, 0x46, 0x43, 0x22, 0x1c, 0xc0, 0x58, 0x52, 0x00, 0x20, 0x00, 0xa0, 0x40, 0x46,
+            0xd0, 0xb8, 0x00,
+        ];
         let mut state = 0x42ca_ac5e_ed01_0001u64;
         for run in 0..2000 {
             let mut bytes = original;
@@ -310,7 +411,11 @@ mod tests {
                 let bit = state as usize % (bytes.len() * 8);
                 bytes[bit / 8] ^= 1 << (bit % 8);
             }
-            let length = if run % 2 == 0 { bytes.len() } else { state as usize % bytes.len() };
+            let length = if run % 2 == 0 {
+                bytes.len()
+            } else {
+                state as usize % bytes.len()
+            };
             let result = std::panic::catch_unwind(|| UsacConfig::parse(&bytes[..length]));
             assert!(result.is_ok(), "config mutation {run}, seed {state:#x}");
         }
@@ -335,12 +440,33 @@ mod tests {
         w.finish()
     }
 
-    fn sce(w: &mut BitWriter) { w.write_u32(0, 2); w.write_u32(0, 2); }
-    fn cpe(w: &mut BitWriter) { w.write_u32(1, 2); w.write_u32(0, 2); }
-    fn lfe(w: &mut BitWriter) { w.write_u32(2, 2); }
-    fn warped(w: &mut BitWriter) { w.write_u32(1, 2); w.write_u32(2, 2); }
-    fn preroll(w: &mut BitWriter) { w.write_u32(3, 2); w.write_u32(3, 4); w.write_u32(0, 4); w.write_u32(0, 2); }
-    fn fill(w: &mut BitWriter) { w.write_u32(3, 2); w.write_u32(0, 4); w.write_u32(0, 4); w.write_u32(0, 2); }
+    fn sce(w: &mut BitWriter) {
+        w.write_u32(0, 2);
+        w.write_u32(0, 2);
+    }
+    fn cpe(w: &mut BitWriter) {
+        w.write_u32(1, 2);
+        w.write_u32(0, 2);
+    }
+    fn lfe(w: &mut BitWriter) {
+        w.write_u32(2, 2);
+    }
+    fn warped(w: &mut BitWriter) {
+        w.write_u32(1, 2);
+        w.write_u32(2, 2);
+    }
+    fn preroll(w: &mut BitWriter) {
+        w.write_u32(3, 2);
+        w.write_u32(3, 4);
+        w.write_u32(0, 4);
+        w.write_u32(0, 2);
+    }
+    fn fill(w: &mut BitWriter) {
+        w.write_u32(3, 2);
+        w.write_u32(0, 4);
+        w.write_u32(0, 4);
+        w.write_u32(0, 2);
+    }
 
     #[test]
     fn audio_preroll_is_valid_only_as_the_first_element() {
@@ -348,8 +474,16 @@ mod tests {
             ("[AudioPreRoll, SCE]", &[preroll, sce][..], true),
             ("[AudioPreRoll, fill, SCE]", &[preroll, fill, sce][..], true),
             ("[fill, SCE]", &[fill, sce][..], true),
-            ("[fill, AudioPreRoll, SCE]", &[fill, preroll, sce][..], false),
-            ("[AudioPreRoll, AudioPreRoll, SCE]", &[preroll, preroll, sce][..], false),
+            (
+                "[fill, AudioPreRoll, SCE]",
+                &[fill, preroll, sce][..],
+                false,
+            ),
+            (
+                "[AudioPreRoll, AudioPreRoll, SCE]",
+                &[preroll, preroll, sce][..],
+                false,
+            ),
             ("[SCE, AudioPreRoll]", &[sce, preroll][..], false),
         ] {
             let full = asc(1, 1, elements);
@@ -362,12 +496,18 @@ mod tests {
                 writer.write_u32(reader.read_u32(1).unwrap(), 1);
             }
             let embedded = writer.finish();
-            for (path, result) in [("ASC", UsacConfig::parse(&full)), ("embedded", UsacConfig::parse_embedded(&embedded))] {
+            for (path, result) in [
+                ("ASC", UsacConfig::parse(&full)),
+                ("embedded", UsacConfig::parse_embedded(&embedded)),
+            ] {
                 match result {
                     Ok(_) => assert!(valid, "{path} {name} accepted"),
                     Err(error) => {
                         assert!(!valid, "{path} {name}: {error}");
-                        assert!(error.to_string().contains("AudioPreRoll"), "{path} {name}: {error}");
+                        assert!(
+                            error.to_string().contains("AudioPreRoll"),
+                            "{path} {name}: {error}"
+                        );
                     }
                 }
             }
@@ -378,7 +518,10 @@ mod tests {
     fn incompatible_and_unsupported_configurations_are_rejected() {
         let config = UsacConfig::parse(&asc(1, 2, &[preroll, cpe, fill])).unwrap();
         assert_eq!((config.channels, config.elements.len()), (2, 3));
-        assert_eq!(UsacConfig::parse(&asc(1, 2, &[sce, sce])).unwrap().channels, 2);
+        assert_eq!(
+            UsacConfig::parse(&asc(1, 2, &[sce, sce])).unwrap().channels,
+            2
+        );
         for (bytes, message) in [
             (asc(1, 1, &[lfe]), "LFE"),
             (asc(1, 2, &[sce, lfe]), "LFE"),
@@ -421,7 +564,17 @@ mod tests {
         };
         assert_eq!(explicit(&[0, 1], cpe).unwrap().channels, 2);
         assert_eq!(explicit(&[2], sce).unwrap().channels, 1);
-        assert!(explicit(&[1, 0], cpe).unwrap_err().to_string().contains("noncanonical"));
-        assert!(explicit(&[0, 1, 2], cpe).unwrap_err().to_string().contains("mono and stereo"));
+        assert!(
+            explicit(&[1, 0], cpe)
+                .unwrap_err()
+                .to_string()
+                .contains("noncanonical")
+        );
+        assert!(
+            explicit(&[0, 1, 2], cpe)
+                .unwrap_err()
+                .to_string()
+                .contains("mono and stereo")
+        );
     }
 }

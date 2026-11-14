@@ -75,8 +75,10 @@ fn decode_all(dec: &mut dyn Decoder, pkts: &[Packet]) -> Vec<i16> {
         while let Ok(Frame::Audio(a)) = dec.receive_frame() {
             out.extend(
                 a.data[0]
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()) * 32768.0)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b) * 32768.0)
                     .map(|v| v as i16),
             );
         }
@@ -148,7 +150,7 @@ fn lc_raw_access_units_match_adts_decode() {
             "{rate} Hz / {ch} ch raw-AU decode diverged"
         );
 
-                let (snr, lag) = snr_db(&pcm, &raw_pcm, ch as usize, 3000);
+        let (snr, lag) = snr_db(&pcm, &raw_pcm, ch as usize, 3000);
         assert_eq!(lag, 1024, "AAC-LC encoder delay is one frame");
         assert!(snr > 30.0, "{rate} Hz / {ch} ch SNR {snr:.1} dB");
     }
@@ -252,7 +254,7 @@ fn adts_container_round_trip() {
     assert_eq!(pkts.len(), adts.len());
     let mut dec = make_decoder(&stream.params).unwrap();
     let out = decode_all(&mut *dec, &pkts);
-        let (snr, _) = snr_db(&pcm, &out, 2, 3000);
+    let (snr, _) = snr_db(&pcm, &out, 2, 3000);
     assert!(snr > 30.0, "ADTS container round trip SNR {snr:.1} dB");
 }
 
@@ -276,6 +278,10 @@ fn implicit_sbr_renders_dual_rate_whatever_the_container_declares() {
     // the explicit opt-in for core-rate output.
     for declared in [44_100, 22_050] {
         let mut dec = make_decoder(&params(declared, 2, lc_asc.clone())).unwrap();
-        assert_eq!(decode_all(&mut *dec, &raw).len() / 2, raw.len() * 2048, "{declared}");
+        assert_eq!(
+            decode_all(&mut *dec, &raw).len() / 2,
+            raw.len() * 2048,
+            "{declared}"
+        );
     }
 }

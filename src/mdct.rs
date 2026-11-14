@@ -39,16 +39,16 @@ struct Fft {
 /// prime divides it.
 fn factorize(mut n: usize) -> Option<Vec<usize>> {
     let mut factors = Vec::new();
-    while n % 4 == 0 {
+    while n.is_multiple_of(4) {
         factors.push(4);
         n /= 4;
     }
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         factors.push(2);
         n /= 2;
     }
     for p in [3, 5] {
-        while n % p == 0 {
+        while n.is_multiple_of(p) {
             factors.push(p);
             n /= p;
         }
@@ -59,13 +59,25 @@ fn factorize(mut n: usize) -> Option<Vec<usize>> {
 /// The input order a recursive decimation-in-time FFT reads at its leaves:
 /// sub-transform `r` of a radix-`p` stage takes every `p`-th input from
 /// offset `r`, and its output occupies the `r`-th contiguous block.
-fn digit_reversal(perm: &mut [u32], out_base: usize, in_off: usize, in_stride: usize, factors: &[usize]) {
+fn digit_reversal(
+    perm: &mut [u32],
+    out_base: usize,
+    in_off: usize,
+    in_stride: usize,
+    factors: &[usize],
+) {
     match factors.split_first() {
         None => perm[out_base] = in_off as u32,
         Some((&p, rest)) => {
             let m: usize = rest.iter().product();
             for r in 0..p {
-                digit_reversal(perm, out_base + r * m, in_off + r * in_stride, in_stride * p, rest);
+                digit_reversal(
+                    perm,
+                    out_base + r * m,
+                    in_off + r * in_stride,
+                    in_stride * p,
+                    rest,
+                );
             }
         }
     }
@@ -180,10 +192,22 @@ impl Fft {
     }
 
     fn radix5(&self, z: &mut [f64], base: usize, m: usize, fstride: usize) {
-        let (c1, s1) = (0.309_016_994_374_947_45, self.sign * 0.951_056_516_295_153_5);
-        let (c2, s2) = (-0.809_016_994_374_947_5, self.sign * 0.587_785_252_292_473_1);
+        let (c1, s1) = (
+            0.309_016_994_374_947_45,
+            self.sign * 0.951_056_516_295_153_5,
+        );
+        let (c2, s2) = (
+            -0.809_016_994_374_947_5,
+            self.sign * 0.587_785_252_292_473_1,
+        );
         for k in 0..m {
-            let a = [base + k, base + k + m, base + k + 2 * m, base + k + 3 * m, base + k + 4 * m];
+            let a = [
+                base + k,
+                base + k + m,
+                base + k + 2 * m,
+                base + k + 3 * m,
+                base + k + 4 * m,
+            ];
             let x0 = ld(z, a[0]);
             let x1 = cmul(ld(z, a[1]), self.twiddles[k * fstride]);
             let x2 = cmul(ld(z, a[2]), self.twiddles[2 * k * fstride]);
@@ -239,7 +263,7 @@ impl Imdct {
     /// A plan for `n` coefficients; `None` unless `n` is a multiple of 4
     /// whose half factors into 2, 3 and 5.
     pub(crate) fn new(n: usize) -> Option<Self> {
-        if n == 0 || n % 4 != 0 {
+        if n == 0 || !n.is_multiple_of(4) {
             return None;
         }
         Some(Imdct {
@@ -308,7 +332,7 @@ impl Mdct {
     /// A plan for `n` coefficients; `None` unless `n` is a multiple of 4
     /// whose half factors into 2, 3 and 5.
     pub(crate) fn new(n: usize) -> Option<Self> {
-        if n == 0 || n % 4 != 0 {
+        if n == 0 || !n.is_multiple_of(4) {
             return None;
         }
         let fft = Fft::new(n / 2, false)?;
@@ -462,7 +486,10 @@ mod tests {
             Imdct::new(n_transform / 2).unwrap().full(&spec, &mut got);
             let peak = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
             for (t, (g, w)) in got.iter().zip(&want).enumerate() {
-                assert!((g - w).abs() <= 1e-12 * peak, "N = {n_transform}, t = {t}: {g} vs {w}");
+                assert!(
+                    (g - w).abs() <= 1e-12 * peak,
+                    "N = {n_transform}, t = {t}: {g} vs {w}"
+                );
             }
         }
     }
@@ -476,7 +503,10 @@ mod tests {
             Mdct::new(n_transform / 2).unwrap().forward(&time, &mut got);
             let peak = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
             for (k, (g, w)) in got.iter().zip(&want).enumerate() {
-                assert!((g - w).abs() <= 1e-12 * peak, "N = {n_transform}, k = {k}: {g} vs {w}");
+                assert!(
+                    (g - w).abs() <= 1e-12 * peak,
+                    "N = {n_transform}, k = {k}: {g} vs {w}"
+                );
             }
         }
     }

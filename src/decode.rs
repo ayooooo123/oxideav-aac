@@ -76,6 +76,50 @@ fn pce_kind(kind: IdSynEle) -> Option<PceElementKind> {
     }
 }
 
+/// The permutation taking a block's element-order channels to the
+/// PCE's declaration order (`out[i] = channels[perm[i]]`); `None` unless
+/// the block carries exactly the PCE's elements.
+fn declaration_permutation(
+    pce: &Pce,
+    elements: &[(PceElementKind, u8, usize)],
+) -> Option<Vec<usize>> {
+    let declared = pce
+        .front_elements
+        .iter()
+        .chain(&pce.side_elements)
+        .chain(&pce.back_elements)
+        .map(|e| {
+            (
+                if e.is_cpe {
+                    PceElementKind::Cpe
+                } else {
+                    PceElementKind::Sce
+                },
+                e.tag_select,
+            )
+        })
+        .chain(
+            pce.lfe_element_tag_selects
+                .iter()
+                .map(|&tag| (PceElementKind::Lfe, tag)),
+        );
+    let mut first = Vec::with_capacity(elements.len());
+    let mut at = 0;
+    for &(_, _, n) in elements {
+        first.push(at);
+        at += n;
+    }
+    let mut used = vec![false; elements.len()];
+    let mut perm = Vec::with_capacity(at);
+    for (kind, tag) in declared {
+        let i = (0..elements.len())
+            .find(|&i| !used[i] && elements[i].0 == kind && elements[i].1 == tag)?;
+        used[i] = true;
+        perm.extend(first[i]..first[i] + elements[i].2);
+    }
+    used.iter().all(|&u| u).then_some(perm)
+}
+
 /// The §4.6.11 per-frame sample count for the default 1024-line
 /// transform family. The other §4.5.1.1 families emit 960 / 512 /
 /// 480 samples per frame per channel
@@ -85,6 +129,7 @@ pub const FRAME_LEN: usize = 1024;
 /// One decoded frame: the interleaved float PCM plus the geometry
 /// needed to interpret it.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct DecodedFrame {
     /// Interleaved float PCM on the `[-1, 1)` axis, `channels` samples
     /// per time index. For a
@@ -174,6 +219,71 @@ pub struct StreamDecoder {
     /// `AudioSpecificConfig` installs the ASC-resolved family via
     /// [`Self::set_frame_family`] before the first block.
     family: FrameFamily,
+    /// Settings every element / coupling decoder this stream creates
+    /// is constructed with.
+    element_options: ElementOptions,
+    // Local opt-in view of the most recent successfully decoded frame,
+    // in normalized canonical-order f64, before the f32 rendering.
+    float_pcm: Option<Vec<f64>>,
+    /// Emit channels in the configuration's element order instead of
+    /// the canonical speaker order ([`Self::set_declaration_order`]).
+    declaration_order: bool,
+    /// Fail blocks carrying a coupling channel element
+    /// ([`Self::set_reject_coupling`]).
+    reject_coupling: bool,
+    /// Skip SBR and PS extension payloads ([`Self::set_core_only`]).
+    core_only: bool,
+    /// `(audioObjectType, samplingFrequencyIndex,
+    /// channelConfiguration)` of the last decoded block. A change —
+    /// a concatenated stream, an ADTS splice — starts a new stream:
+    /// every per-element slot, the SBR back-ends and the SBR latch
+    /// restart (an overlap tail, LTP history or SBR state of a
+    /// different configuration has no meaning for the new one).
+    stream_config: Option<(u8, u8, u8)>,
+}
+
+/// Per-element decoder settings a [`StreamDecoder`] installs on every
+/// element and coupling decoder it creates.
+#[derive(Debug, Clone, Copy)]
+struct ElementOptions {
+    /// [`StreamDecoder::set_sine_before_first_block`].
+    sine_before_first_block: bool,
+    /// [`StreamDecoder::set_shared_pns_seed`].
+    shared_pns_seed: bool,
+}
+
+impl Default for ElementOptions {
+    /// The sine-shaped block before the first is on (FFmpeg's
+    /// rendering); per-channel PNS generators are off.
+    fn default() -> Self {
+        ElementOptions {
+            sine_before_first_block: true,
+            shared_pns_seed: false,
+        }
+    }
+}
+
+impl ElementOptions {
+    fn element_decoder(
+        self,
+        family: FrameFamily,
+        pns: crate::element_decode::SharedPnsState,
+    ) -> ElementDecoder {
+        let mut dec = ElementDecoder::new_family(family, pns);
+        dec.set_sine_before_first_block(self.sine_before_first_block);
+        dec.set_shared_pns_seed(self.shared_pns_seed);
+        dec
+    }
+
+    fn cce_decoder(
+        self,
+        family: FrameFamily,
+        pns: crate::element_decode::SharedPnsState,
+    ) -> CceDecoder {
+        let mut dec = CceDecoder::new_family(family, pns);
+        dec.set_sine_before_first_block(self.sine_before_first_block);
+        dec
+    }
 }
 
 impl StreamDecoder {
@@ -181,6 +291,48 @@ impl StreamDecoder {
     #[must_use]
     pub fn new() -> Self {
         StreamDecoder::default()
+    }
+
+    /// Capture raw-data-block and ER raw-data-block PCM in double
+    /// precision, before the conversion to the frame's `f32` samples.
+    /// Disabled by default; enabling or disabling clears the previous view.
+    /// The view is replaced after each successful decoded frame. Decode
+    /// failures retain the previous successful view, not partial samples.
+    pub fn set_float_pcm_capture(&mut self, enabled: bool) {
+        self.float_pcm = if enabled { Some(Vec::new()) } else { None };
+    }
+
+    /// Borrow the last successful frame's PCM (full scale 1.0).
+    /// This does not compensate decoder delay or drain pending synthesis.
+    pub fn last_pcm_f64(&self) -> Option<&[f64]> {
+        self.float_pcm.as_deref()
+    }
+
+    /// Emit each block's channels in the order the configuration
+    /// declares its elements, as macOS's decoder does: a default
+    /// `channelConfiguration`'s element order (5.1: C, L, R, Ls, Rs,
+    /// LFE), or the active PCE's front, side, back and LFE lists, each
+    /// element found by its tag. A block whose elements do not match
+    /// the PCE fails with [`Error::ElementDecodeInvalid`]; a
+    /// `channelConfiguration == 0` stream with no PCE keeps its
+    /// bitstream element order. Off by default (canonical speaker
+    /// order).
+    pub fn set_declaration_order(&mut self, enabled: bool) {
+        self.declaration_order = enabled;
+    }
+
+    /// Fail a block that carries a coupling channel element with
+    /// [`Error::UnsupportedElementSkip`] (the CCE's element id), as
+    /// macOS's decoder rejects coupling.
+    pub fn set_reject_coupling(&mut self, enabled: bool) {
+        self.reject_coupling = enabled;
+    }
+
+    /// Decode the AAC core only: fill elements, and with them any SBR
+    /// and PS extension payloads, are skipped, as macOS's decoder does
+    /// for a stream configured as AAC-LC.
+    pub fn set_core_only(&mut self, enabled: bool) {
+        self.core_only = enabled;
     }
 
     /// Install the program configuration of a
@@ -243,6 +395,25 @@ impl StreamDecoder {
         self.family = family;
     }
 
+    /// Restart the per-stream state when the block configuration
+    /// differs from the previous block's (see `stream_config`).
+    fn track_stream_config(&mut self, aot: u8, fs_index: u8, channel_configuration: u8) {
+        let cfg = (aot, fs_index, channel_configuration);
+        if self.stream_config.is_some_and(|prev| prev != cfg) {
+            self.decoders.clear();
+            self.cce_decoders.clear();
+            self.sbr.clear();
+            self.sbr_prev_header.clear();
+            self.sbr_active = false;
+            // The float view of the old stream is stale, but capture
+            // stays enabled.
+            if let Some(view) = &mut self.float_pcm {
+                view.clear();
+            }
+        }
+        self.stream_config = Some(cfg);
+    }
+
     /// The active §4.5.1.1 frame-length family.
     pub fn frame_family(&self) -> FrameFamily {
         self.family
@@ -258,6 +429,32 @@ impl StreamDecoder {
     /// decoding.
     pub fn set_sbr_low_power(&mut self, low_power: bool) {
         self.sbr_low_power = low_power;
+    }
+
+    /// Decode as if a sine-shaped block preceded the stream's first
+    /// (on by default). §4.6.11.3.2 gives the first block's left
+    /// window half its own `window_shape`; Apple's and FFmpeg's
+    /// decoders (black box) give it the sine window's, so with this
+    /// disabled a stream whose first block is KBD-shaped differs from
+    /// them in its first frame. Applies to channel and coupling
+    /// elements decoded from then on; select before decoding.
+    pub fn set_sine_before_first_block(&mut self, enabled: bool) {
+        self.element_options.sine_before_first_block = enabled;
+    }
+
+    /// Draw each channel's PNS noise from its own generator started
+    /// from the common seed (off by default): the two channels of a
+    /// pair then carry identical noise in bands that are noise in both,
+    /// until their noise histories diverge — the structure Apple's
+    /// decoder renders. The default draws every band of the stream
+    /// from one generator, so bands coded as independent noise decode
+    /// decorrelated (FFmpeg's process). Applies to every channel
+    /// element, including those already decoding.
+    pub fn set_shared_pns_seed(&mut self, shared: bool) {
+        self.element_options.shared_pns_seed = shared;
+        for dec in self.decoders.values_mut() {
+            dec.set_shared_pns_seed(shared);
+        }
     }
 
     /// Decode one ADTS frame's `raw_data_block()` payload to interleaved
@@ -309,8 +506,10 @@ impl StreamDecoder {
         num_raw_data_blocks: u8,
         payload: &[u8],
     ) -> Result<DecodedFrame> {
+        self.track_stream_config(aot, fs_index, channel_configuration);
         let fs = fs_index;
         let family = self.family;
+        let element_options = self.element_options;
         let mut reader = BitReader::new(payload);
 
         // Per channel-element outputs in element order: the decoded
@@ -423,6 +622,9 @@ impl StreamDecoder {
                         kind: IdSynEle::Cce,
                         element_instance_tag,
                     } => {
+                        if self.reject_coupling {
+                            return Err(Error::UnsupportedElementSkip(IdSynEle::Cce as u8));
+                        }
                         // §4.6.8.3 / Table 4.8: parse the whole coupling
                         // channel element (header + embedded
                         // single_channel_element + gain lists). Its
@@ -447,6 +649,11 @@ impl StreamDecoder {
                         // Any other channel-element id has no decode path.
                         return Err(unsupported_element(kind));
                     }
+                    Element::Fill { payload_bytes } if self.core_only => {
+                        reader
+                            .skip(payload_bytes * 8)
+                            .map_err(|_| Error::UnexpectedEnd)?;
+                    }
                     Element::Fill { payload_bytes } => {
                         // The FIL body was left unconsumed: walk the
                         // Table 4.51 extension_payload() chain, routing
@@ -459,10 +666,9 @@ impl StreamDecoder {
                             .map(|el| (el.kind, el.key));
                         if let Some(ext) =
                             self.consume_fill(&mut reader, payload, payload_bytes, fs_sbr, target)?
+                            && let Some(el) = pending.last_mut()
                         {
-                            if let Some(el) = pending.last_mut() {
-                                el.sbr = Some(ext);
-                            }
+                            el.sbr = Some(ext);
                         }
                     }
                     Element::Data { .. } => {}
@@ -491,7 +697,7 @@ impl StreamDecoder {
             let dec = self
                 .cce_decoders
                 .entry(cce.element_instance_tag)
-                .or_insert_with(|| CceDecoder::new_family(family, self.pns_state.clone()));
+                .or_insert_with(|| element_options.cce_decoder(family, self.pns_state.clone()));
             decoded_cces.push(dec.decode(cce, aot, fs)?);
         }
 
@@ -514,10 +720,9 @@ impl StreamDecoder {
                         ics_info: &sce.ics,
                         spectral: &sce.spectral,
                     };
-                    let dec = self
-                        .decoders
-                        .entry(pe.key)
-                        .or_insert_with(|| ElementDecoder::new_family(family, self.pns_state.clone()));
+                    let dec = self.decoders.entry(pe.key).or_insert_with(|| {
+                        element_options.element_decoder(family, self.pns_state.clone())
+                    });
                     vec![dec.decode_sce_coupled(&ch, aot, fs, &coupling)?]
                 }
                 ParsedChannel::Pair(cpe) => {
@@ -526,10 +731,9 @@ impl StreamDecoder {
                     let right_coupling =
                         coupling_for(&cces, &decoded_cces, pe.block, pe.kind, pe.key.1, 1);
                     let (left, right, joint) = cpe.channel_inputs();
-                    let dec = self
-                        .decoders
-                        .entry(pe.key)
-                        .or_insert_with(|| ElementDecoder::new_family(family, self.pns_state.clone()));
+                    let dec = self.decoders.entry(pe.key).or_insert_with(|| {
+                        element_options.element_decoder(family, self.pns_state.clone())
+                    });
                     let (l, r) = dec.decode_cpe_coupled(
                         &left,
                         &right,
@@ -590,6 +794,7 @@ impl StreamDecoder {
         // interleaved PCM (all blocks of a frame must agree on the
         // channel count).
         let mut pcm: Vec<f32> = Vec::new();
+        let mut float_pcm = self.float_pcm.as_ref().map(|_| Vec::new());
         let mut frame_channels: Option<usize> = None;
         for block in 0..num_raw_data_blocks {
             let mut channels: Vec<Vec<f64>> = Vec::new();
@@ -638,7 +843,19 @@ impl StreamDecoder {
             // maps onto canonical positions; otherwise element order is
             // kept.
             let channels =
-                if channel_configuration == 0 {
+                if self.declaration_order {
+                    match (channel_configuration, self.program_config.as_ref()) {
+                        (0, Some(pce)) => {
+                            let perm = declaration_permutation(pce, &element_desc)
+                                .ok_or(Error::ElementDecodeInvalid)?;
+                            crate::channel_map::apply_permutation(&perm, channels)
+                        }
+                        // A default configuration declares its elements in
+                        // transmission order; with no PCE, the bitstream's
+                        // element order is the only declaration.
+                        _ => channels,
+                    }
+                } else if channel_configuration == 0 {
                     match self.program_config.as_ref().and_then(|pce| {
                         crate::channel_map::pce_reorder_permutation(pce, &element_desc)
                     }) {
@@ -660,11 +877,22 @@ impl StreamDecoder {
                 Some(_) => {}
             }
             pcm.extend(interleave_f32(&channels)?);
+            if let Some(output) = &mut float_pcm {
+                // interleave_f32 above has already validated channel lengths.
+                if let Some(first) = channels.first() {
+                    for frame in 0..first.len() {
+                        for channel in &channels {
+                            output.push(channel[frame] / 32768.0);
+                        }
+                    }
+                }
+            }
         }
 
         if frame_channels.unwrap_or(0) > 0 {
             self.locked = true;
         }
+        self.float_pcm = float_pcm;
         Ok(DecodedFrame {
             pcm,
             channels: frame_channels.unwrap_or(0),
@@ -742,10 +970,10 @@ impl StreamDecoder {
                             // and delay adjustment only (the None SBR
                             // slot below selects the §4.6.18.5 pure
                             // upsampling path). No header is threaded.
-                            if let (Some(crc), Some((s, e))) = (crc, crc_region) {
-                                if crate::adts_crc::sbr_crc(payload, s, e) != crc {
-                                    return Err(Error::SbrCrcMismatch);
-                                }
+                            if let (Some(crc), Some((s, e))) = (crc, crc_region)
+                                && crate::adts_crc::sbr_crc(payload, s, e) != crc
+                            {
+                                return Err(Error::SbrCrcMismatch);
                             }
                             self.sbr_active = true;
                             remaining = 0;
@@ -828,7 +1056,7 @@ impl StreamDecoder {
             let start_byte = (reader.bit_position() / 8) as usize;
             let regions = crate::adts_crc::collect_block_regions(&mut reader, aot, fs)?;
             let end_bit = reader.bit_position();
-            if end_bit % 8 != 0 {
+            if !end_bit.is_multiple_of(8) {
                 // A block that did not end on its §4.4.2.1
                 // byte_alignment() cannot be followed by the
                 // byte-aligned CRC slot.
@@ -934,8 +1162,16 @@ impl StreamDecoder {
         if (aot == 23 || eld) != self.family.is_ld() {
             return Err(Error::ElementDecodeInvalid);
         }
+        self.track_stream_config(aot, fs_index, channel_configuration);
+        // ELD with the resilience tools is not decoded (as in FFmpeg).
+        if eld
+            && (resilience.section_data || resilience.scalefactor_data || resilience.spectral_data)
+        {
+            return Err(Error::NotImplemented);
+        }
         let fs = fs_index;
         let family = self.family;
+        let element_options = self.element_options;
         // Table 4.19: the fixed element sequence per channelConfiguration.
         let sequence: &[IdSynEle] = match channel_configuration {
             1 => &[IdSynEle::Sce],
@@ -978,10 +1214,9 @@ impl StreamDecoder {
                         ics_info: &ics,
                         spectral: &spectral,
                     };
-                    let dec = self
-                        .decoders
-                        .entry(key)
-                        .or_insert_with(|| ElementDecoder::new_family(family, self.pns_state.clone()));
+                    let dec = self.decoders.entry(key).or_insert_with(|| {
+                        element_options.element_decoder(family, self.pns_state.clone())
+                    });
                     channels.push(dec.decode_sce(&ch, aot, fs)?);
                 }
                 IdSynEle::Cpe => {
@@ -1040,10 +1275,9 @@ impl StreamDecoder {
                             ms_mask_present,
                             ms_used,
                         };
-                        let dec = self
-                            .decoders
-                            .entry(key)
-                            .or_insert_with(|| ElementDecoder::new_family(family, self.pns_state.clone()));
+                        let dec = self.decoders.entry(key).or_insert_with(|| {
+                            element_options.element_decoder(family, self.pns_state.clone())
+                        });
                         dec.decode_cpe(&left, &right, &joint, aot, fs)?
                     } else {
                         let left_body = IcsBody::parse_er_family(
@@ -1096,10 +1330,9 @@ impl StreamDecoder {
                             ics_info: &right_ics,
                             spectral: &right_spectral,
                         };
-                        let dec = self
-                            .decoders
-                            .entry(key)
-                            .or_insert_with(|| ElementDecoder::new_family(family, self.pns_state.clone()));
+                        let dec = self.decoders.entry(key).or_insert_with(|| {
+                            element_options.element_decoder(family, self.pns_state.clone())
+                        });
                         dec.decode_cpe(&left, &right, &CpeJointStereo::default(), aot, fs)?
                     };
                     channels.push(dec_out.0);
@@ -1111,9 +1344,24 @@ impl StreamDecoder {
         // Trailing extension_payload() loop + byte_alignment(): consumed
         // permissively (nothing this decoder acts on rides there yet).
 
-        // Table 1.19 canonical output reorder, same as the non-ER walk.
-        let channels = crate::channel_map::reorder_channels(channel_configuration, channels);
+        // Table 1.19 canonical output reorder, same as the non-ER walk
+        // (element order under declaration order).
+        let channels = if self.declaration_order {
+            channels
+        } else {
+            crate::channel_map::reorder_channels(channel_configuration, channels)
+        };
         let pcm = interleave_f32(&channels)?;
+        if let Some(output) = &mut self.float_pcm {
+            output.clear();
+            if let Some(first) = channels.first() {
+                for frame in 0..first.len() {
+                    for channel in &channels {
+                        output.push(channel[frame] / 32768.0);
+                    }
+                }
+            }
+        }
         Ok(DecodedFrame {
             pcm,
             channels: channels.len(),
@@ -1393,6 +1641,46 @@ fn skip_id3v2(data: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
 
+    /// A raw_data_block with one channel pair without common_window: each
+    /// channel an all-zero long-window ICS with its own window sequence
+    /// and max_sfb (one ZERO_HCB section), then END.
+    fn independent_cpe_block(left: (u32, u32), right: (u32, u32)) -> Vec<u8> {
+        let mut w = oxideav_core::bits::BitWriter::new();
+        w.write_u32(1, 3); // ID_CPE
+        w.write_u32(0, 4); // element_instance_tag
+        w.write_bit(false); // common_window
+        for (sequence, max_sfb) in [left, right] {
+            w.write_u32(100, 8); // global_gain
+            w.write_bit(false); // ics_reserved_bit
+            w.write_u32(sequence, 2);
+            w.write_bit(false); // window_shape
+            w.write_u32(max_sfb, 6);
+            w.write_bit(false); // predictor_data_present
+            if max_sfb > 0 {
+                w.write_u32(0, 4); // sect_cb = ZERO_HCB
+                w.write_u32(max_sfb, 5); // sect_len
+            }
+            w.write_bit(false); // pulse_data_present
+            w.write_bit(false); // tns_data_present
+            w.write_bit(false); // gain_control_data_present
+        }
+        w.write_u32(7, 3); // ID_END
+        w.finish()
+    }
+
+    #[test]
+    fn independent_cpe_channels_may_differ_in_max_sfb_and_window_sequence() {
+        for (left, right) in [((0, 1), (0, 0)), ((0, 1), (1, 1)), ((0, 0), (0, 2))] {
+            let block = independent_cpe_block(left, right);
+            let mut dec = StreamDecoder::new();
+            let frame = dec
+                .decode_raw_data_block(2, 4, 44_100, 2, 1, &block)
+                .unwrap_or_else(|e| panic!("{left:?} {right:?}: {e:?}"));
+            assert_eq!(frame.channels, 2);
+            assert!(frame.pcm.iter().all(|&v| v == 0.0));
+        }
+    }
+
     #[test]
     fn skip_id3v2_passes_through_non_id3() {
         let data = [0xFFu8, 0xF1, 0x00, 0x00];
@@ -1424,7 +1712,6 @@ mod tests {
     }
 }
 
-
 impl Default for StreamDecoder {
     fn default() -> Self {
         StreamDecoder {
@@ -1443,6 +1730,12 @@ impl Default for StreamDecoder {
             sbr_low_power: false,
             family: crate::swb_offset::FrameFamily::Lc1024,
             program_config: None,
+            element_options: ElementOptions::default(),
+            float_pcm: None,
+            declaration_order: false,
+            reject_coupling: false,
+            core_only: false,
+            stream_config: None,
         }
     }
 }
